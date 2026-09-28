@@ -1,6 +1,6 @@
 //! From a template to a `mining.notify` and back to a `submitblock` (`new_work` and the
-//! `mining.submit` branch of `ref/yolo/stratumsolo`), with the coinbase policy of each mode
-//! (plan §3.2.4).
+//! `mining.submit` branch of `ref/yolo/stratumsolo`), with the coinbase policy of the
+//! payout × text flag pair (plan §3.2.4 as revised by Y7).
 
 use crate::codec::{compact_size, dsha256, hash_from_display, merkle_root, reverse_hex, u32_le_hex};
 use crate::equihash::Equihash;
@@ -8,35 +8,33 @@ use crate::tag::{decode_coinbase_tag, height_push_len, Tag};
 use crate::template::BlockTemplate;
 use crate::tx::{rebuild_script_sig, Coinbase, MAX_COINBASE_SCRIPTSIG};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum Mode {
-    /// `coinbasetxn.data` as is; the node's `mineraddress` is paid (`stratumsolo`).
-    Solo,
-    /// The payout output is rewritten to the miner's address, the stratum username (`stratumpool`).
-    Pool,
-    /// The scriptSig is rebuilt as height ‖ `coinbaseaux.flags` ‖ text, then the output is
-    /// rewritten, burned (`--cenote N`) or left to the node (`--scrooge`) (`cenote`).
-    Cenote,
-}
-
-impl std::fmt::Display for Mode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Mode::Solo => "solo",
-            Mode::Pool => "pool",
-            Mode::Cenote => "cenote",
-        })
-    }
-}
-
-/// The static half of the coinbase policy; the burn counter lives in the server state.
-#[derive(Debug, Clone)]
+/// The coinbase policy: the two flags of plan Y7 (owner decision P-6). Every combination
+/// carries the Yellowback tag; there are no modes.
+#[derive(Debug, Clone, Default)]
 pub struct Policy {
-    pub mode: Mode,
-    pub text: Vec<u8>,
-    pub scrooge: bool,
-    /// Test-only (Y5's negative case): `cenote` without the flags append, reproducing the Perl.
+    /// `--payout`: every block pays this scriptPubKey (validated once at startup). Unset: the
+    /// miner's stratum username is the payout address (`BuildParams::miner_script_pubkey`).
+    pub payout: Option<Payout>,
+    /// `--text`: the scriptSig is rebuilt as height push ‖ `coinbaseaux.flags` ‖ push(text).
+    /// Unset: the node's scriptSig is used untouched.
+    pub text: Option<Vec<u8>>,
+    /// Test-only (Y5's negative case): `--text` without the flags append, reproducing the
+    /// Perl `cenote` and dropping the tag (Y-F1).
     pub no_flags: bool,
+}
+
+/// A fixed payout address and the scriptPubKey `validateaddress` gave for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Payout {
+    pub address: String,
+    pub script_pubkey: Vec<u8>,
+}
+
+impl Policy {
+    /// What `/status` reports as `payout`: the fixed address, or `"username"`.
+    pub fn payout_label(&self) -> String {
+        self.payout.as_ref().map(|p| p.address.clone()).unwrap_or_else(|| "username".into())
+    }
 }
 
 /// One job, as sent to a miner. Hex fields are exactly the `mining.notify` params.
@@ -69,10 +67,9 @@ impl Work {
 #[derive(Debug, Clone, Default)]
 pub struct BuildParams<'a> {
     pub job_id: String,
-    /// The miner's `validateaddress.scriptPubKey` (pool / cenote); None in solo mode.
+    /// The miner's `validateaddress.scriptPubKey` from `mining.authorize`; used when the
+    /// policy has no fixed `--payout`.
     pub miner_script_pubkey: Option<&'a [u8]>,
-    /// `--cenote N` still counting down: pay 0 to the miner's script.
-    pub burn: bool,
     /// Unix time the job was created (Perl: `time` at `new_work`).
     pub now: u32,
 }
@@ -80,46 +77,41 @@ pub struct BuildParams<'a> {
 const HEADER_SIZE: usize = 4 + 32 + 32 + 32 + 4 + 4 + 32;
 const DEFAULT_SIZE_LIMIT: usize = 2_000_000;
 
-/// The coinbase bytes for this mode, and the scriptSig they carry.
+/// The coinbase bytes under the policy, and the scriptSig they carry.
 pub struct BuiltCoinbase {
     pub data: Vec<u8>,
     pub script_sig: Vec<u8>,
-    /// Set when the `cenote` text had to be truncated (to this many bytes).
+    /// Set when the `--text` had to be truncated (to this many bytes).
     pub text_truncated_to: Option<usize>,
 }
 
 pub fn build_coinbase(t: &BlockTemplate, policy: &Policy, p: &BuildParams) -> Result<BuiltCoinbase, String> {
     let data = hex::decode(&t.coinbasetxn.data).map_err(|e| format!("coinbasetxn.data is not hex: {}", e))?;
-    if policy.mode == Mode::Solo {
-        let script_sig = Coinbase::parse(&data).map(|c| c.script_sig).unwrap_or_default();
-        return Ok(BuiltCoinbase { data, script_sig, text_truncated_to: None });
-    }
     let mut cb = Coinbase::parse(&data).map_err(|e| format!("coinbasetxn.data: {}", e))?;
     if cb.vout.is_empty() {
         return Err("coinbase has no outputs".into());
     }
     let mut truncated = None;
-    if policy.mode == Mode::Cenote {
+    if let Some(text) = &policy.text {
         let hp_len = height_push_len(&cb.script_sig).ok_or("coinbase scriptSig does not start with a height push")?;
         let height_push = cb.script_sig[..hp_len].to_vec();
         let flags = if policy.no_flags { Vec::new() } else { t.flags_bytes()? };
-        let rebuilt = rebuild_script_sig(&height_push, &flags, &policy.text)?;
-        if rebuilt.text_used < policy.text.len() {
+        let rebuilt = rebuild_script_sig(&height_push, &flags, text)?;
+        if rebuilt.text_used < text.len() {
             truncated = Some(rebuilt.text_used);
         }
         cb.script_sig = rebuilt.script_sig;
     }
     debug_assert!(cb.script_sig.len() <= MAX_COINBASE_SCRIPTSIG);
     // The miner's reward is vout[0] (`CreateCoinbaseTransaction`, `ycash-dd/src/miner.cpp:304`);
-    // any further output is the founders/YDF share and stays as the node built it.
-    if p.burn {
-        let spk = p.miner_script_pubkey.ok_or("burn needs the miner's scriptPubKey")?;
-        cb.vout[0].value = 0;
-        cb.vout[0].script_pubkey = spk.to_vec();
-    } else if !(policy.mode == Mode::Cenote && policy.scrooge) {
-        let spk = p.miner_script_pubkey.ok_or("pool mode needs the miner's scriptPubKey (authorize first)")?;
-        cb.vout[0].script_pubkey = spk.to_vec();
-    }
+    // any further output is the founders/YDF share and stays as the node built it. The
+    // output is rewritten structurally in both payout cases: `--payout <the node's own
+    // address>` is what the Perl `stratumsolo` was.
+    let spk = match &policy.payout {
+        Some(fixed) => fixed.script_pubkey.as_slice(),
+        None => p.miner_script_pubkey.ok_or("no --payout: the miner's scriptPubKey is needed (authorize first)")?,
+    };
+    cb.vout[0].script_pubkey = spk.to_vec();
     let script_sig = cb.script_sig.clone();
     Ok(BuiltCoinbase { data: cb.serialize(), script_sig, text_truncated_to: truncated })
 }
@@ -211,20 +203,36 @@ mod tests {
         serde_json::from_str(include_str!("../tests/vectors/regtest-template-105.json")).unwrap()
     }
 
-    fn policy(mode: Mode) -> Policy {
-        Policy { mode, text: b"www.FreeSoloMining.com".to_vec(), scrooge: false, no_flags: false }
+    const MINER_SPK: &str = "76a914000102030405060708090a0b0c0d0e0f1011121388ac";
+    /// The template's own payout script (node A's `mineraddress`): `--payout <the node's
+    /// address>` reproduces the Perl `stratumsolo` coinbase byte for byte.
+    const NODE_SPK: &str = "76a914b5521b95530df65bec840c03c0e90a126c67625888ac";
+    const TEXT: &[u8] = b"www.FreeSoloMining.com";
+
+    fn fixed(spk_hex: &str) -> Option<Payout> {
+        Some(Payout { address: "fixed".into(), script_pubkey: hex::decode(spk_hex).unwrap() })
     }
 
-    const MINER_SPK: &str = "76a914000102030405060708090a0b0c0d0e0f1011121388ac";
+    /// One cell of the payout × text grid.
+    fn policy(payout: Option<Payout>, text: Option<&[u8]>) -> Policy {
+        Policy { payout, text: text.map(|t| t.to_vec()), no_flags: false }
+    }
 
     fn params<'a>(spk: Option<&'a [u8]>) -> BuildParams<'a> {
-        BuildParams { job_id: "1".into(), miner_script_pubkey: spk, burn: false, now: 1_790_581_942 }
+        BuildParams { job_id: "1".into(), miner_script_pubkey: spk, now: 1_790_581_942 }
+    }
+
+    /// The coinbase `build_work` embedded, parsed back (its hex is `transactions[2..]`'s prefix).
+    fn coinbase_of(w: &Work, t: &BlockTemplate, pol: &Policy, p: &BuildParams) -> Coinbase {
+        let built = build_coinbase(t, pol, p).unwrap();
+        assert!(w.transactions[2..].starts_with(&hex::encode(&built.data)));
+        Coinbase::parse(&built.data).unwrap()
     }
 
     #[test]
     fn header_fields_are_reversed_like_the_perl() {
         let t = template();
-        let w = build_work(&t, &policy(Mode::Solo), Equihash::REGTEST, &params(None)).unwrap();
+        let w = build_work(&t, &policy(fixed(NODE_SPK), None), Equihash::REGTEST, &params(None)).unwrap();
         assert_eq!(w.version, "04000000");
         assert_eq!(w.previousblockhash, "f9e5cdb460c2f54266fe370a80c9accf0984bf5f0c9f7f6c0d4986db8cb4f904");
         assert_eq!(w.light_client_root, "5347459ce3ba2a20a698da41174e76c9d15e88b9ee2f25507915a934961b5ab9");
@@ -236,7 +244,7 @@ mod tests {
         assert!(w.transactions[2..].starts_with(&t.coinbasetxn.data));
         assert!(w.transactions.ends_with(&t.transactions[1].data));
         assert_eq!(w.tag_kind(), "quote");
-        // solo keeps the coinbase byte for byte
+        // --payout <the node's own address>, no --text: the coinbase is byte for byte the node's
         assert_eq!(&w.transactions[2..2 + t.coinbasetxn.data.len()], t.coinbasetxn.data);
         // the header prefix matches the mined block 105 up to the merkle root (different coinbase)
         let raw = include_str!("../tests/vectors/regtest-block-105.hex").trim();
@@ -257,8 +265,11 @@ mod tests {
         let cb_end = raw.find(include_str!("../tests/vectors/regtest-tx-a805.hex").trim()).unwrap();
         t2.coinbasetxn.data = raw[cb_start..cb_end].to_string();
         // the internal miner's coinbase carries an extranonce push instead of OP_0
-        assert_eq!(Coinbase::parse(&hex::decode(&t2.coinbasetxn.data).unwrap()).unwrap().script_sig[..4], [0x01, 0x69, 0x01, 0x01]);
-        let w = build_work(&t2, &policy(Mode::Solo), Equihash::REGTEST, &params(None)).unwrap();
+        let mined = Coinbase::parse(&hex::decode(&t2.coinbasetxn.data).unwrap()).unwrap();
+        assert_eq!(mined.script_sig[..4], [0x01, 0x69, 0x01, 0x01]);
+        // --payout <the address block 105 paid>: the structural rewrite is a no-op
+        let payout = Some(Payout { address: "block-105".into(), script_pubkey: mined.vout[0].script_pubkey.clone() });
+        let w = build_work(&t2, &policy(payout, None), Equihash::REGTEST, &params(None)).unwrap();
         assert_eq!(w.merkleroot, &raw[72..136]);
         let nonce_hex = &raw[216..280];
         let s = Submit::check(&raw[200..208], &nonce_hex[28..], &raw[280..354], 28, Equihash::REGTEST).unwrap();
@@ -266,64 +277,77 @@ mod tests {
     }
 
     #[test]
-    fn pool_mode_rewrites_output_and_keeps_tag() {
+    fn payout_unset_pays_the_username_and_keeps_the_tag() {
         let t = template();
         let spk = hex::decode(MINER_SPK).unwrap();
-        let w = build_work(&t, &policy(Mode::Pool), Equihash::REGTEST, &params(Some(&spk))).unwrap();
-        let cb = hex::decode(&w.transactions[2..2 + t.coinbasetxn.data.len()]).unwrap();
-        let cb = Coinbase::parse(&cb).unwrap();
+        let pol = policy(None, None);
+        let w = build_work(&t, &pol, Equihash::REGTEST, &params(Some(&spk))).unwrap();
+        let cb = coinbase_of(&w, &t, &pol, &params(Some(&spk)));
         assert_eq!(cb.vout[0].script_pubkey, spk);
         assert_eq!(cb.vout[0].value, 593_750_490);
         assert_eq!(cb.vout.len(), 2);
+        assert_eq!(cb.script_sig, Coinbase::parse(&hex::decode(&t.coinbasetxn.data).unwrap()).unwrap().script_sig, "no --text: scriptSig untouched");
         assert_eq!(w.tag_kind(), "quote");
-        assert_ne!(w.merkleroot, build_work(&t, &policy(Mode::Solo), Equihash::REGTEST, &params(None)).unwrap().merkleroot);
-        assert!(build_work(&t, &policy(Mode::Pool), Equihash::REGTEST, &params(None)).is_err());
+        assert_ne!(w.merkleroot, build_work(&t, &policy(fixed(NODE_SPK), None), Equihash::REGTEST, &params(None)).unwrap().merkleroot);
+        // no --payout and no authorized address: no work
+        assert!(build_work(&t, &policy(None, None), Equihash::REGTEST, &params(None)).is_err());
     }
 
     #[test]
-    fn cenote_mode_carries_flags_and_text() {
+    fn payout_set_ignores_the_username() {
+        let t = template();
+        let miner = hex::decode(MINER_SPK).unwrap();
+        for text in [None, Some(TEXT)] {
+            let pol = policy(fixed(MINER_SPK), text);
+            let w = build_work(&t, &pol, Equihash::REGTEST, &params(None)).unwrap();
+            let cb = coinbase_of(&w, &t, &pol, &params(None));
+            assert_eq!(cb.vout[0].script_pubkey, miner);
+            assert_eq!(cb.vout[0].value, 593_750_490);
+            assert_eq!(w.tag_kind(), "quote");
+            // the miner's own address does not change the block
+            let w2 = build_work(&t, &policy(fixed(MINER_SPK), text), Equihash::REGTEST, &params(Some(&hex::decode(NODE_SPK).unwrap()))).unwrap();
+            assert_eq!(w2.merkleroot, w.merkleroot);
+        }
+    }
+
+    #[test]
+    fn text_set_carries_flags_and_text() {
         let t = template();
         let spk = hex::decode(MINER_SPK).unwrap();
-        // the rebuilt scriptSig is 2 + 37 + 1 + 22 bytes against the template's 2 + 1 + 37
-        let cb_hex_len = t.coinbasetxn.data.len() + 2 * 22;
-        let coinbase_of = |w: &Work| Coinbase::parse(&hex::decode(&w.transactions[2..2 + cb_hex_len]).unwrap()).unwrap();
-        let w = build_work(&t, &policy(Mode::Cenote), Equihash::REGTEST, &params(Some(&spk))).unwrap();
-        assert_eq!(w.tag_kind(), "quote");
-        assert_eq!(w.text_truncated_to, None);
-        let sig = &w.coinbase_script_sig;
-        assert_eq!(&sig[..2], [0x01, 0x69]);
-        assert_eq!(&sig[2..39], &t.flags_bytes().unwrap()[..]);
-        assert_eq!(&sig[40..], b"www.FreeSoloMining.com");
-        let cb = coinbase_of(&w);
-        assert_eq!(cb.script_sig, *sig);
-        assert_eq!(cb.vout[0].script_pubkey, spk);
-        assert_eq!(cb.vout[0].value, 593_750_490);
-        // burn: 0 to the miner
-        let mut p = params(Some(&spk));
-        p.burn = true;
-        let w = build_work(&t, &policy(Mode::Cenote), Equihash::REGTEST, &p).unwrap();
-        let cb = coinbase_of(&w);
-        assert_eq!(cb.vout[0].value, 0);
-        assert_eq!(cb.vout[0].script_pubkey, spk);
-        assert_eq!(tag_kind(&cb.script_sig), "quote");
-        // scrooge: the node's output stays
-        let mut pol = policy(Mode::Cenote);
-        pol.scrooge = true;
-        let w = build_work(&t, &pol, Equihash::REGTEST, &params(None)).unwrap();
-        let cb = coinbase_of(&w);
-        assert_eq!(hex::encode(&cb.vout[0].script_pubkey), "76a914b5521b95530df65bec840c03c0e90a126c67625888ac");
-        assert_eq!(w.tag_kind(), "quote");
+        for payout in [None, fixed(NODE_SPK)] {
+            let pol = policy(payout.clone(), Some(TEXT));
+            let w = build_work(&t, &pol, Equihash::REGTEST, &params(Some(&spk))).unwrap();
+            assert_eq!(w.tag_kind(), "quote");
+            assert_eq!(w.text_truncated_to, None);
+            // the rebuilt scriptSig is 2 + 37 + 1 + 22 bytes against the template's 2 + 1 + 37
+            let sig = &w.coinbase_script_sig;
+            assert_eq!(sig.len(), 2 + 37 + 1 + 22);
+            assert_eq!(&sig[..2], [0x01, 0x69]);
+            assert_eq!(&sig[2..39], &t.flags_bytes().unwrap()[..]);
+            assert_eq!(&sig[40..], TEXT);
+            let cb = coinbase_of(&w, &t, &pol, &params(Some(&spk)));
+            assert_eq!(cb.script_sig, *sig);
+            assert_eq!(cb.vout[0].value, 593_750_490);
+            let want = if payout.is_some() { hex::decode(NODE_SPK).unwrap() } else { spk.clone() };
+            assert_eq!(cb.vout[0].script_pubkey, want);
+            assert_eq!(tag_kind(&cb.script_sig), "quote");
+        }
         // the Perl's behaviour (no flags) drops the tag: Y-F1
-        let mut pol = policy(Mode::Cenote);
+        let mut pol = policy(None, Some(TEXT));
         pol.no_flags = true;
         let w = build_work(&t, &pol, Equihash::REGTEST, &params(Some(&spk))).unwrap();
         assert_eq!(w.tag_kind(), "none");
+        assert_eq!(&w.coinbase_script_sig[..2], [0x01, 0x69]);
+        assert_eq!(&w.coinbase_script_sig[3..], TEXT);
         // long text is truncated and reported
-        let mut pol = policy(Mode::Cenote);
-        pol.text = vec![b'y'; 120];
-        let w = build_work(&t, &pol, Equihash::REGTEST, &params(Some(&spk))).unwrap();
+        let long = vec![b'y'; 120];
+        let w = build_work(&t, &policy(None, Some(&long)), Equihash::REGTEST, &params(Some(&spk))).unwrap();
         assert_eq!(w.coinbase_script_sig.len(), MAX_COINBASE_SCRIPTSIG);
         assert_eq!(w.text_truncated_to, Some(100 - 2 - 37 - 1));
+        assert_eq!(w.tag_kind(), "quote");
+        // empty text: height push ‖ flags, nothing pushed
+        let w = build_work(&t, &policy(None, Some(b"")), Equihash::REGTEST, &params(Some(&spk))).unwrap();
+        assert_eq!(w.coinbase_script_sig.len(), 2 + 37);
         assert_eq!(w.tag_kind(), "quote");
     }
 
@@ -331,22 +355,30 @@ mod tests {
     fn plain_node_without_flags_behaves_like_the_perl() {
         let t: BlockTemplate = serde_json::from_str(include_str!("../tests/vectors/regtest-template-4-noflags.json")).unwrap();
         let spk = hex::decode(MINER_SPK).unwrap();
-        for mode in [Mode::Solo, Mode::Pool, Mode::Cenote] {
-            let w = build_work(&t, &policy(mode), Equihash::REGTEST, &params(Some(&spk))).unwrap();
-            assert_eq!(w.tag_kind(), "none");
-            assert_eq!(w.transaction_count, 1);
+        for payout in [None, fixed(NODE_SPK)] {
+            for text in [None, Some(TEXT)] {
+                let w = build_work(&t, &policy(payout.clone(), text), Equihash::REGTEST, &params(Some(&spk))).unwrap();
+                assert_eq!(w.tag_kind(), "none");
+                assert_eq!(w.transaction_count, 1);
+            }
         }
-        let w = build_work(&t, &policy(Mode::Cenote), Equihash::REGTEST, &params(Some(&spk))).unwrap();
+        let w = build_work(&t, &policy(None, Some(TEXT)), Equihash::REGTEST, &params(Some(&spk))).unwrap();
         assert_eq!(w.coinbase_script_sig[0], 0x54);
-        assert_eq!(&w.coinbase_script_sig[2..], b"www.FreeSoloMining.com");
+        assert_eq!(&w.coinbase_script_sig[2..], TEXT);
     }
 
     #[test]
     fn size_limit_stops_selection() {
         let mut t = template();
         t.sizelimit = Some(HEADER_SIZE + 37 + 9 + t.coinbasetxn.data.len() / 2 + 245 + 10);
-        let w = build_work(&t, &policy(Mode::Solo), Equihash::REGTEST, &params(None)).unwrap();
+        let w = build_work(&t, &policy(fixed(NODE_SPK), None), Equihash::REGTEST, &params(None)).unwrap();
         assert_eq!(w.transaction_count, 2);
+    }
+
+    #[test]
+    fn payout_label_for_status() {
+        assert_eq!(policy(None, None).payout_label(), "username");
+        assert_eq!(policy(fixed(NODE_SPK), None).payout_label(), "fixed");
     }
 
     #[test]

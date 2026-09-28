@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::state::State;
 use crate::template::BlockTemplate;
-use crate::work::{build_work, BuildParams, Mode};
+use crate::work::{build_work, BuildParams};
 
 pub fn now_unix() -> u32 {
     std::time::SystemTime::now()
@@ -54,25 +54,12 @@ pub fn apply_template(state: &State, template: BlockTemplate) -> bool {
     g.template_at = Some(Instant::now());
     g.generation += 1;
     let generation = g.generation;
-    // Solo mode: one job for everyone, numbered by template change (`$work->{'worknumber'}`).
-    if state.policy.mode == Mode::Solo {
-        g.solo_work_number += 1;
-        let now = job_time(g.template.as_ref().unwrap());
-        let params = BuildParams { job_id: g.solo_work_number.to_string(), miner_script_pubkey: None, burn: false, now };
-        match build_work(g.template.as_ref().unwrap(), &state.policy, state.equihash, &params) {
-            Ok(w) => g.solo_work = Some(w),
-            Err(e) => {
-                error!("cannot build work from template: {}", e);
-                g.solo_work = None;
-            }
-        }
-    }
-    // Log the tag on every work build, per mode, against the node's own flags.
+    // Log the tag on every template change by building a probe job under the policy (a
+    // placeholder payout script stands in for the username when there is no `--payout`).
     let t = g.template.clone().unwrap();
     let probe = BuildParams {
         job_id: "probe".into(),
         miner_script_pubkey: Some(&[0x76, 0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0xac]),
-        burn: false,
         now: job_time(&t),
     };
     match build_work(&t, &state.policy, state.equihash, &probe) {

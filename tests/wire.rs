@@ -9,6 +9,12 @@
 //! Ordering: the Perl interleaves notifications with responses by timing (its select loop
 //! sends the target and the job in the write phase after a request was answered), so the
 //! responses and the notifications are compared as two ordered streams.
+//!
+//! Modes became the payout × text flag pair (Y7): the `stratumsolo` fixture replays under
+//! `--payout <the fixture's address>`, the `cenote` fixtures under `--text`. One
+//! `stratumsolo`-only behaviour was dropped with the modes: it re-issued the target and the
+//! same job after `mining.extranonce.subscribe` (`stratumsolo:101-105`), which the pool
+//! variants only acknowledge; the fixture's second copy of that pair is not expected.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -20,10 +26,44 @@ use tokio::net::{TcpListener, TcpStream};
 
 use yolo::equihash::{Equihash, EquihashArg};
 use yolo::rpc::{RpcAuth, RpcClient};
-use yolo::work::{Mode, Policy};
 use yolo::Config;
 
 const TEMPLATE: &str = include_str!("vectors/regtest-template-105.json");
+/// The address every fixture authorizes with (the fake node validates `sm…` of 35 chars).
+const FIXTURE_ADDRESS: &str = "smJS1rf66HdSykf6spi4kbRCA2mcw3xYftW";
+
+/// The flag pair a fixture replays under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Flags {
+    /// `--payout <FIXTURE_ADDRESS>` (the `stratumsolo` policy) or unset (the username is paid).
+    payout: bool,
+    /// `--text www.FreeSoloMining.com` (the `cenote` policy) or unset.
+    text: bool,
+}
+
+impl Flags {
+    const SOLO: Flags = Flags { payout: true, text: false };
+    const POOL: Flags = Flags { payout: false, text: false };
+    const CENOTE: Flags = Flags { payout: false, text: true };
+}
+
+impl std::fmt::Display for Flags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "payout={} text={}", if self.payout { "fixed" } else { "username" }, self.text)
+    }
+}
+
+fn config(flags: Flags, status: bool) -> Config {
+    Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        status_bind: status.then(|| "127.0.0.1:0".parse().unwrap()),
+        payout: flags.payout.then(|| FIXTURE_ADDRESS.to_string()),
+        text: flags.text.then(|| b"www.FreeSoloMining.com".to_vec()),
+        no_flags: false,
+        password: None,
+        equihash: EquihashArg::Fixed(Equihash::REGTEST),
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Row {
@@ -151,17 +191,9 @@ async fn fake_node_advancing(
     (addr, submitted, current)
 }
 
-async fn start_server(mode: Mode, node: SocketAddr) -> SocketAddr {
+async fn start_server(flags: Flags, node: SocketAddr) -> SocketAddr {
     let rpc = RpcClient::new(&format!("http://{}", node), &RpcAuth { user: "u".into(), password: "p".into() });
-    let config = Config {
-        bind: "127.0.0.1:0".parse().unwrap(),
-        status_bind: None,
-        policy: Policy { mode, text: b"www.FreeSoloMining.com".to_vec(), scrooge: false, no_flags: false },
-        password: None,
-        cenote: 0,
-        equihash: EquihashArg::Fixed(Equihash::REGTEST),
-    };
-    let bound = yolo::bind(rpc, config).await.unwrap();
+    let bound = yolo::bind(rpc, config(flags, false)).await.unwrap();
     let addr = bound.addr;
     let state = bound.state();
     tokio::spawn(bound.serve());
@@ -195,10 +227,10 @@ fn normalise(actual: &str, fixture: &str) -> String {
     out
 }
 
-async fn replay(name: &str, mode: Mode) -> Vec<String> {
+async fn replay(name: &str, flags: Flags) -> Vec<String> {
     let rows = load_fixture(name);
     let (node, submitted) = fake_node(template_from_fixture(&rows)).await;
-    let addr = start_server(mode, node).await;
+    let addr = start_server(flags, node).await;
     let stream = TcpStream::connect(addr).await.unwrap();
     let (rd, mut wr) = stream.into_split();
     let mut lines = BufReader::new(rd).lines();
@@ -206,7 +238,15 @@ async fn replay(name: &str, mode: Mode) -> Vec<String> {
     let sends: Vec<&Row> = rows.iter().filter(|r| r.dir == "send").collect();
     let recvs: Vec<&Row> = rows.iter().filter(|r| r.dir == "recv").collect();
     let expected_responses: Vec<&Row> = recvs.iter().copied().filter(|r| !r.line.contains("\"method\"")).collect();
-    let expected_notifications: Vec<&Row> = recvs.iter().copied().filter(|r| r.line.contains("\"method\"")).collect();
+    // The `stratumsolo` re-issue after `mining.extranonce.subscribe` is a second, identical
+    // copy of the target + job pair; the single pool acknowledges only (Y7), so a notification
+    // already expected is not expected twice.
+    let mut expected_notifications: Vec<&Row> = Vec::new();
+    for r in recvs.iter().copied().filter(|r| r.line.contains("\"method\"")) {
+        if !expected_notifications.iter().any(|e| e.line == r.line) {
+            expected_notifications.push(r);
+        }
+    }
 
     // Send the client's lines in order; one submit's nonce2 is whatever the fixture holds and
     // the fake node accepts anything, as the real node did in the recording.
@@ -252,7 +292,7 @@ async fn replay(name: &str, mode: Mode) -> Vec<String> {
 
 #[tokio::test]
 async fn solo_matches_perl_stratumsolo() {
-    let blocks = replay("stratum-perl-solo.jsonl", Mode::Solo).await;
+    let blocks = replay("stratum-perl-solo.jsonl", Flags::SOLO).await;
     // the block the server assembled: header fields from the fixture's notify, nonce1 ‖ nonce2,
     // the solution as sent, then the coinbase as the template gave it
     let block = &blocks[0];
@@ -268,6 +308,8 @@ async fn solo_matches_perl_stratumsolo() {
     assert_eq!(&block[244..280], sp[3].as_str().unwrap(), "nonce2 after the 28-char nonce1");
     assert_eq!(&block[280..354], sp[4].as_str().unwrap());
     assert!(block[354..].starts_with("01"));
+    // `--payout` rewrites vout[0] structurally to the fixture address's script, which is the
+    // template's own: the coinbase is byte for byte the node's (the `stratumsolo` outcome).
     let t: Value = serde_json::from_str(TEMPLATE).unwrap();
     assert_eq!(&block[356..], t["coinbasetxn"]["data"].as_str().unwrap());
 }
@@ -276,7 +318,7 @@ async fn solo_matches_perl_stratumsolo() {
 async fn cenote_matches_perl_cenote() {
     // The unpatched Perl `cenote` fixture: the wire shapes are the same; the coinbase is not
     // (the Rust server keeps the flags, which is the point: Y-F1).
-    let blocks = replay("stratum-perl-cenote.jsonl", Mode::Cenote).await;
+    let blocks = replay("stratum-perl-cenote.jsonl", Flags::CENOTE).await;
     let cb = hex::decode(&blocks[0][356..]).unwrap();
     let cb = yolo::tx::Coinbase::parse(&cb).unwrap();
     assert_eq!(yolo::tag::tag_kind(&cb.script_sig), "quote");
@@ -285,20 +327,52 @@ async fn cenote_matches_perl_cenote() {
 
 #[tokio::test]
 async fn cenote_fixed_matches_perl_cenote() {
-    replay("stratum-perl-cenote-fixed.jsonl", Mode::Cenote).await;
+    replay("stratum-perl-cenote-fixed.jsonl", Flags::CENOTE).await;
 }
 
 #[tokio::test]
-async fn pool_mode_uses_the_same_shapes_as_cenote() {
-    // No Perl `stratumpool` recording exists; its wire code is the `cenote` one.
-    replay("stratum-perl-cenote.jsonl", Mode::Pool).await;
+async fn every_flag_pair_uses_the_same_shapes() {
+    // No Perl `stratumpool` recording exists; its wire code is the `cenote` one. The four
+    // cells of the grid all speak it.
+    for flags in [Flags::POOL, Flags::SOLO, Flags::CENOTE, Flags { payout: true, text: true }] {
+        replay("stratum-perl-cenote.jsonl", flags).await;
+    }
+}
+
+#[tokio::test]
+async fn payout_unset_rejects_a_username_that_is_not_an_address() {
+    let rows = load_fixture("stratum-perl-solo.jsonl");
+    let (node, _) = fake_node(template_from_fixture(&rows)).await;
+    let addr = start_server(Flags::POOL, node).await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"t\",null,\"127.0.0.1\",\"1\"]}\n{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"worker1\",\"x\"]}\n").await.unwrap();
+    let mut out = String::new();
+    tokio::time::timeout(Duration::from_secs(5), s.read_to_string(&mut out)).await.expect("server should close").unwrap();
+    assert!(out.ends_with("{\"id\":2,\"result\": false,\"error\": \"Invalid address\"}\n"), "{}", out);
+    // with --payout the same username is a worker name
+    let rows = load_fixture("stratum-perl-solo.jsonl");
+    let (node, _) = fake_node(template_from_fixture(&rows)).await;
+    let addr = start_server(Flags::SOLO, node).await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (rd, mut wr) = stream.into_split();
+    let mut lines = BufReader::new(rd).lines();
+    wr.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"t\",null,\"127.0.0.1\",\"1\"]}\n{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"worker1\",\"x\"]}\n").await.unwrap();
+    let _subscribe = next_line(&mut lines).await;
+    assert_eq!(next_line(&mut lines).await, "{\"id\":2,\"result\": true,\"error\": null}");
+    let mut saw_job = false;
+    for _ in 0..2 {
+        if next_line(&mut lines).await.contains("mining.notify") {
+            saw_job = true;
+        }
+    }
+    assert!(saw_job, "a worker name gets work under --payout");
 }
 
 #[tokio::test]
 async fn garbage_and_unknown_methods_disconnect() {
     let rows = load_fixture("stratum-perl-solo.jsonl");
     let (node, _) = fake_node(template_from_fixture(&rows)).await;
-    let addr = start_server(Mode::Solo, node).await;
+    let addr = start_server(Flags::SOLO, node).await;
     for bad in ["not json\n", "{\"id\":1,\"method\":\"mining.get_transactions\",\"params\":[]}\n"] {
         let mut s = TcpStream::connect(addr).await.unwrap();
         s.write_all(bad.as_bytes()).await.unwrap();
@@ -313,15 +387,7 @@ async fn status_endpoint_reports_the_pool() {
     let rows = load_fixture("stratum-perl-solo.jsonl");
     let (node, _) = fake_node(template_from_fixture(&rows)).await;
     let rpc = RpcClient::new(&format!("http://{}", node), &RpcAuth { user: "u".into(), password: "p".into() });
-    let config = Config {
-        bind: "127.0.0.1:0".parse().unwrap(),
-        status_bind: Some("127.0.0.1:0".parse().unwrap()),
-        policy: Policy { mode: Mode::Solo, text: vec![], scrooge: false, no_flags: false },
-        password: None,
-        cenote: 0,
-        equihash: EquihashArg::Fixed(Equihash::REGTEST),
-    };
-    let bound = yolo::bind(rpc, config).await.unwrap();
+    let bound = yolo::bind(rpc, config(Flags::SOLO, true)).await.unwrap();
     let status_addr = bound.status_addr.unwrap();
     let state = bound.state();
     tokio::spawn(bound.serve());
@@ -339,7 +405,9 @@ async fn status_endpoint_reports_the_pool() {
     let body: Value = serde_json::from_str(out.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert_eq!(body["height"], 105);
     assert_eq!(body["tag"], "quote");
-    assert_eq!(body["mode"], "solo");
+    assert_eq!(body["payout"], FIXTURE_ADDRESS);
+    assert_eq!(body["text"], false);
+    assert!(body.get("mode").is_none() && body.get("cenoteLeft").is_none(), "{}", body);
     assert_eq!(body["equihash"], "48,5");
     assert_eq!(body["miners"], 0);
     let _: HashMap<String, Value> = serde_json::from_value(body).unwrap();
@@ -354,14 +422,14 @@ async fn next_line(lines: &mut tokio::io::Lines<BufReader<tokio::net::tcp::Owned
 /// re-issued in between (a fast solver would re-solve it and be rejected `inconclusive`).
 #[tokio::test]
 async fn accepted_submit_refreshes_the_template_before_the_next_job() {
-    for mode in [Mode::Solo, Mode::Pool] {
+    for mode in [Flags::SOLO, Flags::POOL] {
         let rows = load_fixture("stratum-perl-solo.jsonl");
         let (node, _, _) = fake_node_advancing(template_from_fixture(&rows), true).await;
         let addr = start_server(mode, node).await;
         let stream = TcpStream::connect(addr).await.unwrap();
         let (rd, mut wr) = stream.into_split();
         let mut lines = BufReader::new(rd).lines();
-        let user = if mode == Mode::Solo { "stratum-miner" } else { "smJS1rf66HdSykf6spi4kbRCA2mcw3xYftW" };
+        let user = if mode.payout { "stratum-miner" } else { FIXTURE_ADDRESS };
         wr.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"t\",null,\"127.0.0.1\",\"1\"]}\n").await.unwrap();
         let _subscribe = next_line(&mut lines).await;
         wr.write_all(format!("{{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"{}\",\"x\"]}}\n", user).as_bytes()).await.unwrap();

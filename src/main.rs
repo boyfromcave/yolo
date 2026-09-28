@@ -5,39 +5,34 @@ use clap::Parser;
 
 use yolo::equihash::EquihashArg;
 use yolo::rpc::{read_cookie, ConfFile, RpcAuth, RpcClient};
-use yolo::work::{Mode, Policy};
 use yolo::Config;
 
-/// Ycash solo-pool stratum server (yolo), Yellowback tag aware.
+/// Ycash stratum pool (yolo), Yellowback tag aware.
 ///
-/// Modes: solo pays the node's mineraddress with the coinbase as the node built it; pool
-/// pays each miner's stratum username (a transparent address); cenote rebuilds the coinbase
-/// scriptSig (height, coinbaseaux.flags, --text) and can burn rewards (--cenote N) or keep
-/// them all for the node (--scrooge).
+/// Two flags decide the coinbase. --payout unset: each miner's stratum username is its
+/// payout address (checked with validateaddress); set: every block pays that address and
+/// the username is just a worker name. --text unset: the node's coinbase scriptSig is used
+/// as is; set: it is rebuilt as height push, coinbaseaux.flags (the Yellowback tag) and the
+/// text, within 100 bytes. The tag is carried in every combination.
 #[derive(Parser, Debug)]
 #[command(name = "yolo", version, about, long_about = None)]
 struct Cli {
-    /// Coinbase policy.
-    #[arg(long, value_enum, default_value_t = Mode::Solo)]
-    mode: Mode,
-    /// Stratum listen port (the Perl defaults: 3334 solo/cenote, 3333 pool).
-    #[arg(long)]
-    port: Option<u16>,
+    /// Pay every block to this transparent address (unset: the miner's username is paid).
+    #[arg(long, value_name = "ADDRESS")]
+    payout: Option<String>,
+    /// Rebuild the coinbase scriptSig with this text after the node's coinbaseaux.flags
+    /// (unset: the node's scriptSig untouched). Truncated to fit 100 bytes, with a warning.
+    #[arg(long, value_name = "TEXT")]
+    text: Option<String>,
+    /// Stratum listen port.
+    #[arg(long, default_value_t = 3333)]
+    port: u16,
     /// Address to bind the stratum listener to.
     #[arg(long, default_value = "0.0.0.0")]
     bind: String,
     /// Password miners must send in mining.authorize (unset: any).
     #[arg(long)]
     password: Option<String>,
-    /// cenote: text pushed into the coinbase scriptSig after coinbaseaux.flags.
-    #[arg(long, default_value = "www.FreeSoloMining.com")]
-    text: String,
-    /// cenote: burn the next N block rewards (paid as 0 to the finder).
-    #[arg(long, default_value_t = 0, value_name = "N")]
-    cenote: u32,
-    /// cenote: pay every block to the node's mineraddress regardless of the miner's username.
-    #[arg(long)]
-    scrooge: bool,
     /// Node JSON-RPC URL (default from --conf, else http://127.0.0.1:18232 on regtest / 8832).
     #[arg(long, value_name = "URL")]
     rpc: Option<String>,
@@ -62,7 +57,7 @@ struct Cli {
     /// Log level: error, warn, info, debug, trace.
     #[arg(long, default_value = "info")]
     log: String,
-    /// Test only: cenote without the coinbaseaux.flags append (reproduces the Perl; drops the tag).
+    /// Test only: --text without the coinbaseaux.flags append (reproduces the Perl cenote; drops the tag).
     #[arg(long, hide = true)]
     no_flags: bool,
 }
@@ -74,8 +69,8 @@ fn main() {
         std::process::exit(2);
     });
     tracing_subscriber::fmt().with_max_level(level).with_target(false).init();
-    if cli.mode != Mode::Cenote && (cli.cenote > 0 || cli.scrooge || cli.no_flags) {
-        fail("--cenote, --scrooge and --no-flags apply to --mode cenote only");
+    if cli.no_flags && cli.text.is_none() {
+        fail("--no-flags is meaningful only with --text");
     }
 
     let conf = cli.conf.as_deref().map(|p| ConfFile::load(p).unwrap_or_else(|e| fail(&e)));
@@ -107,18 +102,15 @@ fn main() {
     };
     let rpc = RpcClient::new(&url, &auth);
 
-    let port = cli.port.unwrap_or(match cli.mode {
-        Mode::Pool => 3333,
-        _ => 3334,
-    });
-    let bind: SocketAddr = format!("{}:{}", cli.bind, port).parse().unwrap_or_else(|e| fail(&format!("--bind: {}", e)));
+    let bind: SocketAddr = format!("{}:{}", cli.bind, cli.port).parse().unwrap_or_else(|e| fail(&format!("--bind: {}", e)));
     let status_bind = cli.status_port.map(|p| SocketAddr::new(bind.ip(), p));
     let config = Config {
         bind,
         status_bind,
-        policy: Policy { mode: cli.mode, text: cli.text.into_bytes(), scrooge: cli.scrooge, no_flags: cli.no_flags },
+        payout: cli.payout.filter(|a| !a.is_empty()),
+        text: cli.text.map(String::into_bytes),
+        no_flags: cli.no_flags,
         password: cli.password.filter(|p| !p.is_empty()),
-        cenote: cli.cenote,
         equihash: cli.equihash,
     };
 

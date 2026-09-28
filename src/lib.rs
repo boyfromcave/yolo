@@ -24,17 +24,42 @@ use tracing::info;
 use equihash::{Equihash, EquihashArg};
 use rpc::RpcClient;
 use state::Shared;
-use work::Policy;
+use work::{Payout, Policy};
 
 /// Everything `run` needs, as the CLI resolves it.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: SocketAddr,
     pub status_bind: Option<SocketAddr>,
-    pub policy: Policy,
+    /// `--payout`: resolved against the node's `validateaddress` in `bind`.
+    pub payout: Option<String>,
+    /// `--text`, `--no-flags`.
+    pub text: Option<Vec<u8>>,
+    pub no_flags: bool,
     pub password: Option<String>,
-    pub cenote: u32,
     pub equihash: EquihashArg,
+}
+
+/// Resolves `--payout` to its scriptPubKey with `validateaddress`, retrying while the node is
+/// unreachable; an invalid or shielded address is a startup error.
+pub async fn resolve_payout(rpc: &RpcClient, address: &str) -> Result<Payout, String> {
+    loop {
+        let r = rpc.clone();
+        let a = address.to_string();
+        match tokio::task::spawn_blocking(move || r.validateaddress(&a)).await {
+            Ok(Ok(v)) if v.isvalid => {
+                let spk = v.script_pubkey.as_deref().map(hex::decode).transpose().map_err(|e| format!("--payout: scriptPubKey is not hex: {}", e))?;
+                return match spk {
+                    Some(script_pubkey) => Ok(Payout { address: address.to_string(), script_pubkey }),
+                    None => Err(format!("--payout {}: not a transparent address (no scriptPubKey)", address)),
+                };
+            }
+            Ok(Ok(_)) => return Err(format!("--payout {}: invalid address", address)),
+            Ok(Err(e)) => tracing::warn!("validateaddress: {} (retrying in 5 s)", e),
+            Err(e) => tracing::error!("validateaddress task: {}", e),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
 }
 
 /// Resolves `--equihash auto` against the node, retrying while it is unreachable.
@@ -76,10 +101,11 @@ impl Bound {
     /// Serves until the task is dropped.
     pub async fn serve(self) {
         info!(
-            "yolo {} mode {} listening on {} (Equihash {}, node {})",
+            "yolo {} listening on {} (payout {}, text {}, Equihash {}, node {})",
             env!("CARGO_PKG_VERSION"),
-            self.state.policy.mode,
             self.addr,
+            self.state.policy.payout_label(),
+            if self.state.policy.text.is_some() { "set" } else { "node's" },
             self.state.equihash,
             self.state.rpc.url()
         );
@@ -95,6 +121,11 @@ impl Bound {
 /// Resolves the Equihash parameters against the node and binds the listeners.
 pub async fn bind(rpc: RpcClient, config: Config) -> Result<Bound, Box<dyn std::error::Error>> {
     let equihash = resolve_equihash(&rpc, config.equihash).await;
+    let payout = match &config.payout {
+        Some(a) => Some(resolve_payout(&rpc, a).await?),
+        None => None,
+    };
+    let policy = Policy { payout, text: config.text.clone(), no_flags: config.no_flags };
     let listener = TcpListener::bind(config.bind).await.map_err(|e| format!("cannot listen on {}: {}", config.bind, e))?;
     let addr = listener.local_addr()?;
     let (status_listener, status_addr) = match config.status_bind {
@@ -105,7 +136,7 @@ pub async fn bind(rpc: RpcClient, config: Config) -> Result<Bound, Box<dyn std::
         }
         None => (None, None),
     };
-    let (state, generation_rx) = Shared::new(rpc, config.policy.clone(), equihash, config.password.clone(), config.cenote);
+    let (state, generation_rx) = Shared::new(rpc, policy, equihash, config.password.clone());
     Ok(Bound { addr, status_addr, listener, status_listener, state, generation_rx })
 }
 

@@ -9,7 +9,7 @@ use tokio::sync::{watch, Notify};
 use crate::equihash::Equihash;
 use crate::rpc::RpcClient;
 use crate::template::{BlockTemplate, ChangeKey};
-use crate::work::{Policy, Work};
+use crate::work::Policy;
 
 pub struct Inner {
     pub template: Option<BlockTemplate>,
@@ -17,17 +17,12 @@ pub struct Inner {
     pub template_at: Option<Instant>,
     pub generation: u64,
     pub node_up: bool,
-    /// The one job shared by every miner in solo mode (`stratumsolo`'s global `$work`).
-    pub solo_work: Option<Work>,
-    pub solo_work_number: u64,
     pub miners: usize,
     pub clients_seen: u64,
     pub last_tag_kind: &'static str,
     pub last_verdict: String,
     pub accepted: u64,
     pub rejected: u64,
-    /// `--cenote N` blocks still to burn.
-    pub cenote_left: u32,
     /// The `previousblockhash` (wire order, as `Work` carries it) of the last job the node
     /// accepted a block for: a template still on that parent is stale (the node has moved on)
     /// and no work is built from it until the poller brings the next one — otherwise a fast
@@ -60,7 +55,7 @@ pub struct Shared {
 pub type State = Arc<Shared>;
 
 impl Shared {
-    pub fn new(rpc: RpcClient, policy: Policy, equihash: Equihash, password: Option<String>, cenote: u32) -> (State, watch::Receiver<u64>) {
+    pub fn new(rpc: RpcClient, policy: Policy, equihash: Equihash, password: Option<String>) -> (State, watch::Receiver<u64>) {
         let (generation_tx, rx) = watch::channel(0);
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
@@ -69,15 +64,12 @@ impl Shared {
                 template_at: None,
                 generation: 0,
                 node_up: false,
-                solo_work: None,
-                solo_work_number: 0,
                 miners: 0,
                 clients_seen: 0,
                 last_tag_kind: "none",
                 last_verdict: String::new(),
                 accepted: 0,
                 rejected: 0,
-                cenote_left: cenote,
                 accepted_parent: None,
             }),
             generation_tx,
@@ -109,7 +101,8 @@ impl Shared {
     pub fn status_json(&self) -> serde_json::Value {
         let g = self.lock();
         serde_json::json!({
-            "mode": self.policy.mode.to_string(),
+            "payout": self.policy.payout_label(),
+            "text": self.policy.text.is_some(),
             "equihash": self.equihash.to_string(),
             "nodeUp": g.node_up,
             "height": g.template.as_ref().map(|t| t.height),
@@ -119,7 +112,6 @@ impl Shared {
             "lastSubmitVerdict": g.last_verdict,
             "accepted": g.accepted,
             "rejected": g.rejected,
-            "cenoteLeft": g.cenote_left,
             "uptimeSeconds": self.started.elapsed().as_secs(),
         })
     }

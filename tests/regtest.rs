@@ -4,13 +4,14 @@
 //! in-process (`yolo::bind` / `serve`) once per case, drives it with the Python `stratum-miner`
 //! and checks the block on the chain:
 //!
-//! | case | assertion |
+//! | case (payout × text, Y7) | assertion |
 //! |---|---|
-//! | solo | accepted, both nodes at the new height, `yed_gettag` quote at the set price |
-//! | pool | the same, and the coinbase `vout[0]` pays the miner's stratum username |
-//! | cenote | the same, and the scriptSig is exactly height push ‖ `coinbaseaux.flags` ‖ push(text) |
-//! | cenote `--no-flags` | accepted but `yed_gettag` `found: false` (the Perl's behaviour, Y-F1) |
-//! | cenote, 90-byte text | scriptSig exactly 100 bytes, text truncated, tag intact |
+//! | username, no text | accepted, both nodes at the new height, `yed_gettag` quote at the set price, `vout[0]` pays the miner's stratum username, the node's scriptSig kept |
+//! | `--payout <mineraddress>`, no text | the same with the node's address paid; the username is a worker name |
+//! | username, `--text` | pays the username; scriptSig exactly height push ‖ `coinbaseaux.flags` ‖ push(text) |
+//! | `--payout <miner's address>`, `--text` | pays the fixed address; scriptSig rebuilt |
+//! | `--text --no-flags` | accepted but `yed_gettag` `found: false` (the Perl's behaviour, Y-F1) |
+//! | `--text` of 90 bytes | scriptSig exactly 100 bytes, text truncated, tag intact |
 //!
 //! Environment: `YCASHD` (required; unset = skip), `STRATUM_MINER` (default: the ycash-dd
 //! copy beside this repo in the workspace), `PYTHON` (default: the workspace `.venv`),
@@ -27,7 +28,6 @@ use serde_json::{json, Value};
 use yolo::equihash::{Equihash, EquihashArg};
 use yolo::rpc::{RpcAuth, RpcClient};
 use yolo::tag::height_push;
-use yolo::work::{Mode, Policy};
 use yolo::Config;
 
 const QUOTE_MICRO_USD: i64 = 50_000; // $0.05
@@ -168,8 +168,12 @@ fn wait_height(nodes: &[&Node], height: u64, timeout: Duration) -> bool {
 
 struct Case {
     name: &'static str,
-    policy: Policy,
-    /// The stratum username: the miner's payout address in pool/cenote mode.
+    /// `--payout`: the fixed address, or None (the username is paid).
+    payout: Option<String>,
+    /// `--text`.
+    text: Option<String>,
+    no_flags: bool,
+    /// The stratum username: the miner's payout address without `--payout`, any name with it.
     user: String,
 }
 
@@ -186,9 +190,10 @@ async fn run_case(case: &Case, a: &Node, b: &Node, python: &Path, miner: &Path) 
     let config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         status_bind: Some("127.0.0.1:0".parse().unwrap()),
-        policy: case.policy.clone(),
+        payout: case.payout.clone(),
+        text: case.text.as_ref().map(|t| t.as_bytes().to_vec()),
+        no_flags: case.no_flags,
         password: None,
-        cenote: 0,
         equihash: EquihashArg::Fixed(Equihash::REGTEST),
     };
     let bound = yolo::bind(a.rpc.clone(), config).await.unwrap();
@@ -236,6 +241,8 @@ async fn run_case(case: &Case, a: &Node, b: &Node, python: &Path, miner: &Path) 
     assert_eq!(status["accepted"], json!(1), "{}: /status accepted", case.name);
     assert_eq!(status["rejected"], json!(0), "{}: /status rejected", case.name);
     assert_eq!(status["lastSubmitVerdict"], json!("accepted"), "{}: /status verdict", case.name);
+    assert_eq!(status["payout"], json!(case.payout.clone().unwrap_or_else(|| "username".into())), "{}: /status payout", case.name);
+    assert_eq!(status["text"], json!(case.text.is_some()), "{}: /status text", case.name);
     server.abort();
 
     let height = before + 1;
@@ -270,12 +277,8 @@ fn assert_quote(name: &str, tag: &Value, payout: &str) {
     assert_eq!(tag["payoutAddress"], json!(payout), "{}: yed_gettag payout address", name);
 }
 
-fn policy(mode: Mode, text: &str, no_flags: bool) -> Policy {
-    Policy { mode, text: text.as_bytes().to_vec(), scrooge: false, no_flags }
-}
-
 #[tokio::test(flavor = "multi_thread")]
-async fn three_modes_against_a_regtest_node() {
+async fn payout_text_grid_against_a_regtest_node() {
     let Some(ycashd) = std::env::var_os("YCASHD").map(PathBuf::from) else {
         eprintln!("SKIP: YCASHD is not set (point it at a ycash-dd ycashd to run the regtest integration test)");
         return;
@@ -318,52 +321,65 @@ async fn three_modes_against_a_regtest_node() {
 
     let text = "yolo regtest";
     let long_text = "x".repeat(90);
+    let case = |name, payout: Option<&String>, text: Option<&str>, no_flags, user: &str| Case {
+        name,
+        payout: payout.cloned(),
+        text: text.map(String::from),
+        no_flags,
+        user: user.to_string(),
+    };
     let cases = [
-        Case { name: "solo", policy: policy(Mode::Solo, text, false), user: "stratum-miner".into() },
-        Case { name: "pool", policy: policy(Mode::Pool, text, false), user: miner_addr.clone() },
-        Case { name: "cenote", policy: policy(Mode::Cenote, text, false), user: miner_addr.clone() },
-        Case { name: "cenote-no-flags", policy: policy(Mode::Cenote, text, true), user: miner_addr.clone() },
-        Case { name: "cenote-90", policy: policy(Mode::Cenote, &long_text, false), user: miner_addr.clone() },
+        case("username", None, None, false, &miner_addr),
+        case("fixed", Some(&mineraddress), None, false, "stratum-miner"),
+        case("username-text", None, Some(text), false, &miner_addr),
+        case("fixed-text", Some(&miner_addr), Some(text), false, "worker.1"),
+        case("text-no-flags", None, Some(text), true, &miner_addr),
+        case("text-90", None, Some(&long_text), false, &miner_addr),
     ];
     for case in &cases {
         let o = run_case(case, &a, &b, &python, &miner).await;
         let hp = height_push(o.height as u32);
+        let rebuilt = |t: &str| {
+            let mut want = hp.clone();
+            want.extend_from_slice(&flags);
+            want.push(t.len() as u8);
+            want.extend_from_slice(t.as_bytes());
+            want
+        };
         match case.name {
-            "solo" => {
+            "username" => {
                 assert_quote(case.name, &o.tag, &mineraddress);
-                assert_eq!(o.vout0_addresses, vec![mineraddress.clone()], "solo pays the node's mineraddress");
+                assert_eq!(o.vout0_addresses, vec![miner_addr.clone()], "no --payout pays the miner's username");
+                assert!(o.script_sig.starts_with(&hp) && o.script_sig.ends_with(&flags), "no --text keeps the node's scriptSig");
             }
-            "pool" => {
+            "fixed" => {
                 assert_quote(case.name, &o.tag, &mineraddress);
-                assert_eq!(o.vout0_addresses, vec![miner_addr.clone()], "pool pays the miner's username");
-                assert!(o.script_sig.starts_with(&hp) && o.script_sig.ends_with(&flags), "pool keeps the node's scriptSig");
+                assert_eq!(o.vout0_addresses, vec![mineraddress.clone()], "--payout pays the fixed address");
+                assert!(o.script_sig.starts_with(&hp) && o.script_sig.ends_with(&flags), "no --text keeps the node's scriptSig");
             }
-            "cenote" => {
+            "username-text" => {
                 assert_quote(case.name, &o.tag, &mineraddress);
-                assert_eq!(o.vout0_addresses, vec![miner_addr.clone()], "cenote pays the miner's username");
+                assert_eq!(o.vout0_addresses, vec![miner_addr.clone()], "no --payout pays the miner's username");
+                assert_eq!(o.script_sig, rebuilt(text), "--text scriptSig = height push ‖ flags ‖ push(text)");
+            }
+            "fixed-text" => {
+                assert_quote(case.name, &o.tag, &mineraddress);
+                assert_eq!(o.vout0_addresses, vec![miner_addr.clone()], "--payout pays the fixed address, whatever the username");
+                assert_eq!(o.script_sig, rebuilt(text), "--text scriptSig = height push ‖ flags ‖ push(text)");
+            }
+            "text-no-flags" => {
+                assert_eq!(o.tag["found"], json!(false), "--text --no-flags drops the tag (Y-F1): {}", o.tag);
                 let mut want = hp.clone();
-                want.extend_from_slice(&flags);
                 want.push(text.len() as u8);
                 want.extend_from_slice(text.as_bytes());
-                assert_eq!(o.script_sig, want, "cenote scriptSig = height push ‖ flags ‖ push(text)");
+                assert_eq!(o.script_sig, want, "--no-flags scriptSig = height push ‖ push(text)");
             }
-            "cenote-no-flags" => {
-                assert_eq!(o.tag["found"], json!(false), "cenote --no-flags drops the tag (Y-F1): {}", o.tag);
-                let mut want = hp.clone();
-                want.push(text.len() as u8);
-                want.extend_from_slice(text.as_bytes());
-                assert_eq!(o.script_sig, want, "cenote --no-flags scriptSig = height push ‖ push(text)");
-            }
-            "cenote-90" => {
+            "text-90" => {
                 assert_quote(case.name, &o.tag, &mineraddress);
-                assert_eq!(o.script_sig.len(), 100, "cenote at the scriptSig limit: exactly 100 bytes");
+                assert_eq!(o.script_sig.len(), 100, "--text at the scriptSig limit: exactly 100 bytes");
                 let fixed = hp.len() + flags.len();
                 let used = 100 - fixed - 1;
-                let mut want = hp.clone();
-                want.extend_from_slice(&flags);
-                want.push(used as u8);
-                want.extend_from_slice(&long_text.as_bytes()[..used]);
-                assert_eq!(o.script_sig, want, "cenote truncates the text to fit, tag intact");
+                assert_eq!(o.script_sig, rebuilt(&long_text[..used]), "--text is truncated to fit, tag intact");
             }
             _ => unreachable!(),
         }

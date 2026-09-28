@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::poller::job_time;
 use crate::state::State;
-use crate::work::{assemble_block, build_work, BuildParams, Mode, Submit, Work};
+use crate::work::{assemble_block, build_work, BuildParams, Submit, Work};
 
 /// Bytes of nonce the pool fixes per client: the Perl's `nonce1_size` is 16 but
 /// `sprintf("%04x", id) . newkey(16 - 4)` yields 4 + 24 = 28 hex chars, i.e. 14 bytes
@@ -206,22 +206,19 @@ impl Client {
             self.ready = true;
         }
         if !self.mining {
-            let work = if state.policy.mode == Mode::Solo {
-                g.solo_work.clone()
-            } else {
-                self.work_number += 1;
-                let params = BuildParams {
-                    job_id: self.work_number.to_string(),
-                    miner_script_pubkey: self.script_pubkey.as_deref(),
-                    burn: g.cenote_left > 0,
-                    now: job_time(template),
-                };
-                match build_work(template, &state.policy, state.equihash, &params) {
-                    Ok(w) => Some(w),
-                    Err(e) => {
-                        warn!("miner {}: cannot build work: {}", self.index, e);
-                        None
-                    }
+            // One job per client, numbered by a per-client counter (`stratumpool`'s
+            // `$client->{'worknumber'}`; the `stratumsolo` global job is gone with the modes, Y7).
+            self.work_number += 1;
+            let params = BuildParams {
+                job_id: self.work_number.to_string(),
+                miner_script_pubkey: self.script_pubkey.as_deref(),
+                now: job_time(template),
+            };
+            let work = match build_work(template, &state.policy, state.equihash, &params) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    warn!("miner {}: cannot build work: {}", self.index, e);
+                    None
                 }
             };
             drop(g);
@@ -269,12 +266,14 @@ impl Client {
                         return Action::Disconnect;
                     }
                 }
-                if state.policy.mode == Mode::Solo {
+                if let Some(fixed) = &state.policy.payout {
+                    // --payout: every block pays the fixed address; the username is a worker name.
                     self.auth = true;
                     out.push_str(&msg_authorized(&id));
+                    info!("miner {}: authorized as {:?}, paying {}", self.index, self.worker, fixed.address);
                     return Action::Continue;
                 }
-                // pool / cenote: the username is the payout address
+                // no --payout: the username is the payout address
                 let rpc = state.rpc.clone();
                 let address = self.worker.clone();
                 let result = tokio::task::spawn_blocking(move || rpc.validateaddress(&address)).await;
@@ -310,12 +309,8 @@ impl Client {
                 }
             }
             "mining.extranonce.subscribe" => {
-                // `stratumsolo:101-105` re-issues target + work here; `stratumpool` and
-                // `cenote` only acknowledge. Kept per mode so the recorded exchanges replay.
-                if state.policy.mode == Mode::Solo {
-                    self.mining = false;
-                    self.ready = false;
-                }
+                // Acknowledged only, as `stratumpool` and `cenote` do. (`stratumsolo:101-105`
+                // re-issued the target and the same job here; dropped with the modes, Y7.)
                 out.push_str(&msg_extranonce(&id));
                 Action::Continue
             }
@@ -358,11 +353,6 @@ impl Client {
             Ok(Ok(None)) => {
                 info!("miner {}: block {} accepted by the node (job {}, tag {})", self.index, work.height, job_id, work.tag_kind());
                 state.block_accepted(&work.previousblockhash);
-                let mut g = state.lock();
-                if g.cenote_left > 0 {
-                    g.cenote_left -= 1;
-                    info!("cenote: {} block(s) left to burn", g.cenote_left);
-                }
                 true
             }
             Ok(Ok(Some(verdict))) => {
