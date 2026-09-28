@@ -1,0 +1,58 @@
+{
+  "capabilities": [
+    "proposal"
+  ],
+  "version": 4,
+  "previousblockhash": "09dec14104a3733203e044e114ff3530803bfa8317a8fe2454fa00ef1c7daa04",
+  "lightclientroothash": "a7781dd48ddbcf3dca287f0cbdcd571d9003266c40c2c6adba6605404f407e9f",
+  "finalsaplingroothash": "a7781dd48ddbcf3dca287f0cbdcd571d9003266c40c2c6adba6605404f407e9f",
+  "transactions": [
+  ],
+  "coinbasetxn": {
+    "data": "0400008085202f89010000000000000000000000000000000000000000000000000000000000000000ffffffff025400ffffffff02f0e76323000000001976a9143ccfe0a792ed585c176530a19c57165d9ae1c51288ac50d6dc01000000001976a91409beeb250c2f6b918dbd5e5a065f5b14d51faea288ac00000000000000000000000000000000000000",
+    "hash": "26e4368e52030a144296d6739f1866480957314306371fdd4191d557d800aaea",
+    "depends": [
+    ],
+    "fee": 0,
+    "sigops": 2,
+    "ydfpercentage": 5,
+    "foundersreward": 31250000,
+    "foundersaddress": "smDw2LWkeuJ1NGBDDZvdNbzY8A9D1mkkDZm",
+    "required": true
+  },
+  "coinbaseaux": {
+    "flags": ""
+  },
+  "longpollid": "09dec14104a3733203e044e114ff3530803bfa8317a8fe2454fa00ef1c7daa045",
+  "target": "0f0f0f0000000000000000000000000000000000000000000000000000000000",
+  "mintime": 1790581885,
+  "mutable": [
+    "time",
+    "transactions",
+    "prevblock",
+    "coinbase/append"
+  ],
+  "noncerange": "00000000ffffffff",
+  "sigoplimit": 20000,
+  "sizelimit": 2000000,
+  "curtime": 1790581885,
+  "bits": "200f0f0f",
+  "height": 4,
+  "yellowback": {
+    "tag": "",
+    "kind": "none",
+    "priceMicroUsd": 0,
+    "quoteAgeSeconds": null,
+    "signal": false,
+    "payoutAddress": null,
+    "registered": false,
+    "eligible": false,
+    "activation": "signaling",
+    "signalCount": 0,
+    "enforcing": true,
+    "valveTripped": false,
+    "sunset": false,
+    "healthy": true,
+    "templatePolicy": "strict"
+  }
+}

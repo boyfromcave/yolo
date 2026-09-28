@@ -1,0 +1,74 @@
+{
+  "capabilities": [
+    "proposal"
+  ],
+  "version": 4,
+  "previousblockhash": "04f9b48cdb86490d6c7f9f0c5fbf8409cfacc9800a37fe6642f5c260b4cde5f9",
+  "lightclientroothash": "b95a1b9634a9157950252feeb9885ed1c9764e1741da98a6202abae39c454753",
+  "finalsaplingroothash": "b95a1b9634a9157950252feeb9885ed1c9764e1741da98a6202abae39c454753",
+  "transactions": [
+    {
+      "data": "0400008085202f8901fc5e0e5bd051809baac433f9ae7847ba023c895e22163948f5a79f3db05df775000000006b483045022100d427143b9a976e4772fe24454b53140fd824cc46fe661a450d5c3a19e5feef090220629f290dded81e74fa8b8d6dd7479266bb7061044759d4a9420285e283c8522901210354845a0e1f5ba9b58f17a58c0ac2df1c165db161645b31e845f916a35980997bfeffffff0280d1f008000000001976a91492323df36253f52973ac6515e62601674e2a2fe888ac7b15731a000000001976a9141b7c6947735c0c9357ad3413f953d4cc4064693b88ac5e000000910000000000000000000000000000",
+      "hash": "a80555562c7669ae53157f380e77e40a0a60e6b5066c3c84122ecf3d3f44f331",
+      "depends": [
+      ],
+      "fee": 245,
+      "sigops": 2
+    },
+    {
+      "data": "0400008085202f8901b0b90ee3d48fac3078144d3f42300d91bcf5eab4acb1a7f330f6666fcc6845b7000000006b483045022100c61628303380c42037b73b29f2743d7e63878db64e67d49cc4dead66fbc74f8f022002342fc63429134e3e545f038158a0ce3714ae9d4e5f5b57aff444f7ab49932a0121038d5e7f9ea844ca3baf803aca5c57e5b903b1f9b11a92d92790a587a1c26f7030feffffff0240787d01000000001976a91492323df36253f52973ac6515e62601674e2a2fe888acbb6ee621000000001976a9149d3c20cb3e26e8885a68af60843efdc300eee14288ac5e000000910000000000000000000000000000",
+      "hash": "fb9d25619e7c33e39b6201184641cb411bda65bba9ea05e4da114278dd5fbe40",
+      "depends": [
+      ],
+      "fee": 245,
+      "sigops": 2
+    }
+  ],
+  "coinbasetxn": {
+    "data": "0400008085202f89010000000000000000000000000000000000000000000000000000000000000000ffffffff280169002459454421010140e2010000000000030092323df36253f52973ac6515e62601674e2a2fe8ffffffff02dae96323000000001976a914b5521b95530df65bec840c03c0e90a126c67625888ac50d6dc01000000001976a91409beeb250c2f6b918dbd5e5a065f5b14d51faea288ac00000000000000000000000000000000000000",
+    "hash": "678fb48e165fb890f7ca3e69c24d1d286f2750e93c26ced7bd470979dc7e1476",
+    "depends": [
+    ],
+    "fee": -490,
+    "sigops": 2,
+    "ydfpercentage": 5,
+    "foundersreward": 31250000,
+    "foundersaddress": "smDw2LWkeuJ1NGBDDZvdNbzY8A9D1mkkDZm",
+    "required": false
+  },
+  "coinbaseaux": {
+    "flags": "2459454421010140e2010000000000030092323df36253f52973ac6515e62601674e2a2fe8"
+  },
+  "longpollid": "04f9b48cdb86490d6c7f9f0c5fbf8409cfacc9800a37fe6642f5c260b4cde5f9104",
+  "target": "0f0f0f0000000000000000000000000000000000000000000000000000000000",
+  "mintime": 1790581942,
+  "mutable": [
+    "time",
+    "transactions",
+    "prevblock",
+    "coinbase/append"
+  ],
+  "noncerange": "00000000ffffffff",
+  "sigoplimit": 20000,
+  "sizelimit": 2000000,
+  "curtime": 1790581942,
+  "bits": "200f0f0f",
+  "height": 105,
+  "yellowback": {
+    "tag": "2459454421010140e2010000000000030092323df36253f52973ac6515e62601674e2a2fe8",
+    "kind": "quote",
+    "priceMicroUsd": 123456,
+    "quoteAgeSeconds": 4,
+    "signal": true,
+    "payoutAddress": "smSNWPR9xE2eptckrrkLsiUs9UrL1CeWZDF",
+    "registered": true,
+    "eligible": true,
+    "activation": "locked_in",
+    "signalCount": 64,
+    "enforcing": true,
+    "valveTripped": false,
+    "sunset": false,
+    "healthy": true,
+    "templatePolicy": "strict"
+  }
+}
