@@ -1,5 +1,11 @@
 # Yolo : Ycash Solo-Mining Stratum Servers
 
+> **Rust rewrite in progress.** The `yolo` binary (`cargo build --release`, `src/`) replaces the
+> three Perl scripts below with one program (`yolo --mode solo|pool|cenote`) that talks JSON-RPC
+> to the node directly, keeps the Perl's stratum wire format, and carries the Ycash Yellowback
+> (YED) coinbase tag on every mode. See `docs/plans/role-pool-regtest-plan.md` in the workspace.
+> The Perl files stay here until parity is declared; this README still describes them.
+
 These are a very simple stratum servers for connecting GPU miners to a Ycash full node.
 
 - StratumPool : Clients can specify their own transparent ycash address.
