@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- After an accepted `submitblock` the poller is woken for a fresh template at once and no
+  job is re-issued on the parent the node has just built past; previously the stale template
+  was handed out under new job ids until the next 1 s poll and a fast solver's submits came
+  back `inconclusive` (21 rejects over 3 blocks on the regtest devnet; the Perl had the same
+  flaw). The 60 s keepalive re-notify skips a stale job too. Wire test
+  `accepted_submit_refreshes_the_template_before_the_next_job`.
+
 ## v0.12.0 — 2026-09-28
 
 The Rust rewrite. One binary, `yolo --mode solo|pool|cenote`, replaces the Perl

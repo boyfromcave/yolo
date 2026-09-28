@@ -116,8 +116,11 @@ byte scan and logs `tag: quote|signal|none`; the same fields are on `GET /status
  "cenoteLeft":0,"uptimeSeconds":12}
 ```
 
-`lastSubmitVerdict` is `accepted` or the exact string `submitblock` returned (`duplicate`,
-`high-hash`, `time-too-old`, …); `tag` is the kind found in the last coinbase built. To verify
+`lastSubmitVerdict` is the string `"accepted"` on success or the exact string `submitblock`
+returned (`duplicate`, `high-hash`, `time-too-old`, …); `tag` is the kind found in the last
+coinbase built. An accepted block also triggers an immediate `getblocktemplate` (not the next
+1 s poll), and no job is handed out on the old parent in between: a fast solver would only
+re-solve it and be rejected `inconclusive`. To verify
 a mined block on the node, `ycash-cli yed_gettag <height>` and the operator kit's
 `check-coinbase <height>` (`contrib/yellowback/pool/`) decode the stored block the same way and
 must agree with the pool's log line.

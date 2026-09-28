@@ -71,14 +71,26 @@ fn template_from_fixture(rows: &[Row]) -> Value {
 
 /// The fake node: JSON-RPC over HTTP/1.1, four methods, records every submitblock.
 async fn fake_node(template: Value) -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let (addr, submitted, _) = fake_node_advancing(template, false).await;
+    (addr, submitted)
+}
+
+/// The fake node with a chain: when `advance` is set, every accepted `submitblock` moves the
+/// template one height on (new `previousblockhash`), as a real node does.
+async fn fake_node_advancing(
+    template: Value,
+    advance: bool,
+) -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<String>>>, std::sync::Arc<std::sync::Mutex<Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let submitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = submitted.clone();
+    let current = std::sync::Arc::new(std::sync::Mutex::new(template));
+    let chain = current.clone();
     tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else { break };
-            let template = template.clone();
+            let chain = chain.clone();
             let seen = seen.clone();
             tokio::spawn(async move {
                 let mut buf = Vec::new();
@@ -103,9 +115,16 @@ async fn fake_node(template: Value) -> (SocketAddr, std::sync::Arc<std::sync::Mu
                             let params = body["params"].as_array().cloned().unwrap_or_default();
                             let result = match method {
                                 "getblockchaininfo" => json!({ "chain": "regtest", "blocks": 104 }),
-                                "getblocktemplate" => template.clone(),
+                                "getblocktemplate" => chain.lock().unwrap().clone(),
                                 "submitblock" => {
-                                    seen.lock().unwrap().push(params[0].as_str().unwrap().to_string());
+                                    let block = params[0].as_str().unwrap().to_string();
+                                    if advance {
+                                        let mut t = chain.lock().unwrap();
+                                        let height = t["height"].as_u64().unwrap() + 1;
+                                        t["height"] = json!(height);
+                                        t["previousblockhash"] = json!(format!("{:064x}", height));
+                                    }
+                                    seen.lock().unwrap().push(block);
                                     Value::Null
                                 }
                                 "validateaddress" => {
@@ -129,7 +148,7 @@ async fn fake_node(template: Value) -> (SocketAddr, std::sync::Arc<std::sync::Mu
             });
         }
     });
-    (addr, submitted)
+    (addr, submitted, current)
 }
 
 async fn start_server(mode: Mode, node: SocketAddr) -> SocketAddr {
@@ -324,4 +343,71 @@ async fn status_endpoint_reports_the_pool() {
     assert_eq!(body["equihash"], "48,5");
     assert_eq!(body["miners"], 0);
     let _: HashMap<String, Value> = serde_json::from_value(body).unwrap();
+}
+
+async fn next_line(lines: &mut tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>) -> String {
+    tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await.expect("line").unwrap().expect("open")
+}
+
+/// After an accepted `submitblock` the node has built past the template the job came from:
+/// the next `mining.notify` must carry the new parent, and no job on the old parent may be
+/// re-issued in between (a fast solver would re-solve it and be rejected `inconclusive`).
+#[tokio::test]
+async fn accepted_submit_refreshes_the_template_before_the_next_job() {
+    for mode in [Mode::Solo, Mode::Pool] {
+        let rows = load_fixture("stratum-perl-solo.jsonl");
+        let (node, _, _) = fake_node_advancing(template_from_fixture(&rows), true).await;
+        let addr = start_server(mode, node).await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (rd, mut wr) = stream.into_split();
+        let mut lines = BufReader::new(rd).lines();
+        let user = if mode == Mode::Solo { "stratum-miner" } else { "smJS1rf66HdSykf6spi4kbRCA2mcw3xYftW" };
+        wr.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"t\",null,\"127.0.0.1\",\"1\"]}\n").await.unwrap();
+        let _subscribe = next_line(&mut lines).await;
+        wr.write_all(format!("{{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"{}\",\"x\"]}}\n", user).as_bytes()).await.unwrap();
+        // authorize's response, then set_target and the first job
+        let mut first_job = None;
+        for _ in 0..3 {
+            let line = next_line(&mut lines).await;
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v["method"] == "mining.notify" {
+                first_job = Some(v);
+            }
+        }
+        let first_job = first_job.expect("a job after authorize");
+        let old_parent = first_job["params"][2].as_str().unwrap().to_string();
+        let job_id = first_job["params"][0].as_str().unwrap();
+        let submit: Value = serde_json::from_str(&rows.iter().find(|r| r.line.contains("mining.submit")).unwrap().line).unwrap();
+        let sp = &submit["params"];
+        wr.write_all(
+            format!("{{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"{}\",\"{}\",{},{},{}]}}\n", user, job_id, sp[2], sp[3], sp[4]).as_bytes(),
+        )
+        .await
+        .unwrap();
+        let started = std::time::Instant::now();
+        let mut saw_result = false;
+        let mut new_job = None;
+        while new_job.is_none() {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .unwrap_or_else(|_| panic!("{}: no job on the new parent after the accepted submit", mode))
+                .unwrap()
+                .expect("server closed");
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v["id"] == 4 {
+                assert_eq!(v["result"], true, "{}: submit result {}", mode, line);
+                saw_result = true;
+            } else if v["method"] == "mining.notify" {
+                assert!(saw_result, "{}: a job before the submit's response: {}", mode, line);
+                let parent = v["params"][2].as_str().unwrap();
+                assert_ne!(parent, old_parent, "{}: the old template was re-issued after the node built past it: {}", mode, line);
+                new_job = Some(v);
+            }
+        }
+        // the refresh was immediate, not the next 1 s poll
+        assert!(started.elapsed() < Duration::from_millis(900), "{}: new job took {:?}", mode, started.elapsed());
+        let new_job = new_job.unwrap();
+        assert_eq!(new_job["params"][2], json!(yolo::codec::reverse_hex(&format!("{:064x}", 106))), "{}: parent of the new job", mode);
+        assert_eq!(new_job["params"][7], json!(true), "{}: clean_jobs on the new parent", mode);
+    }
 }

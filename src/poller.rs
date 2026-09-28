@@ -1,7 +1,8 @@
 //! The template poller: `getblocktemplate` every second (`stratumsolo:178`), new work when
 //! the change key moves (height, target, light-client root, `coinbaseaux.flags`: Y-F2), a
-//! 5 s back-off while the node is down and a forced refresh when it comes back
-//! (`restart_miners`).
+//! 5 s back-off while the node is down, a forced refresh when it comes back
+//! (`restart_miners`), and an immediate fetch after an accepted `submitblock` (`State::refresh`)
+//! so miners are not handed the template the node has just built past.
 
 use std::time::{Duration, Instant};
 
@@ -111,7 +112,13 @@ pub async fn run(state: State) {
                     if !apply_template(&state, t) {
                         debug!("template unchanged");
                     }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    // A template at the height the node has just accepted is stale: the node
+                    // has not rolled its template yet, so ask again soon instead of in 1 s.
+                    let wait = if state.lock().template_stale() { Duration::from_millis(100) } else { Duration::from_secs(1) };
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = state.refresh.notified() => debug!("template refresh requested"),
+                    }
                 }
                 Err(e) => {
                     error!("getblocktemplate: cannot read template: {}", e);

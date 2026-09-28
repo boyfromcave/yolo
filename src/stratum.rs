@@ -159,7 +159,8 @@ impl Client {
                     }
                 }
                 _ = keepalive => {
-                    if self.mining {
+                    // Never re-notify a job the node has already built past.
+                    if self.mining && !state.lock().template_stale() {
                         if let Some(w) = self.jobs.back() {
                             out.push_str(&msg_notify(w, false));
                             debug!("miner {}: keepalive re-notify job {}", self.index, w.job_id);
@@ -194,6 +195,12 @@ impl Client {
         }
         let g = state.lock();
         let Some(template) = g.template.as_ref() else { return };
+        if g.template_stale() {
+            // The node accepted a block at this height; wait for the poller's next template
+            // (it has been woken) rather than hand out work that can only come back
+            // `inconclusive`.
+            return;
+        }
         if !self.ready {
             out.push_str(&msg_set_target(&template.target));
             self.ready = true;
@@ -350,9 +357,8 @@ impl Client {
         match verdict {
             Ok(Ok(None)) => {
                 info!("miner {}: block {} accepted by the node (job {}, tag {})", self.index, work.height, job_id, work.tag_kind());
+                state.block_accepted(&work.previousblockhash);
                 let mut g = state.lock();
-                g.accepted += 1;
-                g.last_verdict = "accepted".into();
                 if g.cenote_left > 0 {
                     g.cenote_left -= 1;
                     info!("cenote: {} block(s) left to burn", g.cenote_left);

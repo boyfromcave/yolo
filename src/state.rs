@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 
 use crate::equihash::Equihash;
 use crate::rpc::RpcClient;
@@ -28,11 +28,28 @@ pub struct Inner {
     pub rejected: u64,
     /// `--cenote N` blocks still to burn.
     pub cenote_left: u32,
+    /// The `previousblockhash` (wire order, as `Work` carries it) of the last job the node
+    /// accepted a block for: a template still on that parent is stale (the node has moved on)
+    /// and no work is built from it until the poller brings the next one — otherwise a fast
+    /// solver re-solves the old job and every submit comes back `inconclusive`.
+    pub accepted_parent: Option<String>,
+}
+
+impl Inner {
+    /// True while the current template is one the node has already built on.
+    pub fn template_stale(&self) -> bool {
+        match (&self.template, &self.accepted_parent) {
+            (Some(t), Some(parent)) => crate::codec::reverse_hex(&t.previousblockhash) == *parent,
+            _ => false,
+        }
+    }
 }
 
 pub struct Shared {
     pub inner: Mutex<Inner>,
     pub generation_tx: watch::Sender<u64>,
+    /// Wakes the poller before its next 1 s tick (after an accepted `submitblock`).
+    pub refresh: Notify,
     pub rpc: RpcClient,
     pub policy: Policy,
     pub equihash: Equihash,
@@ -61,8 +78,10 @@ impl Shared {
                 accepted: 0,
                 rejected: 0,
                 cenote_left: cenote,
+                accepted_parent: None,
             }),
             generation_tx,
+            refresh: Notify::new(),
             rpc,
             policy,
             equihash,
@@ -74,6 +93,16 @@ impl Shared {
 
     pub fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Records an accepted block and asks the poller for the next template now.
+    pub fn block_accepted(&self, parent: &str) {
+        let mut g = self.lock();
+        g.accepted += 1;
+        g.last_verdict = "accepted".into();
+        g.accepted_parent = Some(parent.to_string());
+        drop(g);
+        self.refresh.notify_one();
     }
 
     /// The `/status` document.
