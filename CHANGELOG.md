@@ -1,7 +1,31 @@
 # Changelog
 
-## Unreleased
+## v0.13.0 — 2026-09-28
 
+One pool, no modes (owner decision P-6, plan Y7). `--mode solo|pool|cenote`, `--cenote N` and
+`--scrooge` are gone; two flags decide the coinbase and the Yellowback tag is carried in every
+combination:
+
+- `--payout <s1…>` unset: each miner's stratum username is its payout address, validated with
+  `validateaddress` on `mining.authorize` (`Invalid address` otherwise) — the `stratumpool`
+  policy. Set: every block pays that address, validated once at startup, and the username is
+  a worker name — `stratumsolo` / `cenote --scrooge`. Both cases rewrite `vout[0].scriptPubKey`
+  structurally; there is no verbatim-`coinbasetxn` case any more (the old solo is
+  `--payout <the node's mineraddress>` and produces the same bytes).
+- `--text "…"` unset: the node's scriptSig untouched. Set: rebuilt as height push ‖
+  `coinbaseaux.flags` ‖ push(text) within 100 bytes, with a truncation warning — the `cenote`
+  policy. `--no-flags` stays hidden (test only, with `--text`). `--text` has no default any more.
+- Job ids are the per-connection counter everywhere; `mining.extranonce.subscribe` is
+  acknowledged only (the `stratumsolo` re-issue of the same job is dropped); `--port` defaults
+  to 3333. Wire message shapes unchanged; the Perl fixtures replay (the solo fixture under
+  `--payout`, the cenote ones under `--text`).
+- `GET /status`: `mode` and `cenoteLeft` removed; `payout` (`"username"` or the fixed address)
+  and `text` (bool) added.
+- Library: `Config` carries `payout`, `text`, `no_flags` instead of `policy`/`cenote`;
+  `bind()` resolves `--payout` against the node; `work::Policy { payout, text, no_flags }`,
+  `work::Payout`; `work::Mode` removed.
+- Tests: the unit tests are the payout × text grid; `tests/regtest.rs` mines one block per cell
+  of the grid, plus `--no-flags` and the 100-byte boundary.
 - After an accepted `submitblock` the poller is woken for a fresh template at once and no
   job is re-issued on the parent the node has just built past; previously the stale template
   was handed out under new job ids until the next 1 s poll and a fast solver's submits came

@@ -8,6 +8,17 @@ was written against (`tests/fixtures/stratum-perl-*.jsonl` were recorded from th
 history is in the workspace's read-only `ref/yolo` checkout (`main` @ `c9c155c6`). They are
 not run, maintained or installed any more.
 
+Why three scripts became one binary: they are one program copy-pasted three times. The git
+history reads `stratumpool` (2020-10-17); `stratumsolo` two days later, which is `stratumpool`
+minus the address check and the stats; `cenote` a month later, which is `stratumpool` plus
+`--text`, a reward burn (`--cenote N`) and `--scrooge`, which is `stratumsolo` again. So
+`cenote --scrooge` ≡ `stratumsolo` and `cenote` ≡ `stratumpool` + text, and the only real
+choices are *who is paid* (each miner's username, or one fixed address) and *whether the
+scriptSig is rebuilt with a text*. The Rust `yolo` is those two choices as two flags,
+`--payout` and `--text` (owner decision P-6, plan Y7): `stratumpool` is `yolo`, `stratumsolo`
+is `yolo --payout <the node's mineraddress>`, `cenote` is `yolo --text "…"` and
+`cenote --scrooge` is `yolo --payout <mineraddress> --text "…"`. The burn was not carried over.
+
 Why the rewrite (the Y-F rows of `docs/plans/role-pool-regtest-plan.md` §7):
 
 - **Y-F1** — `cenote` rebuilds the coinbase scriptSig as height push + text (`cenote:522`), discarding `coinbaseaux.flags` and with it the Ycash Yellowback (YED) tag.
