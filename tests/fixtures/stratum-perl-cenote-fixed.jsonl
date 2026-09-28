@@ -1,0 +1,10 @@
+{"ts": 1790582666.398, "dir": "send", "line": "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"stratum-miner/0.1\",null,\"127.0.0.1\",\"24203\"]}"}
+{"ts": 1790582666.407, "dir": "recv", "line": "{\"id\":1,\"result\":[null,\"000086a620fb22d22f5fd4d4d970\"],\"error\":null}"}
+{"ts": 1790582666.408, "dir": "send", "line": "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"smJS1rf66HdSykf6spi4kbRCA2mcw3xYftW\",\"x\"]}"}
+{"ts": 1790582666.47, "dir": "recv", "line": "{\"id\":2,\"result\": true,\"error\": null}"}
+{"ts": 1790582666.47, "dir": "send", "line": "{\"id\":3,\"method\":\"mining.extranonce.subscribe\",\"params\":[]}"}
+{"ts": 1790582666.47, "dir": "recv", "line": "{\"id\":null,\"method\":\"mining.set_target\",\"params\":[\"0f0f0f0000000000000000000000000000000000000000000000000000000000\"]}"}
+{"ts": 1790582666.54, "dir": "recv", "line": "{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"1\",\"04000000\",\"88d598dfc561ea25fcfbb87a2ead012b3e9ec93eb2b28bb133f05e67da553c09\",\"e78136162069efb38b5f7a26d917938d3e97558a86ecc82e5cda27a88d753145\",\"be4fc9e402f45a27c30f0b7bb82cf76b7719049af74fc511d0802c8e88560f83\",\"8a1fba6a\",\"0f0f0f20\",true,\"ZcashPoW\"]}"}
+{"ts": 1790582666.541, "dir": "recv", "line": "{\"id\":3,\"result\": true,\"error\": null}"}
+{"ts": 1790582666.545, "dir": "send", "line": "{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"smJS1rf66HdSykf6spi4kbRCA2mcw3xYftW\",\"1\",\"8a1fba6a\",\"000000000000000000000000000000000000\",\"2410a8ca1642a18a5df03dd69152955b3fd3f4133b144d76c60a6db32cda9c976445bf3ffa\"]}"}
+{"ts": 1790582666.611, "dir": "recv", "line": "{\"id\":4,\"result\": true}"}
