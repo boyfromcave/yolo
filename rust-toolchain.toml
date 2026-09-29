@@ -1,0 +1,5 @@
+[toolchain]
+# yolo builds on stable. This file also shields the crate from an enclosing rust-toolchain
+# (ycash-dd pins 1.51 for librustzcash and checks yolo out under its tree in CI): rustup takes
+# the nearest file, and 1.51 cannot read a v4 Cargo.lock.
+channel = "stable"
