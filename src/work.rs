@@ -142,7 +142,7 @@ pub fn build_work(t: &BlockTemplate, policy: &Policy, equihash: Equihash, p: &Bu
         version: u32_le_hex(version),
         previousblockhash: reverse_hex(&t.previousblockhash),
         merkleroot: hex::encode(root),
-        light_client_root: reverse_hex(t.light_client_root()),
+        light_client_root: reverse_hex(t.header_root()?),
         time: u32_le_hex(p.now),
         bits: reverse_hex(&t.bits),
         target: t.target.clone(),
