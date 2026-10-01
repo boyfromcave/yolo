@@ -16,7 +16,13 @@
 //! Environment: `YCASHD` (required; unset = skip), `STRATUM_MINER` (default: the ycash-dd
 //! copy beside this repo in the workspace), `PYTHON` (default: the workspace `.venv`),
 //! `YOLO_REGTEST_SCRATCH` (datadirs; default: the system temp dir), `YOLO_REGTEST_RPC_BASE`
-//! / `YOLO_REGTEST_P2P_BASE` (default 26301 / 27301).
+//! / `YOLO_REGTEST_P2P_BASE` (default 26301 / 27301), `YOLO_REGTEST_POOL_NODE_ARGS`
+//! (extra whitespace-separated `ycashd` arguments for node A once it serves the pool, e.g.
+//! `-allowdeprecated=none` on 6.20.0 for templates without the deprecated root keys; the
+//! harness's own `getnewaddress` calls run before, or on node B).
+//!
+//! Works against ycashd v4.5.0 (ycash-dd) and 6.20.0 (the ycash6 build: plain `ref/ycash6`
+//! leaves Equihash (48,5) on regtest under these upgrades, baseline fix 3).
 #![cfg(feature = "regtest")]
 
 use std::path::{Path, PathBuf};
@@ -66,6 +72,8 @@ struct Node {
     rpc: RpcClient,
     child: Option<Child>,
     extra_conf: Vec<String>,
+    /// Command-line arguments after `NODE_ARGS` (`-mocktime`, `YOLO_REGTEST_POOL_NODE_ARGS`).
+    extra_args: Vec<String>,
 }
 
 impl Node {
@@ -74,7 +82,7 @@ impl Node {
         let _ = std::fs::remove_dir_all(&datadir);
         std::fs::create_dir_all(datadir.join("regtest")).unwrap();
         let rpc = RpcClient::new(&format!("http://127.0.0.1:{}", rpc_port), &RpcAuth { user: "u".into(), password: "p".into() });
-        Node { index, datadir, rpc_port, p2p_port, connect, rpc, child: None, extra_conf: Vec::new() }
+        Node { index, datadir, rpc_port, p2p_port, connect, rpc, child: None, extra_conf: Vec::new(), extra_args: Vec::new() }
     }
 
     fn write_conf(&self) {
@@ -103,6 +111,7 @@ impl Node {
         let child = Command::new(ycashd)
             .arg(format!("-datadir={}", self.datadir.display()))
             .args(NODE_ARGS)
+            .args(&self.extra_args)
             .stdout(Stdio::null())
             .stderr(stderr)
             .spawn()
@@ -295,22 +304,30 @@ async fn payout_text_grid_against_a_regtest_node() {
     std::fs::create_dir_all(&scratch).unwrap();
     log(&format!("scratch {}", scratch.display()));
 
+    let pool_node_args: Vec<String> =
+        std::env::var("YOLO_REGTEST_POOL_NODE_ARGS").unwrap_or_default().split_whitespace().map(String::from).collect();
+
     // Node A mines and serves the template; node B only relays. mineraddress= must be a wallet
     // t-addr of node A (the Perl's rule), so A is started once to mint it, then restarted with it.
     let mut a = Node::new(0, &scratch, rpc_base, p2p_base, None);
     let mut b = Node::new(1, &scratch, rpc_base + 1, p2p_base + 1, Some(p2p_base));
+    // A burst of generated blocks runs median-time-past ahead of the clock (Y-F5); generate the
+    // chain an hour in the past so the pool's `max(curtime, now)` header time is accepted. The
+    // first start runs on `-mocktime` rather than `setmocktime` + `setmocktime 0`: 6.20.0 refuses
+    // `setmocktime` on a node started without `-mocktime`, and on one started with it `0` sets
+    // the clock to the epoch instead of restoring the system clock (F-8). The restart below
+    // drops `-mocktime`, so the node mines on the system clock; B starts after and syncs.
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    a.extra_args.push(format!("-mocktime={}", now - 3600));
     a.start(&ycashd);
     let mineraddress = a.call("getnewaddress", json!([])).as_str().unwrap().to_string();
+    a.call("generate", json!([101]));
     a.stop();
+    a.extra_args = pool_node_args;
     a.extra_conf.push(format!("mineraddress={}", mineraddress));
     a.start(&ycashd);
+    assert_eq!(a.height(), 101, "node A kept its chain across the restart");
     b.start(&ycashd);
-    // A burst of generated blocks runs median-time-past ahead of the clock (Y-F5); generate the
-    // chain an hour in the past so the pool's `max(curtime, now)` header time is accepted.
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    a.call("setmocktime", json!([now - 3600]));
-    a.call("generate", json!([101]));
-    a.call("setmocktime", json!([0]));
     assert!(wait_height(&[&a, &b], 101, Duration::from_secs(60)), "node B did not sync the initial chain");
     a.call("yed_setquote", json!([QUOTE_MICRO_USD, 1]));
     let template = a.call("getblocktemplate", json!([]));
@@ -318,6 +335,7 @@ async fn payout_text_grid_against_a_regtest_node() {
     assert_eq!(flags.len(), 37, "the template carries a 37-byte quote tag: {:?}", template["coinbaseaux"]);
     let miner_addr = b.call("getnewaddress", json!([])).as_str().unwrap().to_string();
     log(&format!("chain at 101; mineraddress {} miner {} flags {}", mineraddress, miner_addr, hex::encode(&flags)));
+    log(&format!("template header roots: lightclientroothash {} defaultroots {}", template["lightclientroothash"], template["defaultroots"]));
 
     let text = "yolo regtest";
     let long_text = "x".repeat(90);
