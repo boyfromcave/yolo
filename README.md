@@ -142,6 +142,10 @@ per-connection counter.
   `contrib/yellowback/pool/README.md` in the node repository. Without `-yellowback` the
   template's `coinbaseaux.flags` is empty and `yolo` behaves exactly as the Perl did
   (`--text` then gives `height push ‖ push(text)`).
+- ycashd v4.5.0 or 6.20.0. The header root is read from `lightclientroothash` (v4.5.0, and
+  6.20.0 while the `gbt_oldhashes` deprecation is allowed, the default) or from 6.20.0's
+  `defaultroots`. One combination cannot serve work: a chain before Heartwood (regtest only)
+  on 6.20.0 with `-allowdeprecated=none`, whose template carries no Sapling root.
 - `-regtest`: `--equihash auto` reads `getblockchaininfo.chain` and switches to 48/5. A GPU
   miner cannot solve 48/5; use the Python `stratum-miner` below.
 
@@ -158,10 +162,11 @@ ycashd -regtest -datadir=$D/a -server -rpcuser=u -rpcpassword=p -rpcport=26301 -
        -nuparams=66314da3:1 -nuparams=19bd2d2f:1 \
        -experimentalfeatures -yellowback -yellowbackstartheight=1 -yellowbacksigmaref=0 \
        -mineraddress=$(ycash-cli … getnewaddress)
+#   a generated burst runs ahead of the clock (Y-F5): mint the address and generate 101 on the
+#   first start with -mocktime=$(( $(date +%s) - 3600 )), then restart without it. (ycashd 6.20.0
+#   refuses setmocktime unless started with -mocktime, and there setmocktime 0 means the epoch.)
+ycash-cli -regtest … generate 101                            # on the -mocktime start
 # node B: the same with -rpcport=26302 -port=27302 -connect=127.0.0.1:27301 (getblocktemplate needs a peer)
-ycash-cli -regtest … setmocktime $(( $(date +%s) - 3600 ))   # a generated burst runs ahead of the clock (Y-F5)
-ycash-cli -regtest … generate 101
-ycash-cli -regtest … setmocktime 0
 ycash-cli -regtest … yed_setquote 50000 1                    # $0.05, source 1: the template now carries a quote tag
 
 yolo --rpc http://127.0.0.1:26301 --rpc-user u --rpc-password p --port 26401 --status-port 26402 --log debug \
@@ -172,8 +177,10 @@ curl http://127.0.0.1:26402/status
 ```
 
 `cargo test --features regtest` does all of this unattended when `YCASHD` points at the node
-binary (`STRATUM_MINER`, `PYTHON`, `YOLO_REGTEST_SCRATCH`, `YOLO_REGTEST_RPC_BASE` and
-`YOLO_REGTEST_P2P_BASE` override the defaults, which assume the workspace layout), one block
+binary, ycashd v4.5.0 or 6.20.0 (`STRATUM_MINER`, `PYTHON`, `YOLO_REGTEST_SCRATCH`,
+`YOLO_REGTEST_RPC_BASE` and `YOLO_REGTEST_P2P_BASE` override the defaults, which assume the
+workspace layout; `YOLO_REGTEST_POOL_NODE_ARGS=-allowdeprecated=none` serves 6.20.0 templates
+without the deprecated root keys), one block
 per case: the four cells of the payout × text grid (username / `--payout`, with and without
 `--text`), `--text --no-flags` (the hidden test switch that reproduces the Perl: the block is
 accepted and `yed_gettag` says `found: false`) and a 90-byte `--text` (scriptSig exactly

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — ycashd 6.20.0
+
+- The header root falls back to `getblocktemplate`'s `defaultroots` (`blockcommitmentshash`
+  from NU5, `chainhistoryroot` from Heartwood) when ycashd 6.20.0 withholds the deprecated
+  `lightclientroothash` / `finalsaplingroothash` (`-allowdeprecated=none`); before, the header
+  was built with an empty root. A zero `chainhistoryroot` is never used (before Heartwood the
+  field is the Sapling root, F-29): with no other key, no work is built and the error says why.
+  v4.5.0 is unchanged.
+- `tests/regtest.rs` generates the initial chain on a `-mocktime` start instead of
+  `setmocktime` / `setmocktime 0` (refused, or the epoch, on 6.20.0), and runs on both
+  ycashd v4.5.0 and 6.20.0; `YOLO_REGTEST_POOL_NODE_ARGS` passes extra arguments to the
+  pool's node.
+
 ## v0.13.0 — 2026-09-28
 
 One pool, no modes (owner decision P-6, plan Y7). `--mode solo|pool|cenote`, `--cenote N` and
