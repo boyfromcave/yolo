@@ -43,15 +43,7 @@ impl Equihash {
         let bytes = hex::decode(hex_solution).map_err(|e| format!("solution is not hex: {}", e))?;
         let expected_prefix = crate::codec::compact_size(self.solution_len() as u64);
         if bytes.len() != self.solution_wire_len() || bytes[..expected_prefix.len()] != expected_prefix[..] {
-            return Err(format!(
-                "solution is {} bytes, expected {} ({} + {} for {},{})",
-                bytes.len(),
-                self.solution_wire_len(),
-                hex::encode(&expected_prefix),
-                self.solution_len(),
-                self.n,
-                self.k
-            ));
+            return Err(format!("solution is {} bytes, expected {} ({} + {} for {},{})", bytes.len(), self.solution_wire_len(), hex::encode(&expected_prefix), self.solution_len(), self.n, self.k));
         }
         Ok(bytes)
     }

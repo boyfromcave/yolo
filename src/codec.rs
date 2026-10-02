@@ -47,9 +47,7 @@ pub fn compact_size(n: u64) -> Vec<u8> {
 /// Reads a compact size at `pos`; returns (value, bytes consumed).
 pub fn read_compact_size(data: &[u8], pos: usize) -> Result<(u64, usize), String> {
     let first = *data.get(pos).ok_or("compact size: out of data")?;
-    let take = |n: usize| -> Result<&[u8], String> {
-        data.get(pos + 1..pos + 1 + n).ok_or_else(|| "compact size: truncated".to_string())
-    };
+    let take = |n: usize| -> Result<&[u8], String> { data.get(pos + 1..pos + 1 + n).ok_or_else(|| "compact size: truncated".to_string()) };
     Ok(match first {
         0..=252 => (first as u64, 1),
         0xfd => (u16::from_le_bytes(take(2)?.try_into().unwrap()) as u64, 3),
@@ -74,10 +72,7 @@ pub fn txid_display(raw_tx: &[u8]) -> String {
 
 /// Display hex (big-endian, as RPC prints hashes) → internal 32-byte order.
 pub fn hash_from_display(hex_str: &str) -> Result<[u8; 32], String> {
-    let mut bytes: [u8; 32] = hex::decode(hex_str)
-        .map_err(|e| format!("bad hash hex: {}", e))?
-        .try_into()
-        .map_err(|_| "hash is not 32 bytes".to_string())?;
+    let mut bytes: [u8; 32] = hex::decode(hex_str).map_err(|e| format!("bad hash hex: {}", e))?.try_into().map_err(|_| "hash is not 32 bytes".to_string())?;
     bytes.reverse();
     Ok(bytes)
 }
@@ -144,8 +139,7 @@ mod tests {
 
     #[test]
     fn coinbase_txid_matches_template_hash() {
-        let t: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/vectors/regtest-template-105.json")).unwrap();
+        let t: serde_json::Value = serde_json::from_str(include_str!("../tests/vectors/regtest-template-105.json")).unwrap();
         let data = hex::decode(t["coinbasetxn"]["data"].as_str().unwrap()).unwrap();
         assert_eq!(txid_display(&data), t["coinbasetxn"]["hash"].as_str().unwrap());
     }

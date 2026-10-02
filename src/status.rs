@@ -25,18 +25,10 @@ pub async fn serve(state: State, listener: TcpListener) {
             let first = request.lines().next().unwrap_or("");
             let mut parts = first.split_whitespace();
             let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-            let (status, body) = if method == "GET" && (path == "/status" || path == "/") {
-                ("200 OK", st.status_json().to_string())
-            } else {
-                ("404 Not Found", "{\"error\":\"not found\"}".to_string())
-            };
+            let (status, body) =
+                if method == "GET" && (path == "/status" || path == "/") { ("200 OK", st.status_json().to_string()) } else { ("404 Not Found", "{\"error\":\"not found\"}".to_string()) };
             debug!("status: {} {} -> {}", method, path, status);
-            let response = format!(
-                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                status,
-                body.len(),
-                body
-            );
+            let response = format!("HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", status, body.len(), body);
             let _ = socket.write_all(response.as_bytes()).await;
             let _ = socket.shutdown().await;
         });

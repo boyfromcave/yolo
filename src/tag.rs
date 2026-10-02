@@ -46,10 +46,7 @@ pub fn height_push_len(script: &[u8]) -> Option<usize> {
         0x01..=0x4b => (op as usize, 1),
         0x4c => (*script.get(1)? as usize, 2),
         0x4d => (u16::from_le_bytes([*script.get(1)?, *script.get(2)?]) as usize, 3),
-        0x4e => (
-            u32::from_le_bytes([*script.get(1)?, *script.get(2)?, *script.get(3)?, *script.get(4)?]) as usize,
-            5,
-        ),
+        0x4e => (u32::from_le_bytes([*script.get(1)?, *script.get(2)?, *script.get(3)?, *script.get(4)?]) as usize, 5),
         _ => return None,
     };
     if script.len() >= hdr + n {
@@ -104,16 +101,8 @@ pub fn decode_coinbase_tag(script_sig: &[u8]) -> Option<Tag> {
     let start = height_push_len(script_sig)?;
     let rest = &script_sig[start..];
     let i = rest.windows(TAG_PATTERN.len()).position(|w| w == TAG_PATTERN)?;
-    let (version, flags, price_micro_usd, source_mask, payout_key) =
-        decode_body(&rest[i + TAG_PATTERN.len()..])?;
-    Some(Tag {
-        version,
-        signal: flags & 1 == 1,
-        price_micro_usd,
-        source_mask,
-        payout_key,
-        offset: start + i,
-    })
+    let (version, flags, price_micro_usd, source_mask, payout_key) = decode_body(&rest[i + TAG_PATTERN.len()..])?;
+    Some(Tag { version, signal: flags & 1 == 1, price_micro_usd, source_mask, payout_key, offset: start + i })
 }
 
 /// `quote`, `signal` or `none` for a scriptSig, for the log line and `/status`.

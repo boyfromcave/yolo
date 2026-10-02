@@ -99,10 +99,7 @@ impl BlockTemplate {
         if let Some(r) = roots.and_then(|r| non_empty(&r.blockcommitmentshash)) {
             return Ok(r);
         }
-        if let Some(r) = non_empty(&self.lightclientroothash)
-            .or_else(|| non_empty(&self.blockcommitmentshash))
-            .or_else(|| non_empty(&self.finalsaplingroothash))
-        {
+        if let Some(r) = non_empty(&self.lightclientroothash).or_else(|| non_empty(&self.blockcommitmentshash)).or_else(|| non_empty(&self.finalsaplingroothash)) {
             return Ok(r);
         }
         match roots.and_then(|r| non_empty(&r.chainhistoryroot)) {
@@ -118,12 +115,7 @@ impl BlockTemplate {
     }
 
     pub fn change_key(&self) -> ChangeKey {
-        ChangeKey {
-            height: self.height,
-            target: self.target.clone(),
-            light_client_root: self.header_root().unwrap_or("").to_string(),
-            flags: self.coinbaseaux.flags.clone(),
-        }
+        ChangeKey { height: self.height, target: self.target.clone(), light_client_root: self.header_root().unwrap_or("").to_string(), flags: self.coinbaseaux.flags.clone() }
     }
 
     pub fn flags_bytes(&self) -> Result<Vec<u8>, String> {
