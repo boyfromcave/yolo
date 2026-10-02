@@ -1,0 +1,46 @@
+# yolo CI (audit I-13, I-7): fmt, build, test and clippy (-D warnings) on Linux and macOS with
+# the toolchain rust-toolchain.toml pins, then an advisory scan (cargo audit) and a
+# licence/source/ban check (cargo deny). Third-party actions are pinned by commit, never by tag.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # rustup (preinstalled on the hosted runners) installs the pinned toolchain and its
+      # components from rust-toolchain.toml on first use.
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - run: cargo fmt --check
+      - run: cargo build --locked
+      - run: cargo build --locked --features regtest
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup show active-toolchain
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: EmbarkStudios/cargo-deny-action@30f817c6f72275c6d54dc744fbca09ebc958599f # v2.0.12
+        with:
+          command: check
