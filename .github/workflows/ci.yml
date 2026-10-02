@@ -40,7 +40,7 @@ jobs:
       - run: rustup show active-toolchain
       # Token-free, as chain-viz: rustsec/audit-check posts a check run and needs `checks: write`,
       # which the read-only permissions block above does not grant (first run, 2026-10-02).
-      - run: cargo install cargo-deny --version 0.18.3 --locked
+      - run: cargo install cargo-deny --version 0.20.2 --locked
       - run: cargo install cargo-audit --version 0.22.2 --locked
       - run: cargo deny --locked check
       - run: cargo audit --deny warnings
