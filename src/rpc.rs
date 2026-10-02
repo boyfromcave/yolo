@@ -23,7 +23,9 @@ pub struct ConfFile {
     pub rpcuser: Option<String>,
     pub rpcpassword: Option<String>,
     pub rpcport: Option<u16>,
-    pub rpcbind: Option<String>,
+    /// `rpcconnect=`: where a client connects. `rpcbind=` is a listen address (often
+    /// `0.0.0.0`) and is deliberately not read (audit H-9).
+    pub rpcconnect: Option<String>,
     pub regtest: bool,
     pub testnet: bool,
     pub datadir: Option<PathBuf>,
@@ -45,7 +47,7 @@ impl ConfFile {
                 "rpcuser" => c.rpcuser = Some(v.to_string()),
                 "rpcpassword" => c.rpcpassword = Some(v.to_string()),
                 "rpcport" => c.rpcport = v.parse().ok(),
-                "rpcbind" => c.rpcbind = Some(v.to_string()),
+                "rpcconnect" => c.rpcconnect = Some(v.to_string()),
                 "regtest" => c.regtest = v == "1",
                 "testnet" => c.testnet = v == "1",
                 "datadir" => c.datadir = Some(PathBuf::from(v)),
@@ -72,7 +74,7 @@ impl ConfFile {
     }
 
     pub fn url(&self) -> String {
-        let host = self.rpcbind.clone().unwrap_or_else(|| "127.0.0.1".into());
+        let host = self.rpcconnect.clone().unwrap_or_else(|| "127.0.0.1".into());
         format!("http://{}:{}", host, self.rpcport.unwrap_or_else(|| self.default_rpc_port()))
     }
 }
@@ -136,15 +138,8 @@ fn base64(input: &[u8]) -> String {
 
 impl RpcClient {
     pub fn new(url: &str, auth: &RpcAuth) -> RpcClient {
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(30)))
-            .build();
-        RpcClient {
-            url: url.trim_end_matches('/').to_string(),
-            authorization: format!("Basic {}", base64(format!("{}:{}", auth.user, auth.password).as_bytes())),
-            agent: config.new_agent(),
-        }
+        let config = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(30))).build();
+        RpcClient { url: url.trim_end_matches('/').to_string(), authorization: format!("Basic {}", base64(format!("{}:{}", auth.user, auth.password).as_bytes())), agent: config.new_agent() }
     }
 
     pub fn url(&self) -> &str {
@@ -153,13 +148,8 @@ impl RpcClient {
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         let body = json!({ "jsonrpc": "1.0", "id": "yolo", "method": method, "params": params });
-        let response = self
-            .agent
-            .post(&self.url)
-            .header("Authorization", &self.authorization)
-            .header("Content-Type", "application/json")
-            .send_json(&body)
-            .map_err(|e| RpcError::Transport(e.to_string()))?;
+        let response =
+            self.agent.post(&self.url).header("Authorization", &self.authorization).header("Content-Type", "application/json").send_json(&body).map_err(|e| RpcError::Transport(e.to_string()))?;
         let status = response.status().as_u16();
         let text = response.into_body().read_to_string().map_err(|e| RpcError::Transport(e.to_string()))?;
         parse_response(status, &text)
@@ -206,10 +196,7 @@ fn parse_response(status: u16, text: &str) -> Result<Value, RpcError> {
         }
     })?;
     if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
-        return Err(RpcError::Node {
-            code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
-            message: err.get("message").and_then(Value::as_str).unwrap_or("").to_string(),
-        });
+        return Err(RpcError::Node { code: err.get("code").and_then(Value::as_i64).unwrap_or(0), message: err.get("message").and_then(Value::as_str).unwrap_or("").to_string() });
     }
     v.get("result").cloned().ok_or_else(|| RpcError::Protocol(format!("HTTP {}: no result field", status)))
 }
@@ -230,6 +217,9 @@ mod tests {
         assert_eq!(c.url(), "http://127.0.0.1:18832");
         assert_eq!(ConfFile::parse("").url(), "http://127.0.0.1:8832");
         assert_eq!(ConfFile::parse("regtest=1").url(), "http://127.0.0.1:18232");
+        // rpcbind is a listen address, never a connect host; rpcconnect is
+        assert_eq!(ConfFile::parse("rpcbind=0.0.0.0\n").url(), "http://127.0.0.1:8832");
+        assert_eq!(ConfFile::parse("rpcbind=0.0.0.0\nrpcconnect=10.0.0.5\n").url(), "http://10.0.0.5:8832");
     }
 
     #[test]
