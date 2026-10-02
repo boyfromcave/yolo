@@ -27,6 +27,7 @@ use tracing::info;
 
 use equihash::{Equihash, EquihashArg};
 use rpc::RpcClient;
+pub use state::Limits;
 use state::Shared;
 use work::{Payout, Policy};
 
@@ -42,6 +43,7 @@ pub struct Config {
     pub no_flags: bool,
     pub password: Option<String>,
     pub equihash: EquihashArg,
+    pub limits: Limits,
 }
 
 /// Resolves `--payout` to its scriptPubKey with `validateaddress`, retrying while the node is
@@ -122,6 +124,10 @@ impl Bound {
     }
 }
 
+fn policy_payout_is_username(payout: &Option<Payout>) -> bool {
+    payout.is_none()
+}
+
 /// Resolves the Equihash parameters against the node and binds the listeners.
 pub async fn bind(rpc: RpcClient, config: Config) -> Result<Bound, Box<dyn std::error::Error>> {
     let equihash = resolve_equihash(&rpc, config.equihash).await;
@@ -129,6 +135,17 @@ pub async fn bind(rpc: RpcClient, config: Config) -> Result<Bound, Box<dyn std::
         Some(a) => Some(resolve_payout(&rpc, a).await?),
         None => None,
     };
+    if policy_payout_is_username(&payout) {
+        // Audit H-7: the coinbase pays the miner, but the tag inside it (and so FEE-2
+        // eligibility) stays with the node's -yellowbackpayoutaddress.
+        tracing::warn!(
+            "no --payout: each miner's username is paid, but the Yellowback tag's payoutKey is the node's \
+             -yellowbackpayoutaddress regardless (miners are not registered as Yellowback miners)"
+        );
+    }
+    if config.no_flags {
+        tracing::warn!("--no-flags: every block will be mined WITHOUT the Yellowback tag (test switch)");
+    }
     let policy = Policy { payout, text: config.text.clone(), no_flags: config.no_flags };
     let listener = TcpListener::bind(config.bind).await.map_err(|e| format!("cannot listen on {}: {}", config.bind, e))?;
     let addr = listener.local_addr()?;
@@ -140,7 +157,7 @@ pub async fn bind(rpc: RpcClient, config: Config) -> Result<Bound, Box<dyn std::
         }
         None => (None, None),
     };
-    let (state, generation_rx) = Shared::new(rpc, policy, equihash, config.password.clone());
+    let (state, generation_rx) = Shared::new(rpc, policy, equihash, config.password.clone(), config.limits.clone());
     Ok(Bound { addr, status_addr, listener, status_listener, state, generation_rx })
 }
 

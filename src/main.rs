@@ -58,10 +58,20 @@ struct Cli {
     /// Serve GET /status (JSON) on this port.
     #[arg(long)]
     status_port: Option<u16>,
+    /// Address to bind the status listener to (unauthenticated; loopback unless you mean it).
+    #[arg(long, default_value = "127.0.0.1")]
+    status_bind: String,
+    /// Stratum sockets open at once, authorized or not; further connections are refused.
+    #[arg(long, default_value_t = 1024)]
+    max_connections: usize,
+    /// Stratum sockets open at once from one IP address.
+    #[arg(long, default_value_t = 64)]
+    max_per_ip: usize,
     /// Log level: error, warn, info, debug, trace.
     #[arg(long, default_value = "info")]
     log: String,
-    /// Test only: --text without the coinbaseaux.flags append (reproduces the Perl cenote; drops the tag).
+    /// Test only: --text without the coinbaseaux.flags append (reproduces the Perl cenote;
+    /// drops the tag). Refused unless built with the `regtest` cargo feature.
     #[arg(long, hide = true)]
     no_flags: bool,
 }
@@ -76,13 +86,15 @@ fn main() {
     if cli.no_flags && cli.text.is_none() {
         fail("--no-flags is meaningful only with --text");
     }
+    #[cfg(not(feature = "regtest"))]
+    if cli.no_flags {
+        // Audit H-6: the tag-dropping switch exists for one negative test and must not reach
+        // a production invocation.
+        fail("--no-flags is a test switch: this binary was built without the `regtest` feature");
+    }
 
     let conf = cli.conf.as_deref().map(|p| ConfFile::load(p).unwrap_or_else(|e| fail(&e)));
-    let url = cli
-        .rpc
-        .clone()
-        .or_else(|| conf.as_ref().map(ConfFile::url))
-        .unwrap_or_else(|| "http://127.0.0.1:18232".to_string());
+    let url = cli.rpc.clone().or_else(|| conf.as_ref().map(ConfFile::url)).unwrap_or_else(|| "http://127.0.0.1:18232".to_string());
     let auth = if let Some(cookie) = &cli.rpc_cookie {
         read_cookie(cookie).unwrap_or_else(|e| fail(&e))
     } else if let (Some(user), Some(password)) = (cli.rpc_user.clone(), cli.rpc_password.clone()) {
@@ -104,10 +116,15 @@ fn main() {
     } else {
         fail("no RPC credentials: give --rpc-user/--rpc-password, --rpc-cookie or --conf")
     };
+    if !rpc_url_is_local_or_tls(&url) {
+        // Audit H-9: Basic auth over plain HTTP leaks the node's RPC password to the network.
+        tracing::warn!("RPC URL {} is neither loopback nor https: the node's RPC credentials travel in clear", url);
+    }
     let rpc = RpcClient::new(&url, &auth);
 
     let bind: SocketAddr = format!("{}:{}", cli.bind, cli.port).parse().unwrap_or_else(|e| fail(&format!("--bind: {}", e)));
-    let status_bind = cli.status_port.map(|p| SocketAddr::new(bind.ip(), p));
+    let status_ip: std::net::IpAddr = cli.status_bind.parse().unwrap_or_else(|e| fail(&format!("--status-bind: {}", e)));
+    let status_bind = cli.status_port.map(|p| SocketAddr::new(status_ip, p));
     let config = Config {
         bind,
         status_bind,
@@ -116,6 +133,7 @@ fn main() {
         no_flags: cli.no_flags,
         password: cli.password.filter(|p| !p.is_empty()),
         equihash: cli.equihash,
+        limits: yolo::Limits { max_connections: cli.max_connections, max_per_ip: cli.max_per_ip, ..yolo::Limits::default() },
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap_or_else(|e| fail(&e.to_string()));
@@ -133,7 +151,36 @@ fn main() {
     }
 }
 
+/// True for `https://…` or a plain-http URL whose host is loopback.
+fn rpc_url_is_local_or_tls(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("http://") else { return false };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    let host = if let Some(v6) = host.strip_prefix('[') { v6.split(']').next().unwrap_or("") } else { host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host) };
+    host == "localhost" || host.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+
 fn fail(msg: &str) -> ! {
     eprintln!("yolo: {}", msg);
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rpc_url_locality() {
+        use super::rpc_url_is_local_or_tls as local;
+        assert!(local("http://127.0.0.1:8832"));
+        assert!(local("http://localhost:8832/"));
+        assert!(local("http://[::1]:8832"));
+        assert!(local("http://u:p@127.0.0.1:8832"));
+        assert!(local("https://node.example:8832"));
+        assert!(!local("http://0.0.0.0:8832"));
+        assert!(!local("http://10.0.0.5:8832"));
+        assert!(!local("http://node.example"));
+        assert!(!local("ftp://127.0.0.1"));
+    }
 }

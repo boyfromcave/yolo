@@ -66,6 +66,10 @@ fn config(flags: Flags, status: bool) -> Config {
         no_flags: false,
         password: None,
         equihash: EquihashArg::Fixed(Equihash::REGTEST),
+        // The recorded submits were solved against the Perl's coinbase, not the fixture
+        // template's, so their hashes cannot meet the target here; the replays are about
+        // wire shapes, the pool's own PoW check has its own tests below.
+        limits: yolo::Limits { check_pow: false, ..yolo::Limits::default() },
     }
 }
 
@@ -90,11 +94,7 @@ fn load_fixture(name: &str) -> Vec<Row> {
 /// A template whose header fields match the fixture's first `mining.notify` (so prevhash,
 /// root, bits and target compare literally) with the regtest-105 coinbase and no transactions.
 fn template_from_fixture(rows: &[Row]) -> Value {
-    let notify = rows
-        .iter()
-        .find(|r| r.dir == "recv" && r.line.contains("mining.notify"))
-        .map(|r| serde_json::from_str::<Value>(&r.line).unwrap())
-        .expect("fixture has a mining.notify");
+    let notify = rows.iter().find(|r| r.dir == "recv" && r.line.contains("mining.notify")).map(|r| serde_json::from_str::<Value>(&r.line).unwrap()).expect("fixture has a mining.notify");
     let target = rows
         .iter()
         .find(|r| r.dir == "recv" && r.line.contains("mining.set_target"))
@@ -121,10 +121,7 @@ async fn fake_node(template: Value) -> (SocketAddr, std::sync::Arc<std::sync::Mu
 
 /// The fake node with a chain: when `advance` is set, every accepted `submitblock` moves the
 /// template one height on (new `previousblockhash`), as a real node does.
-async fn fake_node_advancing(
-    template: Value,
-    advance: bool,
-) -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<String>>>, std::sync::Arc<std::sync::Mutex<Value>>) {
+async fn fake_node_advancing(template: Value, advance: bool) -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<String>>>, std::sync::Arc<std::sync::Mutex<Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let submitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -148,10 +145,7 @@ async fn fake_node_advancing(
                     let text = String::from_utf8_lossy(&buf).to_string();
                     if let Some(idx) = text.find("\r\n\r\n") {
                         let headers = &text[..idx];
-                        let len: usize = headers
-                            .lines()
-                            .find_map(|h| h.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
-                            .unwrap_or(0);
+                        let len: usize = headers.lines().find_map(|h| h.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap())).unwrap_or(0);
                         let body_start = idx + 4;
                         if buf.len() >= body_start + len {
                             let body: Value = serde_json::from_slice(&buf[body_start..body_start + len]).unwrap();
@@ -451,11 +445,7 @@ async fn accepted_submit_refreshes_the_template_before_the_next_job() {
         let job_id = first_job["params"][0].as_str().unwrap();
         let submit: Value = serde_json::from_str(&rows.iter().find(|r| r.line.contains("mining.submit")).unwrap().line).unwrap();
         let sp = &submit["params"];
-        wr.write_all(
-            format!("{{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"{}\",\"{}\",{},{},{}]}}\n", user, job_id, sp[2], sp[3], sp[4]).as_bytes(),
-        )
-        .await
-        .unwrap();
+        wr.write_all(format!("{{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"{}\",\"{}\",{},{},{}]}}\n", user, job_id, sp[2], sp[3], sp[4]).as_bytes()).await.unwrap();
         let started = std::time::Instant::now();
         let mut saw_result = false;
         let mut new_job = None;
@@ -482,4 +472,216 @@ async fn accepted_submit_refreshes_the_template_before_the_next_job() {
         assert_eq!(new_job["params"][2], json!(yolo::codec::reverse_hex(&format!("{:064x}", 106))), "{}: parent of the new job", mode);
         assert_eq!(new_job["params"][7], json!(true), "{}: clean_jobs on the new parent", mode);
     }
+}
+
+/// A connected miner for the hardening tests: raw lines in, raw lines out.
+struct Miner {
+    rd: tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+    wr: tokio::net::tcp::OwnedWriteHalf,
+}
+
+impl Miner {
+    async fn connect(addr: SocketAddr) -> Miner {
+        let (rd, wr) = TcpStream::connect(addr).await.unwrap().into_split();
+        Miner { rd: BufReader::new(rd).lines(), wr }
+    }
+    async fn send(&mut self, line: &str) {
+        self.wr.write_all(format!("{}\n", line).as_bytes()).await.unwrap();
+    }
+    /// The next line within `secs`, or None when the server closed the socket.
+    async fn next(&mut self, secs: u64) -> Option<Value> {
+        match tokio::time::timeout(Duration::from_secs(secs), self.rd.next_line()).await {
+            Ok(Ok(Some(l))) => Some(serde_json::from_str(&l).unwrap_or_else(|e| panic!("non-JSON {:?}: {}", l, e))),
+            Ok(Ok(None)) | Ok(Err(_)) => None,
+            Err(_) => panic!("no line within {} s", secs),
+        }
+    }
+    /// The next response (non-notification) within `secs`.
+    async fn response(&mut self, secs: u64) -> Option<Value> {
+        loop {
+            match self.next(secs).await {
+                Some(v) if v.get("method").is_some() => continue,
+                other => return other,
+            }
+        }
+    }
+    /// True once the server has closed the socket (within `secs`); pending lines are drained.
+    async fn closed(&mut self, secs: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            match tokio::time::timeout_at(deadline, self.rd.next_line()).await {
+                Ok(Ok(Some(_))) => continue,
+                Ok(_) => return true,
+                Err(_) => return false,
+            }
+        }
+    }
+    async fn subscribe_and_authorize(&mut self, user: &str) {
+        self.send("{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"t\",null,\"h\",\"p\"]}").await;
+        assert!(self.response(5).await.unwrap()["result"][1].is_string());
+        self.send(&format!("{{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"{}\",\"x\"]}}", user)).await;
+        assert_eq!(self.response(5).await.unwrap()["result"], json!(true));
+    }
+    /// Waits for the first job; returns its id.
+    async fn job(&mut self) -> String {
+        loop {
+            let v = self.next(5).await.expect("server closed before a job");
+            if v["method"] == "mining.notify" {
+                return v["params"][0].as_str().unwrap().to_string();
+            }
+        }
+    }
+}
+
+async fn start_hardened(limits: yolo::Limits, node: SocketAddr) -> (SocketAddr, SocketAddr, yolo::state::State) {
+    let rpc = RpcClient::new(&format!("http://{}", node), &RpcAuth { user: "u".into(), password: "p".into() });
+    let mut cfg = config(Flags::POOL, true);
+    cfg.limits = limits;
+    let bound = yolo::bind(rpc, cfg).await.unwrap();
+    let (addr, status_addr, state) = (bound.addr, bound.status_addr.unwrap(), bound.state());
+    tokio::spawn(bound.serve());
+    for _ in 0..100 {
+        if state.lock().template.is_some() {
+            return (addr, status_addr, state);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("no template");
+}
+
+async fn status(addr: SocketAddr) -> Value {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+    let mut text = String::new();
+    s.read_to_string(&mut text).await.unwrap();
+    serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+}
+
+/// Audit H-1: a line without a newline past the cap closes the socket; nothing is buffered.
+#[tokio::test]
+async fn overlong_line_disconnects() {
+    let t: Value = serde_json::from_str(TEMPLATE).unwrap();
+    let (node, _) = fake_node(t).await;
+    let (addr, _, _) = start_hardened(yolo::Limits::default(), node).await;
+    let mut m = Miner::connect(addr).await;
+    m.wr.write_all(&vec![b'a'; yolo::stratum::MAX_LINE + 1]).await.unwrap();
+    assert!(m.closed(5).await);
+    // just under the cap and valid JSON is fine
+    let mut m = Miner::connect(addr).await;
+    let pad = "p".repeat(yolo::stratum::MAX_LINE - 80);
+    m.send(&format!("{{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"{}\"]}}", pad)).await;
+    assert!(m.response(5).await.unwrap()["result"][1].is_string());
+}
+
+/// Audit H-2: the global and per-IP caps, the authorize deadline, and the gauges.
+#[tokio::test]
+async fn connection_caps_and_authorize_deadline() {
+    let t: Value = serde_json::from_str(TEMPLATE).unwrap();
+    let (node, _) = fake_node(t).await;
+    let limits = yolo::Limits { max_connections: 3, max_per_ip: 2, auth_timeout: Duration::from_millis(400), ..yolo::Limits::default() };
+    let (addr, status_addr, state) = start_hardened(limits, node).await;
+    // two sockets from 127.0.0.1 are the per-IP cap; the third is closed at once
+    let mut a = Miner::connect(addr).await;
+    let mut b = Miner::connect(addr).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut c = Miner::connect(addr).await;
+    assert!(c.closed(5).await, "third socket from one IP must be refused");
+    let st = status(status_addr).await;
+    assert_eq!(st["connections"], json!(2));
+    assert_eq!(st["miners"], json!(0), "unauthorized sockets are not miners");
+    // one authorizes and counts as a miner; the other never does and is dropped at the deadline
+    a.subscribe_and_authorize(FIXTURE_ADDRESS).await;
+    assert_eq!(status(status_addr).await["miners"], json!(1));
+    assert!(b.closed(5).await, "unauthorized socket must be closed after auth_timeout");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let st = status(status_addr).await;
+    assert_eq!(st["connections"], json!(1));
+    assert_eq!(st["miners"], json!(1));
+    // the global cap: make it the only limit by freeing the per-IP one
+    drop(a);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(state.lock().connections, 0);
+    assert_eq!(state.lock().miners, 0);
+    assert_eq!(state.connection_permits.available_permits(), 3);
+}
+
+/// Audit H-3, H-17: a submit above the target or for an unknown job never reaches the node,
+/// and a miner that keeps sending bad submits is disconnected.
+#[tokio::test]
+async fn bad_submits_stay_local_and_get_the_miner_disconnected() {
+    let mut t: Value = serde_json::from_str(TEMPLATE).unwrap();
+    // The regtest target (0f0f0f…) admits one random hash in seventeen and the job time moves
+    // the merkle root every second; a near-zero target makes the rejections deterministic.
+    t["target"] = json!(format!("{}01", "0".repeat(62)));
+    let (node, submitted) = fake_node(t).await;
+    let limits = yolo::Limits { max_bad_submits: 3, ..yolo::Limits::default() };
+    let (addr, status_addr, _) = start_hardened(limits, node).await;
+    let mut m = Miner::connect(addr).await;
+    m.subscribe_and_authorize(FIXTURE_ADDRESS).await;
+    let job = m.job().await;
+    let sol = format!("24{}", "ab".repeat(36));
+    // unknown job: rejected as stale, not counted as a bad submit
+    m.send(&format!("{{\"id\":9,\"method\":\"mining.submit\",\"params\":[\"w\",\"999\",\"b61cba6a\",\"{}\",\"{}\"]}}", "0".repeat(36), sol)).await;
+    assert_eq!(m.response(5).await.unwrap()["result"], json!(false));
+    assert_eq!(status(status_addr).await["lastSubmitVerdict"], json!("stale"));
+    // three submits that hash above the regtest target: rejected locally, then disconnected
+    for i in 0..3 {
+        let job = m.job().await;
+        m.send(&format!("{{\"id\":{},\"method\":\"mining.submit\",\"params\":[\"w\",\"{}\",\"b61cba6a\",\"{}{:02x}\",\"{}\"]}}", 10 + i, job, "f".repeat(34), i, sol)).await;
+        assert_eq!(m.response(5).await.unwrap()["result"], json!(false), "submit {}", i);
+    }
+    assert!(m.closed(5).await, "the miner must be disconnected after max_bad_submits");
+    let st = status(status_addr).await;
+    assert_eq!(st["lastSubmitVerdict"], json!("high-hash"));
+    assert_eq!(st["rejected"], json!(4));
+    assert!(submitted.lock().unwrap().is_empty(), "nothing may reach submitblock: {:?}", submitted.lock().unwrap());
+    let _ = job;
+}
+
+/// Audit H-4: one authorize per connection, a per-IP budget, and cached validateaddress.
+#[tokio::test]
+async fn authorize_is_once_rate_limited_and_cached() {
+    let t: Value = serde_json::from_str(TEMPLATE).unwrap();
+    let (node, _) = fake_node(t).await;
+    let limits = yolo::Limits { authorize_per_minute: 3, ..yolo::Limits::default() };
+    let (addr, _, state) = start_hardened(limits, node).await;
+    let mut m = Miner::connect(addr).await;
+    m.subscribe_and_authorize(FIXTURE_ADDRESS).await;
+    assert!(state.cached_address(FIXTURE_ADDRESS).is_some(), "the answer is cached");
+    m.send(&format!("{{\"id\":3,\"method\":\"mining.authorize\",\"params\":[\"{}\",\"x\"]}}", FIXTURE_ADDRESS)).await;
+    assert!(m.closed(5).await, "a second authorize closes the socket");
+    // invalid answers are cached too, and the per-IP budget (3) closes the fourth attempt
+    let mut m = Miner::connect(addr).await;
+    m.send("{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"nope\",\"x\"]}").await;
+    assert_eq!(m.response(5).await.unwrap()["result"], json!(false));
+    assert_eq!(state.cached_address("nope"), Some(None));
+    let mut m = Miner::connect(addr).await;
+    m.send("{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"nope\",\"x\"]}").await;
+    assert_eq!(m.response(5).await.unwrap()["result"], json!(false));
+    let mut m = Miner::connect(addr).await;
+    m.send(&format!("{{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"{}\",\"x\"]}}", FIXTURE_ADDRESS)).await;
+    let v = m.response(5).await.unwrap();
+    assert_eq!(v["result"], json!(false), "fourth authorize from this IP within a minute: {}", v);
+    assert_eq!(v["error"], json!("Auth Failed"));
+    assert!(m.closed(5).await);
+}
+
+/// Audit H-5: the password gate still works (constant-time compare), wrong password disconnects.
+#[tokio::test]
+async fn password_gate() {
+    let t: Value = serde_json::from_str(TEMPLATE).unwrap();
+    let (node, _) = fake_node(t).await;
+    let rpc = RpcClient::new(&format!("http://{}", node), &RpcAuth { user: "u".into(), password: "p".into() });
+    let mut cfg = config(Flags::POOL, false);
+    cfg.password = Some("s3cret".into());
+    let bound = yolo::bind(rpc, cfg).await.unwrap();
+    let addr = bound.addr;
+    tokio::spawn(bound.serve());
+    let mut m = Miner::connect(addr).await;
+    m.send(&format!("{{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"{}\",\"s3cre\"]}}", FIXTURE_ADDRESS)).await;
+    assert_eq!(m.response(5).await.unwrap()["error"], json!("Auth Failed"));
+    assert!(m.closed(5).await);
+    let mut m = Miner::connect(addr).await;
+    m.send(&format!("{{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"{}\",\"s3cret\"]}}", FIXTURE_ADDRESS)).await;
+    assert_eq!(m.response(5).await.unwrap()["result"], json!(true));
 }

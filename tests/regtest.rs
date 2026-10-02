@@ -208,6 +208,7 @@ async fn run_case(case: &Case, a: &Node, b: &Node, python: &Path, miner: &Path) 
         no_flags: case.no_flags,
         password: None,
         equihash: EquihashArg::Fixed(Equihash::REGTEST),
+        limits: yolo::Limits::default(),
     };
     let bound = yolo::bind(a.rpc.clone(), config).await.unwrap();
     let addr = bound.addr;
@@ -234,19 +235,9 @@ async fn run_case(case: &Case, a: &Node, b: &Node, python: &Path, miner: &Path) 
         "--verbose".into(),
     ];
     let python = python.to_path_buf();
-    let output = tokio::task::spawn_blocking(move || Command::new(&python).args(&cmd).output())
-        .await
-        .unwrap()
-        .unwrap_or_else(|e| panic!("cannot run the stratum miner: {}", e));
+    let output = tokio::task::spawn_blocking(move || Command::new(&python).args(&cmd).output()).await.unwrap().unwrap_or_else(|e| panic!("cannot run the stratum miner: {}", e));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "{}: stratum-miner exit {}\nstdout:\n{}\nstderr:\n{}",
-        case.name,
-        output.status,
-        stdout,
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "{}: stratum-miner exit {}\nstdout:\n{}\nstderr:\n{}", case.name, output.status, stdout, String::from_utf8_lossy(&output.stderr));
     assert!(stdout.contains("accepted job"), "{}: the miner reported no accepted job:\n{}", case.name, stdout);
 
     let status = reqwest_status(status_addr).await;
@@ -264,10 +255,7 @@ async fn run_case(case: &Case, a: &Node, b: &Node, python: &Path, miner: &Path) 
     let block = a.call("getblock", json!([height.to_string(), 2]));
     let coinbase = &block["tx"][0];
     let script_sig = hex::decode(coinbase["vin"][0]["coinbase"].as_str().unwrap()).unwrap();
-    let vout0_addresses = coinbase["vout"][0]["scriptPubKey"]["addresses"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default();
+    let vout0_addresses = coinbase["vout"][0]["scriptPubKey"]["addresses"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
     log(&format!("{}: height {} tag {} scriptSig {} ({} bytes) vout0 {:?}", case.name, height, tag, hex::encode(&script_sig), script_sig.len(), vout0_addresses));
     Outcome { height, tag, script_sig, vout0_addresses }
 }
@@ -308,8 +296,7 @@ async fn payout_text_grid_against_a_regtest_node() {
     std::fs::create_dir_all(&scratch).unwrap();
     log(&format!("scratch {}", scratch.display()));
 
-    let pool_node_args: Vec<String> =
-        std::env::var("YOLO_REGTEST_POOL_NODE_ARGS").unwrap_or_default().split_whitespace().map(String::from).collect();
+    let pool_node_args: Vec<String> = std::env::var("YOLO_REGTEST_POOL_NODE_ARGS").unwrap_or_default().split_whitespace().map(String::from).collect();
 
     // Node A mines and serves the template; node B only relays. mineraddress= must be a wallet
     // t-addr of node A (the Perl's rule), so A is started once to mint it, then restarted with it.
@@ -343,13 +330,7 @@ async fn payout_text_grid_against_a_regtest_node() {
 
     let text = "yolo regtest";
     let long_text = "x".repeat(90);
-    let case = |name, payout: Option<&String>, text: Option<&str>, no_flags, user: &str| Case {
-        name,
-        payout: payout.cloned(),
-        text: text.map(String::from),
-        no_flags,
-        user: user.to_string(),
-    };
+    let case = |name, payout: Option<&String>, text: Option<&str>, no_flags, user: &str| Case { name, payout: payout.cloned(), text: text.map(String::from), no_flags, user: user.to_string() };
     let cases = [
         case("username", None, None, false, &miner_addr),
         case("fixed", Some(&mineraddress), None, false, "stratum-miner"),

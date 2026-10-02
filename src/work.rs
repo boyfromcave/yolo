@@ -180,22 +180,50 @@ impl Submit {
     }
 }
 
-/// The raw block for `submitblock`, byte for byte as the Perl concatenates it: header fields
-/// from the job, `nTime` as the miner echoed it, nonce = nonce1 ‖ nonce2, the solution as sent
-/// (compact size included), then the transactions.
+/// The block header for a submit, hex: header fields from the job, `nTime` as the miner
+/// echoed it, nonce = nonce1 ‖ nonce2, the solution as sent (compact size included).
+pub fn assemble_header(work: &Work, nonce1: &str, s: &Submit) -> String {
+    let mut header = String::with_capacity(2 * HEADER_SIZE + 400);
+    header.push_str(&work.version);
+    header.push_str(&work.previousblockhash);
+    header.push_str(&work.merkleroot);
+    header.push_str(&work.light_client_root);
+    header.push_str(&s.ntime);
+    header.push_str(&work.bits);
+    header.push_str(nonce1);
+    header.push_str(&s.nonce2);
+    header.push_str(&s.solution);
+    header
+}
+
+/// The raw block for `submitblock`, byte for byte as the Perl concatenates it: the header
+/// (`assemble_header`), then the transactions.
 pub fn assemble_block(work: &Work, nonce1: &str, s: &Submit) -> String {
-    let mut block = String::with_capacity(work.transactions.len() + 400);
-    block.push_str(&work.version);
-    block.push_str(&work.previousblockhash);
-    block.push_str(&work.merkleroot);
-    block.push_str(&work.light_client_root);
-    block.push_str(&s.ntime);
-    block.push_str(&work.bits);
-    block.push_str(nonce1);
-    block.push_str(&s.nonce2);
-    block.push_str(&s.solution);
+    let mut block = assemble_header(work, nonce1, s);
     block.push_str(&work.transactions);
     block
+}
+
+/// The block hash (SHA256d of the serialized header, solution included) as the node
+/// displays it: big-endian hex.
+pub fn header_hash_display(header_hex: &str) -> Result<String, String> {
+    let bytes = hex::decode(header_hex).map_err(|e| format!("header is not hex: {}", e))?;
+    let mut h = dsha256(&bytes);
+    h.reverse();
+    Ok(hex::encode(h))
+}
+
+/// Audit H-3: the pool's own proof-of-work check before `submitblock`. True when the block
+/// hash is at or below the template's `target` (both big-endian), the same comparison
+/// `CheckProofOfWork` makes; the Equihash solution itself is left to the node.
+pub fn meets_target(header_hex: &str, target_hex: &str) -> Result<bool, String> {
+    let hash = header_hash_display(header_hex)?;
+    let target = hex::decode(target_hex).map_err(|e| format!("target is not hex: {}", e))?;
+    if target.len() != 32 {
+        return Err(format!("target is {} bytes, not 32", target.len()));
+    }
+    let hash = hex::decode(hash).map_err(|e| e.to_string())?;
+    Ok(hash.as_slice() <= target.as_slice())
 }
 
 #[cfg(test)]
@@ -278,6 +306,25 @@ mod tests {
         let nonce_hex = &raw[216..280];
         let s = Submit::check(&raw[200..208], &nonce_hex[28..], &raw[280..354], 28, Equihash::REGTEST).unwrap();
         assert_eq!(assemble_block(&w, &nonce_hex[..28], &s), raw);
+    }
+
+    #[test]
+    fn local_pow_check_against_block_105() {
+        // Block 105 as mined: its hash is the node's, and it meets the regtest target.
+        let raw = include_str!("../tests/vectors/regtest-block-105.hex").trim();
+        let t = template();
+        let header = &raw[..2 * (HEADER_SIZE + 37)];
+        assert_eq!(header_hash_display(header).unwrap(), "0d5648cf5ce951d41676fd37a9d4666ccbc75eeb8562c3d8d81e3bb607eb59f8");
+        assert!(meets_target(header, &t.target).unwrap());
+        // the same header with one nonce byte flipped is no longer below the target
+        let mut flipped = header.to_string();
+        flipped.replace_range(216..218, "ff");
+        assert!(!meets_target(&flipped, &t.target).unwrap());
+        // a zero target admits nothing but the zero hash; an all-ff target admits everything
+        assert!(!meets_target(header, &"0".repeat(64)).unwrap());
+        assert!(meets_target(header, &"f".repeat(64)).unwrap());
+        assert!(meets_target(header, "0f").is_err());
+        assert!(meets_target("zz", &t.target).is_err());
     }
 
     #[test]

@@ -7,10 +7,12 @@
 //! beyond logging the tag of the job it hands out.
 
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use subtle::ConstantTimeEq;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -18,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use crate::poller::job_time;
 use crate::state::State;
-use crate::work::{assemble_block, build_work, BuildParams, Submit, Work};
+use crate::work::{assemble_block, assemble_header, build_work, meets_target, BuildParams, Submit, Work};
 
 /// Bytes of nonce the pool fixes per client: the Perl's `nonce1_size` is 16 but
 /// `sprintf("%04x", id) . newkey(16 - 4)` yields 4 + 24 = 28 hex chars, i.e. 14 bytes
@@ -73,24 +75,91 @@ pub fn msg_submit_result(id: &Value, ok: bool) -> String {
     format!("{{\"id\":{},\"result\": {}}}\n", id_text(id), ok)
 }
 
+/// Audit H-1: the longest line a miner may send. A `mining.submit` at 192,7 is about 1 KB
+/// (806 hex chars of solution); anything near this is not a stratum message.
+pub const MAX_LINE: usize = 8192;
+/// Audit H-8: miner-controlled strings are logged `{:?}` and no longer than this.
+const MAX_LOGGED: usize = 128;
+
+/// A miner-controlled string as it may appear in the log: `{:?}` (control characters and
+/// escapes shown escaped), cut to `MAX_LOGGED` bytes on a character boundary.
+pub fn shown(s: &str) -> String {
+    let mut end = s.len().min(MAX_LOGGED);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < s.len() {
+        format!("{:?}…", &s[..end])
+    } else {
+        format!("{:?}", s)
+    }
+}
+
+/// `read_line` with a bound: `Ok(Some(line))` without its terminator, `Ok(None)` at EOF, and
+/// an `InvalidData` error once `MAX_LINE` bytes arrive without a newline (the caller
+/// disconnects; nothing more is buffered).
+pub async fn read_line_capped<R: AsyncBufRead + Unpin>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Option<String>> {
+    buf.clear();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if buf.is_empty() { Ok(None) } else { Ok(Some(String::from_utf8_lossy(buf).into_owned())) };
+        }
+        let (take, done) = match available.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (available.len(), false),
+        };
+        if buf.len() + take > MAX_LINE {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("line longer than {} bytes", MAX_LINE)));
+        }
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if done {
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            return Ok(Some(String::from_utf8_lossy(buf).into_owned()));
+        }
+    }
+}
+
 pub async fn serve(state: State, listener: TcpListener, generation_rx: watch::Receiver<u64>) {
     loop {
         match listener.accept().await {
             Ok((socket, peer)) => {
+                // Audit H-2: a global cap and a per-IP cap on open sockets; a refused socket
+                // is closed at once and never costs a task.
+                let Ok(permit) = state.connection_permits.clone().try_acquire_owned() else {
+                    warn!("miner from {} refused: {} connections open (--max-connections)", peer, state.limits.max_connections);
+                    continue;
+                };
+                if !state.ip_connect(peer.ip()) {
+                    warn!("miner from {} refused: {} connections from that address (--max-per-ip)", peer, state.limits.max_per_ip);
+                    continue;
+                }
                 let index = {
                     let mut g = state.lock();
                     let i = g.clients_seen;
                     g.clients_seen += 1;
-                    g.miners += 1;
+                    g.connections += 1;
                     i
                 };
                 info!("miner {} connected from {}", index, peer);
                 let st = state.clone();
                 let rx = generation_rx.clone();
                 tokio::spawn(async move {
-                    let client = Client::new(index, peer.to_string(), rx);
-                    client.run(socket, st.clone()).await;
-                    st.lock().miners -= 1;
+                    let client = Client::new(index, peer, rx);
+                    let authorized = client.run(socket, st.clone()).await;
+                    {
+                        let mut g = st.lock();
+                        g.connections -= 1;
+                        if authorized {
+                            g.miners -= 1;
+                        }
+                    }
+                    st.ip_disconnect(peer.ip());
+                    drop(permit);
                     info!("miner {} disconnected", index);
                 });
             }
@@ -104,7 +173,7 @@ pub async fn serve(state: State, listener: TcpListener, generation_rx: watch::Re
 
 struct Client {
     index: u64,
-    peer: String,
+    peer: SocketAddr,
     nonce1: String,
     generation_rx: watch::Receiver<u64>,
     auth: bool,
@@ -116,6 +185,12 @@ struct Client {
     work_number: u64,
     jobs: VecDeque<Work>,
     last_write: Instant,
+    /// When the socket was accepted (the `mining.authorize` deadline counts from here).
+    connected_at: Instant,
+    /// When the miner last sent a line (the idle deadline counts from here).
+    last_read: Instant,
+    /// Submits rejected locally since the last good one (audit H-3).
+    bad_submits: u32,
 }
 
 enum Action {
@@ -124,7 +199,8 @@ enum Action {
 }
 
 impl Client {
-    fn new(index: u64, peer: String, generation_rx: watch::Receiver<u64>) -> Client {
+    fn new(index: u64, peer: SocketAddr, generation_rx: watch::Receiver<u64>) -> Client {
+        let now = Instant::now();
         Client {
             index,
             peer,
@@ -138,21 +214,41 @@ impl Client {
             script_pubkey: None,
             work_number: 0,
             jobs: VecDeque::new(),
-            last_write: Instant::now(),
+            last_write: now,
+            connected_at: now,
+            last_read: now,
+            bad_submits: 0,
         }
     }
 
-    async fn run(mut self, socket: TcpStream, state: State) {
+    /// The moment this socket is closed for silence: an unauthorized one must authorize
+    /// within `auth_timeout`; an authorized one must say something within
+    /// `idle_keepalives` keepalive periods (audit H-2).
+    fn silence_deadline(&self, state: &State) -> Instant {
+        if self.auth {
+            self.last_read + MINER_TIMEOUT * state.limits.idle_keepalives
+        } else {
+            self.connected_at + state.limits.auth_timeout
+        }
+    }
+
+    /// Serves the socket until it closes; returns whether the miner had authorized.
+    async fn run(mut self, socket: TcpStream, state: State) -> bool {
         let (rd, mut wr) = socket.into_split();
-        let mut lines = BufReader::new(rd).lines();
+        let mut reader = BufReader::new(rd);
+        let mut line_buf = Vec::with_capacity(1024);
         let mut out = String::new();
         loop {
             let keepalive = tokio::time::sleep_until(self.last_write + MINER_TIMEOUT);
+            let silence = tokio::time::sleep_until(self.silence_deadline(&state));
             let action = tokio::select! {
-                line = lines.next_line() => match line {
-                    Ok(Some(line)) => self.handle_line(&line, &state, &mut out).await,
+                line = read_line_capped(&mut reader, &mut line_buf) => match line {
+                    Ok(Some(line)) => {
+                        self.last_read = Instant::now();
+                        self.handle_line(&line, &state, &mut out).await
+                    }
                     Ok(None) => Action::Disconnect,
-                    Err(e) => { debug!("miner {}: read: {}", self.index, e); Action::Disconnect }
+                    Err(e) => { warn!("miner {}: read: {}, disconnecting", self.index, e); Action::Disconnect }
                 },
                 changed = self.generation_rx.changed() => {
                     if changed.is_err() { Action::Disconnect } else {
@@ -173,6 +269,14 @@ impl Client {
                     self.last_write = Instant::now();
                     Action::Continue
                 }
+                _ = silence => {
+                    if self.auth {
+                        warn!("miner {}: silent for {} keepalive periods, disconnecting", self.index, state.limits.idle_keepalives);
+                    } else {
+                        warn!("miner {}: no mining.authorize within {:?}, disconnecting", self.index, state.limits.auth_timeout);
+                    }
+                    Action::Disconnect
+                }
             };
             if let Action::Continue = action {
                 self.pump(&state, &mut out);
@@ -189,6 +293,7 @@ impl Client {
                 break;
             }
         }
+        self.auth
     }
 
     /// The Perl main loop's per-client branch: set the target for a miner that needs one, then
@@ -213,11 +318,7 @@ impl Client {
             // One job per client, numbered by a per-client counter (`stratumpool`'s
             // `$client->{'worknumber'}`; the `stratumsolo` global job is gone with the modes, Y7).
             self.work_number += 1;
-            let params = BuildParams {
-                job_id: self.work_number.to_string(),
-                miner_script_pubkey: self.script_pubkey.as_deref(),
-                now: job_time(template),
-            };
+            let params = BuildParams { job_id: self.work_number.to_string(), miner_script_pubkey: self.script_pubkey.as_deref(), now: job_time(template) };
             let work = match build_work(template, &state.policy, state.equihash, &params) {
                 Ok(w) => Some(w),
                 Err(e) => {
@@ -235,6 +336,14 @@ impl Client {
                 }
                 self.mining = true;
             }
+        }
+    }
+
+    /// Marks the miner authorized (once; the gauge counts authorized miners only).
+    fn authorized(&mut self, state: &State) {
+        if !self.auth {
+            self.auth = true;
+            state.lock().miners += 1;
         }
     }
 
@@ -257,57 +366,83 @@ impl Client {
             "mining.subscribe" => {
                 self.software = param(0);
                 out.push_str(&msg_subscribe(&id, &self.nonce1));
-                info!("miner {}: subscribed ({}), nonce1 {}", self.index, self.software, self.nonce1);
+                info!("miner {}: subscribed ({}), nonce1 {}", self.index, shown(&self.software), self.nonce1);
                 Action::Continue
             }
             "mining.authorize" => {
+                // Audit H-4: one authorize per connection, a per-IP budget, cached answers.
+                if self.auth {
+                    warn!("miner {}: second mining.authorize, disconnecting", self.index);
+                    return Action::Disconnect;
+                }
+                if !state.authorize_allowed(self.peer.ip()) {
+                    out.push_str(&msg_auth_failed(&id, "Auth Failed"));
+                    warn!("miner {}: too many mining.authorize from {}, disconnecting", self.index, self.peer.ip());
+                    return Action::Disconnect;
+                }
                 self.worker = param(0);
                 let password = param(1);
                 if let Some(expected) = &state.password {
-                    if &password != expected {
+                    // Audit H-5: constant-time compare.
+                    if !bool::from(password.as_bytes().ct_eq(expected.as_bytes())) {
                         out.push_str(&msg_auth_failed(&id, "Auth Failed"));
-                        warn!("miner {}: wrong password for {}", self.index, self.worker);
+                        warn!("miner {}: wrong password for {}", self.index, shown(&self.worker));
                         return Action::Disconnect;
                     }
                 }
                 if let Some(fixed) = &state.policy.payout {
                     // --payout: every block pays the fixed address; the username is a worker name.
-                    self.auth = true;
+                    self.authorized(state);
                     out.push_str(&msg_authorized(&id));
-                    info!("miner {}: authorized as {:?}, paying {}", self.index, self.worker, fixed.address);
+                    info!("miner {}: authorized as {}, paying {}", self.index, shown(&self.worker), fixed.address);
                     return Action::Continue;
                 }
                 // no --payout: the username is the payout address
-                let rpc = state.rpc.clone();
-                let address = self.worker.clone();
-                let result = tokio::task::spawn_blocking(move || rpc.validateaddress(&address)).await;
-                match result {
-                    Ok(Ok(v)) if v.isvalid => match v.script_pubkey.as_deref().map(hex::decode) {
-                        Some(Ok(spk)) => {
-                            self.script_pubkey = Some(spk);
-                            self.auth = true;
-                            out.push_str(&msg_authorized(&id));
-                            info!("miner {}: authorized, paying {}", self.index, self.worker);
-                            Action::Continue
+                let cached = state.cached_address(&self.worker);
+                let was_cached = cached.is_some();
+                let answer = match cached {
+                    Some(spk) => Ok(spk),
+                    None => {
+                        let rpc = state.rpc.clone();
+                        let address = self.worker.clone();
+                        match tokio::task::spawn_blocking(move || rpc.validateaddress(&address)).await {
+                            Ok(Ok(v)) if v.isvalid => match v.script_pubkey.as_deref().map(hex::decode) {
+                                Some(Ok(spk)) => Ok(Some(spk)),
+                                _ => {
+                                    warn!("miner {}: {} validates but has no scriptPubKey (shielded?)", self.index, shown(&self.worker));
+                                    Ok(None)
+                                }
+                            },
+                            Ok(Ok(_)) => {
+                                warn!("miner {}: invalid payout address {}", self.index, shown(&self.worker));
+                                Ok(None)
+                            }
+                            Ok(Err(e)) => Err(format!("validateaddress failed: {}", e)),
+                            Err(e) => Err(format!("validateaddress task: {}", e)),
                         }
-                        _ => {
-                            out.push_str(&msg_auth_failed(&id, "Invalid address"));
-                            warn!("miner {}: {} validates but has no scriptPubKey (shielded?)", self.index, self.worker);
-                            Action::Disconnect
-                        }
-                    },
-                    Ok(Ok(_)) => {
-                        out.push_str(&msg_auth_failed(&id, "Invalid address"));
-                        warn!("miner {}: invalid payout address {:?}", self.index, self.worker);
-                        Action::Disconnect
                     }
-                    Ok(Err(e)) => {
+                };
+                match answer {
+                    Ok(Some(spk)) => {
+                        if !was_cached {
+                            state.cache_address(&self.worker, Some(spk.clone()));
+                        }
+                        self.script_pubkey = Some(spk);
+                        self.authorized(state);
+                        out.push_str(&msg_authorized(&id));
+                        info!("miner {}: authorized, paying {}", self.index, shown(&self.worker));
+                        Action::Continue
+                    }
+                    Ok(None) => {
+                        if !was_cached {
+                            state.cache_address(&self.worker, None);
+                        }
                         out.push_str(&msg_auth_failed(&id, "Invalid address"));
-                        warn!("miner {}: validateaddress failed: {}", self.index, e);
                         Action::Disconnect
                     }
                     Err(e) => {
-                        warn!("miner {}: validateaddress task: {}", self.index, e);
+                        out.push_str(&msg_auth_failed(&id, "Invalid address"));
+                        warn!("miner {}: {}", self.index, e);
                         Action::Disconnect
                     }
                 }
@@ -319,39 +454,69 @@ impl Client {
                 Action::Continue
             }
             "mining.submit" => {
+                if !self.auth {
+                    warn!("miner {}: submit before authorize, disconnecting", self.index);
+                    return Action::Disconnect;
+                }
                 self.mining = false;
                 self.ready = false;
                 let ok = self.submit(&id, &params, state).await;
                 out.push_str(&msg_submit_result(&id, ok));
+                if self.bad_submits >= state.limits.max_bad_submits {
+                    warn!("miner {}: {} bad submits, disconnecting", self.index, self.bad_submits);
+                    return Action::Disconnect;
+                }
                 Action::Continue
             }
             other => {
-                warn!("miner {}: unknown method {:?}, disconnecting", self.index, other);
+                warn!("miner {}: unknown method {}, disconnecting", self.index, shown(other));
                 Action::Disconnect
             }
         }
     }
 
     /// `mining.submit` [worker, job id, ntime, nonce2, solution] → true only when the node
-    /// returns null; the verdict string is logged and kept for `/status`.
+    /// returns null; the verdict string is logged and kept for `/status`. A submit that fails
+    /// the pool's own checks (shape, unknown job, hash above target) never reaches the node
+    /// (audit H-3, H-17).
     async fn submit(&mut self, _id: &Value, params: &[Value], state: &State) -> bool {
         let p = |i: usize| params.get(i).and_then(Value::as_str).unwrap_or("");
         let job_id = p(1);
-        let Some(work) = self.jobs.iter().rev().find(|w| w.job_id == job_id).or(self.jobs.back()).cloned() else {
-            warn!("miner {}: submit before any job", self.index);
-            self.record(state, "no-job");
+        let Some(work) = self.jobs.iter().rev().find(|w| w.job_id == job_id).cloned() else {
+            warn!("miner {}: submit for unknown job {}", self.index, shown(job_id));
+            self.record(state, "stale");
             return false;
         };
         let submit = match Submit::check(p(2), p(3), p(4), self.nonce1.len(), state.equihash) {
             Ok(s) => s,
             Err(e) => {
                 warn!("miner {}: bad submit for job {}: {}", self.index, job_id, e);
+                self.bad_submits += 1;
                 self.record(state, "bad-submit");
                 return false;
             }
         };
+        let header = assemble_header(&work, &self.nonce1, &submit);
+        match if state.limits.check_pow { meets_target(&header, &work.target) } else { Ok(true) } {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!("miner {}: submit for job {} is above the target, not forwarded", self.index, job_id);
+                self.bad_submits += 1;
+                self.record(state, "high-hash");
+                return false;
+            }
+            Err(e) => {
+                warn!("miner {}: cannot hash submit for job {}: {}", self.index, job_id, e);
+                self.bad_submits += 1;
+                self.record(state, "bad-submit");
+                return false;
+            }
+        }
+        self.bad_submits = 0;
         let block = assemble_block(&work, &self.nonce1, &submit);
         let rpc = state.rpc.clone();
+        // Audit H-3: at most `submits_in_flight` submitblock calls at once, pool-wide.
+        let _permit = state.submit_permits.acquire().await;
         let verdict = tokio::task::spawn_blocking(move || rpc.submitblock(&block)).await;
         match verdict {
             Ok(Ok(None)) => {
@@ -400,13 +565,49 @@ mod tests {
     }
 
     #[test]
+    fn miner_strings_are_escaped_and_cut() {
+        assert_eq!(shown("gminer"), "\"gminer\"");
+        assert_eq!(shown("a\nblock 9 accepted\x1b[0m"), "\"a\\nblock 9 accepted\\u{1b}[0m\"");
+        let long = "é".repeat(100);
+        let cut = shown(&long);
+        assert!(cut.ends_with("…"));
+        assert!(cut.len() < 140);
+        assert_eq!(shown(&"x".repeat(128)), format!("{:?}", "x".repeat(128)));
+    }
+
+    #[tokio::test]
+    async fn line_reader_is_capped() {
+        let mut buf = Vec::new();
+        let mut r = BufReader::new(&b"one\r\ntwo\nthree"[..]);
+        assert_eq!(read_line_capped(&mut r, &mut buf).await.unwrap().as_deref(), Some("one"));
+        assert_eq!(read_line_capped(&mut r, &mut buf).await.unwrap().as_deref(), Some("two"));
+        assert_eq!(read_line_capped(&mut r, &mut buf).await.unwrap().as_deref(), Some("three"));
+        assert_eq!(read_line_capped(&mut r, &mut buf).await.unwrap(), None);
+        let ok = "x".repeat(MAX_LINE - 1) + "\n";
+        let mut r = BufReader::new(ok.as_bytes());
+        assert_eq!(read_line_capped(&mut r, &mut buf).await.unwrap().unwrap().len(), MAX_LINE - 1);
+        let over = "x".repeat(MAX_LINE) + "\n";
+        let mut r = BufReader::new(over.as_bytes());
+        let e = read_line_capped(&mut r, &mut buf).await.unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        // no newline at all: the error comes once the cap is hit, not at EOF
+        let endless = "y".repeat(MAX_LINE * 3);
+        let mut r = BufReader::with_capacity(100, endless.as_bytes());
+        assert!(read_line_capped(&mut r, &mut buf).await.is_err());
+        assert!(buf.len() <= MAX_LINE);
+    }
+
+    #[test]
     fn messages_match_the_perl_byte_for_byte() {
         let id = serde_json::json!(7);
         assert_eq!(msg_subscribe(&id, "000094e6b550edb9bd052ceac8af"), "{\"id\":7,\"result\":[null,\"000094e6b550edb9bd052ceac8af\"],\"error\":null}\n");
         assert_eq!(msg_authorized(&id), "{\"id\":7,\"result\": true,\"error\": null}\n");
         assert_eq!(msg_auth_failed(&id, "Auth Failed"), "{\"id\":7,\"result\": false,\"error\": \"Auth Failed\"}\n");
         assert_eq!(msg_extranonce(&id), "{\"id\":7,\"result\": true,\"error\": null}\n");
-        assert_eq!(msg_set_target("0f0f0f0000000000000000000000000000000000000000000000000000000000"), "{\"id\":null,\"method\":\"mining.set_target\",\"params\":[\"0f0f0f0000000000000000000000000000000000000000000000000000000000\"]}\n");
+        assert_eq!(
+            msg_set_target("0f0f0f0000000000000000000000000000000000000000000000000000000000"),
+            "{\"id\":null,\"method\":\"mining.set_target\",\"params\":[\"0f0f0f0000000000000000000000000000000000000000000000000000000000\"]}\n"
+        );
         assert_eq!(msg_submit_result(&id, true), "{\"id\":7,\"result\": true}\n");
         assert_eq!(msg_submit_result(&id, false), "{\"id\":7,\"result\": false}\n");
         assert_eq!(msg_submit_result(&serde_json::json!("x"), false), "{\"id\":\"x\",\"result\": false}\n");
@@ -428,7 +629,12 @@ mod tests {
         };
         assert_eq!(
             msg_notify(&w, true),
-            format!("{{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"3\",\"04000000\",\"{}\",\"{}\",\"{}\",\"b61cba6a\",\"0f0f0f20\",true,\"ZcashPoW\"]}}\n", "aa".repeat(32), "bb".repeat(32), "cc".repeat(32))
+            format!(
+                "{{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"3\",\"04000000\",\"{}\",\"{}\",\"{}\",\"b61cba6a\",\"0f0f0f20\",true,\"ZcashPoW\"]}}\n",
+                "aa".repeat(32),
+                "bb".repeat(32),
+                "cc".repeat(32)
+            )
         );
         assert!(msg_notify(&w, false).contains("\"0f0f0f20\",false,\"ZcashPoW\""));
     }
