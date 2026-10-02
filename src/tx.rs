@@ -35,6 +35,11 @@ pub struct Coinbase {
     pub value_balance: i64,
 }
 
+/// `pos + len` for a node-supplied compact size, without overflow (audit H-17).
+fn span(pos: usize, len: u64) -> Result<usize, String> {
+    usize::try_from(len).ok().and_then(|n| pos.checked_add(n)).ok_or_else(|| format!("length {} out of range", len))
+}
+
 fn u32_at(data: &[u8], pos: usize) -> Result<u32, String> {
     let b = data.get(pos..pos + 4).ok_or("truncated u32")?;
     Ok(u32::from_le_bytes(b.try_into().unwrap()))
@@ -68,8 +73,9 @@ impl Coinbase {
         pos += 36;
         let (sig_len, n) = read_compact_size(data, pos)?;
         pos += n;
-        let script_sig = data.get(pos..pos + sig_len as usize).ok_or("truncated scriptSig")?.to_vec();
-        pos += sig_len as usize;
+        let end = span(pos, sig_len)?;
+        let script_sig = data.get(pos..end).ok_or("truncated scriptSig")?.to_vec();
+        pos = end;
         let sequence = u32_at(data, pos)?;
         pos += 4;
         let (vout_count, n) = read_compact_size(data, pos)?;
@@ -80,8 +86,9 @@ impl Coinbase {
             pos += 8;
             let (spk_len, n) = read_compact_size(data, pos)?;
             pos += n;
-            let script_pubkey = data.get(pos..pos + spk_len as usize).ok_or("truncated scriptPubKey")?.to_vec();
-            pos += spk_len as usize;
+            let end = span(pos, spk_len)?;
+            let script_pubkey = data.get(pos..end).ok_or("truncated scriptPubKey")?.to_vec();
+            pos = end;
             vout.push(TxOut { value, script_pubkey });
         }
         let lock_time = u32_at(data, pos)?;
@@ -155,7 +162,13 @@ pub fn rebuild_script_sig(height_push: &[u8], flags: &[u8], text: &[u8]) -> Resu
     // A direct push costs one byte up to 75 bytes of data, two (OP_PUSHDATA1) beyond.
     let mut text_used = text.len();
     loop {
-        let push_hdr = if text_used == 0 { 0 } else if text_used <= 75 { 1 } else { 2 };
+        let push_hdr = if text_used == 0 {
+            0
+        } else if text_used <= 75 {
+            1
+        } else {
+            2
+        };
         if push_hdr + text_used <= room {
             break;
         }
@@ -182,12 +195,8 @@ mod tests {
     use crate::tag::{decode_coinbase_tag, height_push_len, tag_kind};
 
     fn template_coinbase() -> (Vec<u8>, String) {
-        let t: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/vectors/regtest-template-105.json")).unwrap();
-        (
-            hex::decode(t["coinbasetxn"]["data"].as_str().unwrap()).unwrap(),
-            t["coinbaseaux"]["flags"].as_str().unwrap().to_string(),
-        )
+        let t: serde_json::Value = serde_json::from_str(include_str!("../tests/vectors/regtest-template-105.json")).unwrap();
+        (hex::decode(t["coinbasetxn"]["data"].as_str().unwrap()).unwrap(), t["coinbaseaux"]["flags"].as_str().unwrap().to_string())
     }
 
     #[test]
@@ -208,8 +217,7 @@ mod tests {
         assert_eq!(hex::encode(&cb.script_sig), format!("016900{}", flags));
         assert_eq!(cb.serialize(), data);
         // the no-flags template too (height 4: OP_4 OP_0)
-        let t: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/vectors/regtest-template-4-noflags.json")).unwrap();
+        let t: serde_json::Value = serde_json::from_str(include_str!("../tests/vectors/regtest-template-4-noflags.json")).unwrap();
         let data4 = hex::decode(t["coinbasetxn"]["data"].as_str().unwrap()).unwrap();
         let cb4 = Coinbase::parse(&data4).unwrap();
         assert_eq!(cb4.script_sig, vec![0x54, 0x00]);
@@ -313,5 +321,19 @@ mod tests {
         assert_eq!(r.script_sig.len(), 4 + 2 + 76);
         // flags alone over the limit is an error
         assert!(rebuild_script_sig(&hp, &[0u8; 97], b"").is_err());
+    }
+
+    #[test]
+    fn huge_compact_sizes_are_rejected_not_overflowed() {
+        // a coinbase whose scriptSig length claims u64::MAX: an error, not a panic (audit H-17)
+        let (data, _) = template_coinbase();
+        let mut bad = data[..8 + 1 + 36].to_vec();
+        bad.push(0xff);
+        bad.extend_from_slice(&u64::MAX.to_le_bytes());
+        bad.extend_from_slice(&data[8 + 1 + 36 + 1..]);
+        let e = Coinbase::parse(&bad).unwrap_err();
+        assert!(e.contains("out of range") || e.contains("truncated"), "{}", e);
+        assert!(span(usize::MAX, 1).is_err());
+        assert_eq!(span(5, 7).unwrap(), 12);
     }
 }
