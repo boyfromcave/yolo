@@ -1,3 +1,7 @@
+// Copyright (c) 2026 The Ycash developers
+// Distributed under the MIT software license, see the accompanying
+// file LICENSE or https://www.opensource.org/licenses/mit-license.php .
+
 //! `GET /status`: a one-document HTTP endpoint so `monitor-quote.sh`-style checks can read
 //! the pool (height, template age, miners, last tag kind, last submit verdict).
 

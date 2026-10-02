@@ -1,3 +1,7 @@
+// Copyright (c) 2026 The Ycash developers
+// Distributed under the MIT software license, see the accompanying
+// file LICENSE or https://www.opensource.org/licenses/mit-license.php .
+
 //! JSON-RPC 1.0 over HTTP to `ycashd`. The Perl shells out to `ycash-cli` (`stratumsolo:294`);
 //! this talks to the node directly. Only four methods are used: `getblockchaininfo`,
 //! `getblocktemplate`, `submitblock`, `validateaddress`.

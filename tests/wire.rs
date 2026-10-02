@@ -1,3 +1,7 @@
+// Copyright (c) 2026 The Ycash developers
+// Distributed under the MIT software license, see the accompanying
+// file LICENSE or https://www.opensource.org/licenses/mit-license.php .
+
 //! Wire-format parity with the Perl (plan §3.2.2, §3.2.5): the exchanges Y2 recorded against
 //! `ref/yolo/stratumsolo` and `cenote` (`tests/fixtures/stratum-perl-*.jsonl`, rows
 //! `{"ts","dir":"send|recv","line"}` from the miner's side) are replayed against the Rust

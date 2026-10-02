@@ -1,3 +1,7 @@
+// Copyright (c) 2026 The Ycash developers
+// Distributed under the MIT software license, see the accompanying
+// file LICENSE or https://www.opensource.org/licenses/mit-license.php .
+
 //! The stratum server: one task per miner, messages byte for byte as the Perl writes them
 //! (`ref/yolo/stratumsolo`, `stratumpool`; plan §3.2.2). Nothing here knows about Yellowback
 //! beyond logging the tag of the job it hands out.

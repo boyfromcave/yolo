@@ -1,3 +1,7 @@
+// Copyright (c) 2026 The Ycash developers
+// Distributed under the MIT software license, see the accompanying
+// file LICENSE or https://www.opensource.org/licenses/mit-license.php .
+
 //! The template poller: `getblocktemplate` every second (`stratumsolo:178`), new work when
 //! the change key moves (height, target, light-client root, `coinbaseaux.flags`: Y-F2), a
 //! 5 s back-off while the node is down, a forced refresh when it comes back

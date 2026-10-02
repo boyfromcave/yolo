@@ -1,3 +1,7 @@
+// Copyright (c) 2026 The Ycash developers
+// Distributed under the MIT software license, see the accompanying
+// file LICENSE or https://www.opensource.org/licenses/mit-license.php .
+
 //! Shared server state: the current template, the counters `/status` reports, and the
 //! generation number that tells clients to fetch new work.
 

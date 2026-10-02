@@ -1,3 +1,7 @@
+// Copyright (c) 2026 The Ycash developers
+// Distributed under the MIT software license, see the accompanying
+// file LICENSE or https://www.opensource.org/licenses/mit-license.php .
+
 //! Byte helpers that mirror the Perl (`ref/yolo/stratumsolo`): `reverse_bytes`, `int_to_hex`,
 //! `compact_size`, `hash_this`, `merkleroot`. Everything here works on bytes; hex is only at
 //! the edges.

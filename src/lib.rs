@@ -1,3 +1,7 @@
+// Copyright (c) 2026 The Ycash developers
+// Distributed under the MIT software license, see the accompanying
+// file LICENSE or https://www.opensource.org/licenses/mit-license.php .
+
 //! yolo: a Ycash solo-pool stratum server, the Rust rewrite of `yecdev/yolo` (Perl
 //! `stratumsolo`, `stratumpool`, `cenote`), aware of the Yellowback coinbase tag.
 //!

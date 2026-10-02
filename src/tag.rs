@@ -1,3 +1,7 @@
+// Copyright (c) 2026 The Ycash developers
+// Distributed under the MIT software license, see the accompanying
+// file LICENSE or https://www.opensource.org/licenses/mit-license.php .
+
 //! The Yellowback coinbase tag, decoded the way the node does it
 //! (`ycash-dd/contrib/yellowback/yellowback_price.py` `decode_coinbase_tag`, mirroring
 //! `src/yellowback/tag.cpp`): skip the BIP34 height push, scan the rest of the scriptSig for

@@ -1,3 +1,7 @@
+// Copyright (c) 2026 The Ycash developers
+// Distributed under the MIT software license, see the accompanying
+// file LICENSE or https://www.opensource.org/licenses/mit-license.php .
+
 //! `getblocktemplate` as yolo reads it, and the change key that decides when miners get new
 //! work (height, target, header root and, unlike the Perl, `coinbaseaux.flags`: Y-F2).
 //!

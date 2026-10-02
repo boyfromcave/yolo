@@ -1,3 +1,7 @@
+// Copyright (c) 2026 The Ycash developers
+// Distributed under the MIT software license, see the accompanying
+// file LICENSE or https://www.opensource.org/licenses/mit-license.php .
+
 //! A minimal Ycash v4 (Sapling) transaction codec, sufficient for a coinbase: header
 //! (`nVersion | fOverwintered`, `nVersionGroupId`), one input (null prevout, scriptSig,
 //! sequence), the outputs, then the tail (`nLockTime`, `nExpiryHeight`, `valueBalance`, and

@@ -1,3 +1,7 @@
+// Copyright (c) 2026 The Ycash developers
+// Distributed under the MIT software license, see the accompanying
+// file LICENSE or https://www.opensource.org/licenses/mit-license.php .
+
 //! End-to-end against a real node (plan §3.2.5, Y3): `cargo test --features regtest` with
 //! `YCASHD` set. Starts a two-node regtest the way `stratum-perl-check` does (Yellowback on, a
 //! quote set, `mineraddress=` so the template carries a tagged coinbase), runs the server

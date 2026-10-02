@@ -1,3 +1,7 @@
+// Copyright (c) 2026 The Ycash developers
+// Distributed under the MIT software license, see the accompanying
+// file LICENSE or https://www.opensource.org/licenses/mit-license.php .
+
 //! From a template to a `mining.notify` and back to a `submitblock` (`new_work` and the
 //! `mining.submit` branch of `ref/yolo/stratumsolo`), with the coinbase policy of the
 //! payout × text flag pair (plan §3.2.4 as revised by Y7).
