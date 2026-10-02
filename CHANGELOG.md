@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased — hardening (security audit 2026-10-01)
+
+- Stratum reader bounded at 8 KiB per line; a longer line closes the socket (H-1).
+- `--max-connections` (1024) and `--max-per-ip` (64); a socket that has not authorized
+  within 30 s or a miner silent for three keepalive periods is closed; `/status` `miners`
+  counts authorized miners only and a new `connections` gauge counts every socket (H-2).
+- Every `mining.submit` is hash-checked against the target before `submitblock` (`high-hash`
+  locally, nothing forwarded); at most eight `submitblock` calls in flight pool-wide; ten
+  locally rejected submits in a row disconnect the miner; the template poll runs on a thread
+  of its own, never behind queued submits (H-3). A submit for an unknown job id is rejected as
+  `stale` instead of being matched to the latest job (H-17).
+- One `mining.authorize` per connection, ten per minute per IP, `validateaddress` answers
+  cached for ten minutes (H-4); the password compare is constant-time (H-5).
+- `--no-flags` is refused unless the binary is built with `--features regtest`; `/status`
+  reports `noFlags` (H-6). README and `/status` (`tagPayoutKey`) state that the tag's
+  payoutKey is the node's whatever `--payout` says, with a startup warning without
+  `--payout` (H-7).
+- Miner-controlled strings are logged escaped and cut to 128 bytes (H-8).
+- A startup warning when the RPC URL is plain http off loopback; a conf's `rpcbind=` is no
+  longer used as the connect host (`rpcconnect=` is) (H-9). `--status-bind` defaults to
+  `127.0.0.1` (H-10).
+- Coinbase parser uses checked arithmetic on node-supplied lengths (H-17).
+- Toolchain pinned to 1.91.0; GitHub CI (fmt, clippy, test, cargo audit, cargo deny) with
+  actions pinned by commit; `rustfmt.toml` at the crate's 200-column style (H-16, I-7, I-8, I-13).
+
 ## Unreleased — ycashd 6.20.0
 
 - The header root falls back to `getblocktemplate`'s `defaultroots` (`blockcommitmentshash`

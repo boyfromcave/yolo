@@ -53,6 +53,14 @@ The node's **`mineraddress=` is still required** in both cases: without it there
 template to serve (the node builds the coinbase, `yolo` only edits it), and the Yellowback
 tag's payout key defaults to it (`-yellowbackpayoutaddress=` overrides).
 
+**The tag's `payoutKey` is always the node's, whatever `--payout` says.** The Yellowback tag
+inside the coinbase scriptSig comes from the node (`coinbaseaux.flags`) and carries the
+node's `-yellowbackpayoutaddress` (MINER-2); `yolo` rewrites only `vout[0]`. So without
+`--payout` a miner is paid at its username, but the quote and the enforcement-fee
+eligibility that the spec credits to the tag's `payoutKey` (FEE-2) accrue to the pool
+operator's key, and the miner is **not** a registered Yellowback miner by mining here. `yolo`
+logs this once at startup and `/status` says `"tagPayoutKey":"node"`.
+
 ## Coinbase text and the Yellowback tag
 
 Under Yellowback a miner's block carries a 36-byte tag in its coinbase scriptSig (the push
@@ -74,22 +82,27 @@ height push off and appended its text, discarding the node's tag (Y-F1); the Rus
 An empty `--text ""` gives `height push ‖ flags` with nothing pushed after.
 
 A hidden `--no-flags` (meaningful only with `--text`) reproduces the Perl `cenote`'s
-tag-dropping scriptSig for the negative test; do not use it.
+tag-dropping scriptSig for the negative test. It only works in a binary built with
+`--features regtest`; a release build refuses it at startup, and when it is on, `/status`
+reports `"noFlags":true` and every block is logged `tag: none`.
 
 On every template change the server decodes the scriptSig it is about to serve with the node's
 own byte scan and logs `tag: quote|signal|none`; the same fields are on `GET /status`
 (`--status-port`):
 
 ```
-{"payout":"username","text":true,"equihash":"48,5","nodeUp":true,"height":104,
- "templateAgeSeconds":0.0,"miners":1,"tag":"quote","lastSubmitVerdict":"accepted",
- "accepted":1,"rejected":0,"uptimeSeconds":12}
+{"payout":"username","tagPayoutKey":"node","text":true,"noFlags":false,"equihash":"48,5",
+ "nodeUp":true,"height":104,"templateAgeSeconds":0.0,"miners":1,"connections":1,
+ "tag":"quote","lastSubmitVerdict":"accepted","accepted":1,"rejected":0,"uptimeSeconds":12}
 ```
 
 `payout` is the string `"username"` or the fixed `--payout` address; `text` is whether
-`--text` is set. `lastSubmitVerdict` is the string `"accepted"` on success or the exact string
-`submitblock` returned (`duplicate`, `high-hash`, `time-too-old`, …); `tag` is the kind found
-in the last coinbase built. An accepted block also triggers an immediate `getblocktemplate`
+`--text` is set. `miners` counts authorized miners, `connections` every open stratum socket.
+`lastSubmitVerdict` is the string `"accepted"` on success, the exact string `submitblock`
+returned (`duplicate`, `high-hash`, `time-too-old`, …), or one of the pool's own verdicts for
+a submit that never reached the node: `bad-submit` (malformed), `high-hash` (the block hash
+is above the target — checked locally before `submitblock`), `stale` (unknown job id);
+`tag` is the kind found in the last coinbase built. An accepted block also triggers an immediate `getblocktemplate`
 (not the next 1 s poll), and no job is handed out on the old parent in between: a fast solver
 would only re-solve it and be rejected `inconclusive`. To verify a mined block on the node,
 `ycash-cli yed_gettag <height>` and the operator kit's `check-coinbase <height>`
@@ -114,6 +127,9 @@ yolo [OPTIONS]
   --conf <ycash.conf>        read rpcuser/rpcpassword/rpcport/regtest from a ycash.conf
   --equihash <EQUIHASH>      auto (regtest → 48,5, else 192,7), 48,5 or 192,7 [default: auto]
   --status-port <PORT>       serve GET /status (JSON) on this port
+  --status-bind <BIND>       address to bind the status listener to       [default: 127.0.0.1]
+  --max-connections <N>      stratum sockets open at once, authorized or not [default: 1024]
+  --max-per-ip <N>           stratum sockets open at once from one IP     [default: 64]
   --log <LOG>                error, warn, info, debug, trace              [default: info]
   -h, --help / -V, --version
 ```
@@ -127,6 +143,31 @@ A miner connects as it would to any Equihash stratum pool: `stratum+tcp://host:3
 username = a transparent address (or any worker name when `--payout` is set), password =
 `--password` or anything. `mining.extranonce.subscribe` is acknowledged; job ids are a
 per-connection counter.
+
+### Exposure
+
+Stratum is plaintext TCP. `--password` is an **access gate, not a secret channel**: every miner
+shares it and it crosses the network in clear (the compare on the pool side is
+constant-time, which is all that can be done there). A private pool belongs behind a firewall
+or an allowlist. The pool itself is bounded against misbehaving peers: a line longer than
+8 KiB, a socket that has not authorized within 30 s, a miner silent for three keepalive
+periods (3 min), a second `mining.authorize`, more than ten `mining.authorize` a minute from
+one IP, or ten submits in a row that fail the pool's own checks all close the socket; at most
+`--max-connections` sockets (and `--max-per-ip` per address) are open at once, at most eight
+`submitblock` calls are in flight pool-wide, and every submit's block hash is compared with
+the target before it is forwarded, so a flood of random submits never reaches the node.
+`validateaddress` answers are cached for ten minutes. The template poll runs on its own
+thread, never behind queued submits.
+
+`GET /status` is unauthenticated and bound to loopback by default (`--status-bind`); it
+reveals the payout address, height, miner count and the last verdict — bind it elsewhere only
+on purpose.
+
+The node's RPC credentials travel as HTTP Basic auth: keep `--rpc` on loopback (or behind a
+TLS proxy with `https://`); `yolo` warns at startup otherwise. `--rpc-password` on the command
+line is visible to every local user in `ps`; prefer `--rpc-cookie` or `--conf`. From a conf
+file, `yolo` connects to `rpcconnect=` (default `127.0.0.1`), never to `rpcbind=`, which is a
+listen address.
 
 ## Node requirements
 
