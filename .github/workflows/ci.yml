@@ -38,9 +38,9 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup show active-toolchain
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: EmbarkStudios/cargo-deny-action@30f817c6f72275c6d54dc744fbca09ebc958599f # v2.0.12
-        with:
-          command: check
+      # Token-free, as chain-viz: rustsec/audit-check posts a check run and needs `checks: write`,
+      # which the read-only permissions block above does not grant (first run, 2026-10-02).
+      - run: cargo install cargo-deny --version 0.18.3 --locked
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo deny --locked check
+      - run: cargo audit --deny warnings
