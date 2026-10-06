@@ -1,47 +1,197 @@
-# yolo CI (audit I-13, I-7): fmt, build, test and clippy (-D warnings) on Linux and macOS with
-# the toolchain rust-toolchain.toml pins, then an advisory scan (cargo audit) and a
-# licence/source/ban check (cargo deny). Third-party actions are pinned by commit, never by tag.
+# yolo CI (audit I-13, I-7; workspace CI/CD design 2026-10-06).
+#
+# Push / PR tier (every push and pull request on the branches below):
+#   check (ubuntu, macos)  fmt, clippy (-D warnings), build (plain and --features regtest), test,
+#                          with the toolchain rust-toolchain.toml pins
+#   audit (ubuntu)         cargo deny (licences, sources, bans, advisories) + cargo audit
+# Nightly tier (workflow_dispatch with tier=nightly; component repos carry no schedule, the node
+# lines do):
+#   regtest (ubuntu)       tests/regtest.rs against a real ycashd of each node line, the binary taken
+#                          from that node line's own CI build artifact (see the job's comment)
+#
+# Third-party actions are pinned by commit, never by tag; the comment carries the tag (bump both).
 name: ci
 
 on:
   push:
-    branches: [main]
+    # The one branch list: harden/yellowback (P1 hardening), upgrade/vault (the network upgrade),
+    # main (the branch of record, AGENTS.md rule 2).
+    branches: &branches [main, harden/yellowback, upgrade/vault]
   pull_request:
+    branches: *branches
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "push = the push/PR jobs only; nightly = also the regtest job against real nodes"
+        type: choice
+        options: [push, nightly]
+        default: push
+      node_run_id:
+        description: "nightly: a run id of the node line's yellowback-tests workflow to take ycashd from (empty = the newest run on the matching branch that has the artifact)"
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_DENY_VERSION: 0.20.2
+  CARGO_AUDIT_VERSION: 0.22.2
 
 jobs:
   check:
+    name: check (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       # rustup (preinstalled on the hosted runners) installs the pinned toolchain and its
       # components from rust-toolchain.toml on first use.
       - run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-      - run: cargo fmt --check
+      # Keyed by rust-cache on the rustc version, Cargo.lock/Cargo.toml and the job; restored by the
+      # same prefix only. Saved from pushes, not from pull requests (a PR's cache is PR-scoped).
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: cargo fmt --check
+        if: runner.os == 'Linux'
+        run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo build --locked
       - run: cargo build --locked --features regtest
+      # The regtest integration test is compiled only with --features regtest and skips without
+      # YCASHD; the nightly job below runs it.
       - run: cargo test --locked
-      - run: cargo clippy --all-targets --locked -- -D warnings
 
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - run: rustup show active-toolchain
       # Token-free, as chain-viz: rustsec/audit-check posts a check run and needs `checks: write`,
       # which the read-only permissions block above does not grant (first run, 2026-10-02).
-      - run: cargo install cargo-deny --version 0.20.2 --locked
-      - run: cargo install cargo-audit --version 0.22.2 --locked
+      # The two tools at exact versions, cached by exact key (no restore-keys): a hit skips the
+      # ~6 min source build.
+      - name: cache cargo-deny and cargo-audit
+        id: tools
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-audit
+          key: cargo-tools-${{ runner.os }}-${{ runner.arch }}-deny-${{ env.CARGO_DENY_VERSION }}-audit-${{ env.CARGO_AUDIT_VERSION }}
+      - name: install cargo-deny and cargo-audit
+        if: steps.tools.outputs.cache-hit != 'true'
+        run: |
+          cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked
+          cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
       - run: cargo deny --locked check
       # Its own database path: cargo-deny 0.20 clones into ~/.cargo/advisory-db/<hash>, which cargo-audit then refuses as a non-empty clone target.
       - run: cargo audit --deny warnings --db "$RUNNER_TEMP/advisory-db"
+
+  # Nightly tier, on demand. The regtest test needs a ycashd: building one here costs > 60 min
+  # uncached (depends tree, Rust, C++), downloading the node line's own CI build artifact costs
+  # seconds, so this job downloads. The node line is matched to this run's branch: upgrade/vault ->
+  # upgrade/vault (and the test runs across the Vault activation, YOLO_REGTEST_VAULT),
+  # harden/yellowback -> harden/yellowback, anything else -> the node line's branch of record.
+  # The artifact name (NODE_ARTIFACT) is the one the node lines' yellowback-tests build job uploads:
+  # ycashd and ycash-cli at the archive root.
+  regtest:
+    if: github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly'
+    name: regtest (${{ matrix.node }})
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - node: ycash-dd
+            of_record: feature/yellowback-price-attest
+            pool_node_args: ""
+          - node: ycash6
+            of_record: feature/yellowback
+            pool_node_args: -allowdeprecated=none
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      NODE_REPO: boyfromcave/${{ matrix.node }}
+      NODE_ARTIFACT: ycashd-linux-x86_64
+      NODE_RUN_ID: ${{ inputs.node_run_id }}
+      NODE_OF_RECORD: ${{ matrix.of_record }}
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: node branch for this run
+        id: node
+        run: |
+          case "$REF_NAME" in
+            upgrade/vault|harden/yellowback) branch=$REF_NAME ;;
+            *) branch=$NODE_OF_RECORD ;;
+          esac
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "node line $NODE_REPO @ $branch"
+      # The stratum test miner (Python, stdlib only) lives in the node tree.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ env.NODE_REPO }}
+          ref: ${{ steps.node.outputs.branch }}
+          path: node
+          persist-credentials: false
+          sparse-checkout: |
+            contrib/yellowback/devnet
+            zcutil
+      - name: download ycashd from the node line's CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NODE_BRANCH: ${{ steps.node.outputs.branch }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/node"
+          if [ -n "$NODE_RUN_ID" ]; then runs=$NODE_RUN_ID; else
+            runs=$(gh run list -R "$NODE_REPO" -w yellowback-tests.yml -b "$NODE_BRANCH" -L 20 --json databaseId -q '.[].databaseId')
+          fi
+          for r in $runs; do
+            if gh run download "$r" -R "$NODE_REPO" -n "$NODE_ARTIFACT" -D "$RUNNER_TEMP/node" 2>/dev/null; then
+              echo "ycashd from $NODE_REPO run $r"; break
+            fi
+          done
+          test -f "$RUNNER_TEMP/node/ycashd" || { echo "::error::no artifact $NODE_ARTIFACT in $NODE_REPO runs on $NODE_BRANCH ($runs)"; exit 1; }
+          chmod +x "$RUNNER_TEMP/node/ycashd" "$RUNNER_TEMP/node/ycash-cli"
+      - name: cache zcash params
+        id: params
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.zcash-params
+          key: zcash-params-${{ hashFiles('node/zcutil/fetch-params.sh') }}
+      - if: steps.params.outputs.cache-hit != 'true'
+        run: node/zcutil/fetch-params.sh
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: false
+      - name: cargo test --features regtest --test regtest
+        env:
+          POOL_NODE_ARGS: ${{ matrix.pool_node_args }}
+        run: |
+          export YCASHD="$RUNNER_TEMP/node/ycashd" PYTHON=python3
+          export STRATUM_MINER="$GITHUB_WORKSPACE/node/contrib/yellowback/devnet/stratum-miner"
+          export YOLO_REGTEST_SCRATCH="$RUNNER_TEMP/yolo-regtest" YOLO_REGTEST_POOL_NODE_ARGS="$POOL_NODE_ARGS"
+          # upgrade/vault nodes: Yellowback is a module of the Vault upgrade (README, "The vault
+          # network upgrade"); the test mines 102..=h+1 across the activation first.
+          if [ "$REF_NAME" = upgrade/vault ]; then export YOLO_REGTEST_VAULT=110; fi
+          cargo test --locked --features regtest --test regtest -- --nocapture
