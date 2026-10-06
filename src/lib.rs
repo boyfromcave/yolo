@@ -115,12 +115,23 @@ impl Bound {
             self.state.equihash,
             self.state.rpc.url()
         );
-        tokio::spawn(poller::run(self.state.clone()));
+        // The poller and the status server live exactly as long as this future: aborting or
+        // dropping the serve task stops them too (they used to outlive it and keep polling).
+        struct AbortOnDrop(Vec<tokio::task::JoinHandle<()>>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                for h in &self.0 {
+                    h.abort();
+                }
+            }
+        }
+        let mut tasks = AbortOnDrop(vec![tokio::spawn(poller::run(self.state.clone()))]);
         if let Some(l) = self.status_listener {
             info!("status on http://{}/status", self.status_addr.unwrap());
-            tokio::spawn(status::serve(self.state.clone(), l));
+            tasks.0.push(tokio::spawn(status::serve(self.state.clone(), l)));
         }
         stratum::serve(self.state, self.listener, self.generation_rx).await;
+        drop(tasks);
     }
 }
 
