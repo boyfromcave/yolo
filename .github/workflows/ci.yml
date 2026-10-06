@@ -109,8 +109,8 @@ jobs:
   # seconds, so this job downloads. The node line is matched to this run's branch: upgrade/vault ->
   # upgrade/vault (and the test runs across the Vault activation, YOLO_REGTEST_VAULT),
   # harden/yellowback -> harden/yellowback, anything else -> the node line's branch of record.
-  # The artifact name (NODE_ARTIFACT) is the one the node lines' yellowback-tests build job uploads:
-  # ycashd and ycash-cli at the archive root.
+  # NODE_ARTIFACT is the node lines' yellowback-tests `build` job artifact: ycash-build.tgz, whose
+  # tar keeps src/ycashd and src/ycash-cli executable (retention 3 days, so "newest run" works).
   regtest:
     if: github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly'
     name: regtest (${{ matrix.node }})
@@ -129,7 +129,7 @@ jobs:
     timeout-minutes: 60
     env:
       NODE_REPO: boyfromcave/${{ matrix.node }}
-      NODE_ARTIFACT: ycashd-linux-x86_64
+      NODE_ARTIFACT: ycash-build
       NODE_RUN_ID: ${{ inputs.node_run_id }}
       NODE_OF_RECORD: ${{ matrix.of_record }}
       REF_NAME: ${{ github.ref_name }}
@@ -161,17 +161,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NODE_BRANCH: ${{ steps.node.outputs.branch }}
         run: |
-          mkdir -p "$RUNNER_TEMP/node"
+          dst="$RUNNER_TEMP/node"; mkdir -p "$dst"
           if [ -n "$NODE_RUN_ID" ]; then runs=$NODE_RUN_ID; else
             runs=$(gh run list -R "$NODE_REPO" -w yellowback-tests.yml -b "$NODE_BRANCH" -L 20 --json databaseId -q '.[].databaseId')
           fi
           for r in $runs; do
-            if gh run download "$r" -R "$NODE_REPO" -n "$NODE_ARTIFACT" -D "$RUNNER_TEMP/node" 2>/dev/null; then
+            if gh run download "$r" -R "$NODE_REPO" -n "$NODE_ARTIFACT" -D "$RUNNER_TEMP/dl" 2>/dev/null; then
               echo "ycashd from $NODE_REPO run $r"; break
             fi
           done
-          test -f "$RUNNER_TEMP/node/ycashd" || { echo "::error::no artifact $NODE_ARTIFACT in $NODE_REPO runs on $NODE_BRANCH ($runs)"; exit 1; }
-          chmod +x "$RUNNER_TEMP/node/ycashd" "$RUNNER_TEMP/node/ycash-cli"
+          test -f "$RUNNER_TEMP/dl/ycash-build.tgz" || { echo "::error::no artifact $NODE_ARTIFACT in $NODE_REPO runs on $NODE_BRANCH ($runs)"; exit 1; }
+          # The tarball keeps the executable bits: src/ycashd, src/ycash-cli (and the test binaries).
+          tar xzf "$RUNNER_TEMP/dl/ycash-build.tgz" -C "$dst" src/ycashd src/ycash-cli
+          ls -l "$dst/src"
       - name: cache zcash params
         id: params
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -188,7 +190,7 @@ jobs:
         env:
           POOL_NODE_ARGS: ${{ matrix.pool_node_args }}
         run: |
-          export YCASHD="$RUNNER_TEMP/node/ycashd" PYTHON=python3
+          export YCASHD="$RUNNER_TEMP/node/src/ycashd" PYTHON=python3
           export STRATUM_MINER="$GITHUB_WORKSPACE/node/contrib/yellowback/devnet/stratum-miner"
           export YOLO_REGTEST_SCRATCH="$RUNNER_TEMP/yolo-regtest" YOLO_REGTEST_POOL_NODE_ARGS="$POOL_NODE_ARGS"
           # upgrade/vault nodes: Yellowback is a module of the Vault upgrade (README, "The vault
