@@ -109,8 +109,9 @@ jobs:
   # seconds, so this job downloads. The node line is matched to this run's branch: upgrade/vault ->
   # upgrade/vault (and the test runs across the Vault activation, YOLO_REGTEST_VAULT),
   # harden/yellowback -> harden/yellowback, anything else -> the node line's branch of record.
-  # NODE_ARTIFACT is the node lines' yellowback-tests `build` job artifact: ycash-build.tgz, whose
-  # tar keeps src/ycashd and src/ycash-cli executable (retention 3 days, so "newest run" works).
+  # NODE_ARTIFACT is the node lines' yellowback-tests `build` job artifact `node-bin`: node-bin.tar
+  # (ycash-dd) or node-bin.tgz (ycash6), whose tar keeps src/ycashd and src/ycash-cli executable
+  # (retention 3 days, so "newest run" works).
   regtest:
     if: github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly'
     name: regtest (${{ matrix.node }})
@@ -129,7 +130,7 @@ jobs:
     timeout-minutes: 60
     env:
       NODE_REPO: boyfromcave/${{ matrix.node }}
-      NODE_ARTIFACT: ycash-build
+      NODE_ARTIFACT: node-bin
       NODE_RUN_ID: ${{ inputs.node_run_id }}
       NODE_OF_RECORD: ${{ matrix.of_record }}
       REF_NAME: ${{ github.ref_name }}
@@ -170,9 +171,12 @@ jobs:
               echo "ycashd from $NODE_REPO run $r"; break
             fi
           done
-          test -f "$RUNNER_TEMP/dl/ycash-build.tgz" || { echo "::error::no artifact $NODE_ARTIFACT in $NODE_REPO runs on $NODE_BRANCH ($runs)"; exit 1; }
-          # The tarball keeps the executable bits: src/ycashd, src/ycash-cli (and the test binaries).
-          tar xzf "$RUNNER_TEMP/dl/ycash-build.tgz" -C "$dst" src/ycashd src/ycash-cli
+          # node-bin holds one tar that keeps the executable bits, with src/ycashd and src/ycash-cli
+          # (plus test binaries) at its root: ycash-dd uploads node-bin.tar, ycash6 node-bin.tgz.
+          if [ -f "$RUNNER_TEMP/dl/node-bin.tar" ]; then tar -xf "$RUNNER_TEMP/dl/node-bin.tar" -C "$dst" src/ycashd src/ycash-cli
+          elif [ -f "$RUNNER_TEMP/dl/node-bin.tgz" ]; then tar -xzf "$RUNNER_TEMP/dl/node-bin.tgz" -C "$dst" src/ycashd src/ycash-cli
+          else echo "::error::no artifact $NODE_ARTIFACT (node-bin.tar / node-bin.tgz) in $NODE_REPO runs on $NODE_BRANCH ($runs)"; ls -lR "$RUNNER_TEMP/dl" 2>/dev/null || true; exit 1; fi
+          test -x "$dst/src/ycashd" && test -x "$dst/src/ycash-cli"
           ls -l "$dst/src"
       - name: cache zcash params
         id: params
