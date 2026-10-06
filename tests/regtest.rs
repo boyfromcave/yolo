@@ -27,6 +27,15 @@
 //!
 //! Works against ycashd v4.5.0 (ycash-dd) and 6.20.0 (the ycash6 build: plain `ref/ycash6`
 //! leaves Equihash (48,5) on regtest under these upgrades, baseline fix 3).
+//!
+//! **The vault upgrade** (`upgrade/vault` nodes, docs/plans/yellowback-upgrade-plan.md §15.10):
+//! set `YOLO_REGTEST_VAULT=<h>` (h ≥ 104). Yellowback is then a consensus module of the network
+//! upgrade `Vault` (branch id `6d5b7a31`) rather than `-yellowback`: the nodes start with
+//! `-nuparams=6d5b7a31:<h>` (and without `-yellowback`/`-yellowbackstartheight`, which that node
+//! refuses), yolo mines the blocks from 102 through `h + 1` before any Yellowback state exists
+//! (the case `across-vault-activation`: every block accepted, the chain tip's branch id becomes
+//! `6d5b7a31`), then node A creates the YED attestor set (`set_create`) and both nodes restart
+//! with `-yellowbackattestorset=<setid>`, after which the six cases run as before.
 #![cfg(feature = "regtest")]
 
 use std::path::{Path, PathBuf};
@@ -54,6 +63,18 @@ const NODE_ARGS: &[&str] = &[
     "-yellowbacksigmaref=0",
 ];
 
+/// The vault upgrade's consensus branch id (upgrade plan U-9).
+const VAULT_BRANCH_ID: &str = "6d5b7a31";
+
+/// `NODE_ARGS` for this run: unchanged without `YOLO_REGTEST_VAULT`; with it, the vault upgrade at
+/// `h` and none of the retired Yellowback switches (finding (31): an init error on that node).
+fn node_args(vault: Option<u64>) -> Vec<String> {
+    let Some(h) = vault else { return NODE_ARGS.iter().map(|a| a.to_string()).collect() };
+    let mut args: Vec<String> = NODE_ARGS.iter().filter(|a| **a != "-yellowback" && !a.starts_with("-yellowbackstartheight")).map(|a| a.to_string()).collect();
+    args.push(format!("-nuparams={}:{}", VAULT_BRANCH_ID, h));
+    args
+}
+
 fn workspace() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
 }
@@ -74,6 +95,8 @@ struct Node {
     p2p_port: u16,
     connect: Option<u16>,
     rpc: RpcClient,
+    /// `node_args(..)`: the network-upgrade arguments of the run.
+    base_args: Vec<String>,
     child: Option<Child>,
     extra_conf: Vec<String>,
     /// Command-line arguments after `NODE_ARGS` (`-mocktime`, `YOLO_REGTEST_POOL_NODE_ARGS`).
@@ -86,7 +109,7 @@ impl Node {
         let _ = std::fs::remove_dir_all(&datadir);
         std::fs::create_dir_all(datadir.join("regtest")).unwrap();
         let rpc = RpcClient::new(&format!("http://127.0.0.1:{}", rpc_port), &RpcAuth { user: "u".into(), password: "p".into() });
-        Node { index, datadir, rpc_port, p2p_port, connect, rpc, child: None, extra_conf: Vec::new(), extra_args: Vec::new() }
+        Node { index, datadir, rpc_port, p2p_port, connect, rpc, base_args: node_args(None), child: None, extra_conf: Vec::new(), extra_args: Vec::new() }
     }
 
     fn write_conf(&self) {
@@ -114,7 +137,7 @@ impl Node {
         let stderr = std::fs::File::create(self.datadir.join("stderr.log")).unwrap();
         let child = Command::new(ycashd)
             .arg(format!("-datadir={}", self.datadir.display()))
-            .args(NODE_ARGS)
+            .args(&self.base_args)
             .args(&self.extra_args)
             .stdout(Stdio::null())
             .stderr(stderr)
@@ -260,6 +283,46 @@ async fn run_case(case: &Case, a: &Node, b: &Node, python: &Path, miner: &Path) 
     Outcome { height, tag, script_sig, vout0_addresses }
 }
 
+/// Serves yolo with no Yellowback state (no quote, no tag) and mines `blocks` blocks through the
+/// Python miner in one session: the vault mode's walk across the activation height.
+async fn run_plain(name: &str, a: &Node, b: &Node, python: &Path, miner: &Path, user: &str, blocks: u64) {
+    let before = a.height();
+    let config = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        status_bind: Some("127.0.0.1:0".parse().unwrap()),
+        payout: None,
+        text: None,
+        no_flags: false,
+        password: None,
+        equihash: EquihashArg::Fixed(Equihash::REGTEST),
+        limits: yolo::Limits::default(),
+    };
+    let bound = yolo::bind(a.rpc.clone(), config).await.unwrap();
+    let addr = bound.addr;
+    let status_addr = bound.status_addr.unwrap();
+    let state = bound.state();
+    let server = tokio::spawn(bound.serve());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while state.lock().template.is_none() {
+        assert!(Instant::now() < deadline, "{}: the poller never fetched a template", name);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let cmd =
+        vec![miner.to_string_lossy().to_string(), "--pool".into(), addr.to_string(), "--user".into(), user.to_string(), "--blocks".into(), blocks.to_string(), "--equihash".into(), "48,5".into()];
+    let python = python.to_path_buf();
+    let output = tokio::task::spawn_blocking(move || Command::new(&python).args(&cmd).output()).await.unwrap().unwrap_or_else(|e| panic!("cannot run the stratum miner: {}", e));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{}: stratum-miner exit {}\nstdout:\n{}\nstderr:\n{}", name, output.status, stdout, String::from_utf8_lossy(&output.stderr));
+    let status = reqwest_status(status_addr).await;
+    log(&format!("{}: /status {}", name, status));
+    assert_eq!(status["accepted"], json!(blocks), "{}: /status accepted", name);
+    assert_eq!(status["rejected"], json!(0), "{}: /status rejected", name);
+    assert_eq!(status["tag"], json!("none"), "{}: no Yellowback state yet, so no tag", name);
+    server.abort();
+    let height = before + blocks;
+    assert!(wait_height(&[a, b], height, Duration::from_secs(30)), "{}: nodes did not reach {} ({} / {})", name, height, a.height(), b.height());
+}
+
 /// `GET /status` with plain tokio (no HTTP client in the dev-dependencies).
 async fn reqwest_status(addr: std::net::SocketAddr) -> Value {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -297,11 +360,18 @@ async fn payout_text_grid_against_a_regtest_node() {
     log(&format!("scratch {}", scratch.display()));
 
     let pool_node_args: Vec<String> = std::env::var("YOLO_REGTEST_POOL_NODE_ARGS").unwrap_or_default().split_whitespace().map(String::from).collect();
+    let vault: Option<u64> = std::env::var("YOLO_REGTEST_VAULT").ok().map(|v| v.parse().expect("YOLO_REGTEST_VAULT is a height"));
+    if let Some(h) = vault {
+        assert!(h >= 104, "YOLO_REGTEST_VAULT must be at least 104 (yolo mines 102..=h+1 across it)");
+        log(&format!("vault mode: -nuparams={}:{}", VAULT_BRANCH_ID, h));
+    }
 
     // Node A mines and serves the template; node B only relays. mineraddress= must be a wallet
     // t-addr of node A (the Perl's rule), so A is started once to mint it, then restarted with it.
     let mut a = Node::new(0, &scratch, rpc_base, p2p_base, None);
     let mut b = Node::new(1, &scratch, rpc_base + 1, p2p_base + 1, Some(p2p_base));
+    a.base_args = node_args(vault);
+    b.base_args = node_args(vault);
     // A burst of generated blocks runs median-time-past ahead of the clock (Y-F5); generate the
     // chain an hour in the past so the pool's `max(curtime, now)` header time is accepted. The
     // first start runs on `-mocktime` rather than `setmocktime` + `setmocktime 0`: 6.20.0 refuses
@@ -320,12 +390,45 @@ async fn payout_text_grid_against_a_regtest_node() {
     assert_eq!(a.height(), 101, "node A kept its chain across the restart");
     b.start(&ycashd);
     assert!(wait_height(&[&a, &b], 101, Duration::from_secs(60)), "node B did not sync the initial chain");
+    if let Some(h) = vault {
+        // Across the activation through yolo: templates before, at and after the upgrade height.
+        let info = a.call("getblockchaininfo", json!([]));
+        assert_ne!(info["consensus"]["nextblock"], json!(VAULT_BRANCH_ID), "the upgrade is not active at 102");
+        let user = b.call("getnewaddress", json!([])).as_str().unwrap().to_string();
+        run_plain("across-vault-activation", &a, &b, &python, &miner, &user, h + 1 - a.height()).await;
+        for node in [&a, &b] {
+            let info = node.call("getblockchaininfo", json!([]));
+            assert_eq!(info["consensus"]["chaintip"], json!(VAULT_BRANCH_ID), "node {}: the tip is past the vault activation", node.index);
+            assert_eq!(info["upgrades"][VAULT_BRANCH_ID]["status"], json!("active"), "node {}: Vault active", node.index);
+            assert_eq!(info["upgrades"][VAULT_BRANCH_ID]["activationheight"], json!(h), "node {}: Vault height", node.index);
+        }
+        log(&format!("across-vault-activation: yolo mined 102..={} through the upgrade at {}; tip branch {}", h + 1, h, VAULT_BRANCH_ID));
+        // The YED attestor set (U-22): created after activation, then both nodes restart naming it.
+        let created = a.call("set_create", json!([{"seats": 15, "unlockthreshold": 1, "cancelthreshold": 1, "slashthreshold": 1, "open": true, "maturity": 1}]));
+        let setid = created["setid"].as_str().unwrap().to_string();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while a.call("getrawmempool", json!([])).as_array().map(|m| m.is_empty()).unwrap_or(true) {
+            assert!(Instant::now() < deadline, "set_create never reached the mempool");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        a.call("generate", json!([1]));
+        let height = a.height();
+        assert!(wait_height(&[&a, &b], height, Duration::from_secs(30)), "node B did not sync the set");
+        for node in [&mut a, &mut b] {
+            node.stop();
+            node.extra_args.push(format!("-yellowbackattestorset={}", setid));
+        }
+        a.start(&ycashd);
+        b.start(&ycashd);
+        assert!(wait_height(&[&a, &b], height, Duration::from_secs(60)), "the nodes did not come back at {}", height);
+        log(&format!("YED attestor set {} at {}; nodes restarted with it", setid, height));
+    }
     a.call("yed_setquote", json!([QUOTE_MICRO_USD, 1]));
     let template = a.call("getblocktemplate", json!([]));
     let flags = hex::decode(template["coinbaseaux"]["flags"].as_str().unwrap_or("")).unwrap();
     assert_eq!(flags.len(), 37, "the template carries a 37-byte quote tag: {:?}", template["coinbaseaux"]);
     let miner_addr = b.call("getnewaddress", json!([])).as_str().unwrap().to_string();
-    log(&format!("chain at 101; mineraddress {} miner {} flags {}", mineraddress, miner_addr, hex::encode(&flags)));
+    log(&format!("chain at {}; mineraddress {} miner {} flags {}", a.height(), mineraddress, miner_addr, hex::encode(&flags)));
     log(&format!("template header roots: lightclientroothash {} defaultroots {}", template["lightclientroothash"], template["defaultroots"]));
 
     let text = "yolo regtest";

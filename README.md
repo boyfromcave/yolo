@@ -227,6 +227,18 @@ per case: the four cells of the payout × text grid (username / `--payout`, with
 accepted and `yed_gettag` says `found: false`) and a 90-byte `--text` (scriptSig exactly
 100 bytes, tag intact). It skips when `YCASHD` is unset.
 
+**The vault network upgrade** (`upgrade/vault` nodes; workspace
+`docs/plans/yellowback-upgrade-plan.md` §15.10). yolo needs no change for it: it takes the
+coinbase from `coinbasetxn` and the header roots from the template, a v4 coinbase carries no
+consensus branch id, and nothing in yolo signs, so no branch id or upgrade list exists in this
+repository. On such a node Yellowback is a consensus module of the upgrade `Vault` (branch id
+`6d5b7a31`), not `-yellowback`: replace `-yellowback -yellowbackstartheight=1` with
+`-nuparams=6d5b7a31:<h>`, create the YED attestor set after `<h>` (`set_create`, one block) and
+restart both nodes with `-yellowbackattestorset=<setid>`; then `yed_setquote` as above.
+`YOLO_REGTEST_VAULT=<h>` (h ≥ 104) makes the regtest test do exactly that, and first mines blocks
+102 through `h + 1` through yolo with no Yellowback state (case `across-vault-activation`: every
+block accepted, the tip's branch id `6d5b7a31` on both nodes).
+
 ## Differences from the Perl
 
 The Perl scripts are the behavioural and wire-format reference (`tests/fixtures/` were recorded
