@@ -255,12 +255,11 @@ per case: the four cells of the payout × text grid (username / `--payout`, with
 accepted and `yed_gettag` says `found: false`) and a 90-byte `--text` (scriptSig exactly
 100 bytes, tag intact). It skips when `YCASHD` is unset.
 
-**Against an `upgrade/vault` node set `YOLO_REGTEST_VAULT=<h>`** (h ≥ 104): the nodes start
-with `-nuparams=6d5b7a31:<h>`, yolo first mines blocks 102 through `h + 1` with no Yellowback
-state (case `across-vault-activation`: every block accepted, the tip's branch ID `6d5b7a31` on
-both nodes), then node A creates the YED attestor set (`set_create`, one block), both nodes
-restart with `-yellowbackattestorset=<setid>`, and the six cases run as above. (Without
-`YOLO_REGTEST_VAULT` the test needs a `harden/yellowback` node; see the note at the end.)
+The nodes start with the vault upgrade active at height 110: yolo first mines blocks 102
+through 111 with no Yellowback state (case `across-vault-activation`: every block accepted, the
+tip's branch ID `6d5b7a31` on both nodes), then node A creates the YED attestor set
+(`set_create`, one block), both nodes restart with `-yellowbackattestorset=<setid>`, and the six
+cases run as above. `YOLO_REGTEST_VAULT=<h>` (h ≥ 104) moves the activation height.
 
 ## Differences from the Perl
 
@@ -301,5 +300,6 @@ disconnect on any unknown method.
 The nodes' `harden/yellowback` branch carries a version of Yellowback that needs no network
 upgrade; yolo mines for it unchanged. There, Yellowback is switched on with
 `-experimentalfeatures -yellowback -yellowbackstartheight=1` (drop `-nuparams=6d5b7a31:…` and the
-attestor set from the quick start), and `cargo test --features regtest` without
-`YOLO_REGTEST_VAULT` expects such a node. An `upgrade/vault` node refuses `-yellowbackstartheight` at startup.
+attestor set from the quick start), and `YOLO_REGTEST_LEGACY=1 cargo test --features regtest`
+runs the regtest test against such a node. An `upgrade/vault` node refuses
+`-yellowbackstartheight` at startup.
