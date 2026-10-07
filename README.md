@@ -8,18 +8,26 @@ miners the Perl served — gminer, miniZ and lolMiner at Equihash 192/7 — and 
 **Ycash Yellowback (YED)** coinbase tag: the node's tag reaches the mined block whatever the
 flags, including when the coinbase scriptSig is rebuilt.
 
-**Nodes on the vault network upgrade.** This branch (`upgrade/vault`) runs against Ycash nodes
-that carry the **vault network upgrade** (`UPGRADE_VAULT`, consensus branch ID `0x6d5b7a31`), a
-coordinated hard fork in which Yellowback is a consensus rule module: from the activation height
-every upgraded node rejects a block that breaks YED's rules, whoever mined it, so a pool has
-nothing to enable, signal or enforce. yolo needs **no code change** for it and mines across the
-activation (tested on regtest, case `across-vault-activation`): it takes the coinbase from
-`coinbasetxn` and the header roots from the template, a v4 coinbase carries no branch ID, and
-nothing in yolo signs. What remains for a pool is the optional, paid **quote tag**, served
-exactly as before. The upgrade has no activation height on mainnet or testnet and is not
-activated on any public network; it runs on regtest and the devnet only. Signalling and the
-`-experimentalfeatures -yellowback` / `-yellowbackstartheight` switches belong to the
-`harden/yellowback` line (no network upgrade); where they appear below they are labelled so.
+## Yolo and Ycash Yellowback (YED)
+
+This branch (`upgrade/vault`) mines for nodes that carry a proposed Ycash network upgrade, **the
+vault upgrade**, which adds **vaults** to Ycash: YEC locked on chain under rules every node
+enforces. **Ycash Yellowback (YED)** is a dollar token built on vaults (`1 YED = 1 US dollar`).
+Its YEC/USD price comes partly from mining pools: a pool may put a **quote tag** (its price) in
+each block's coinbase, and pools that do earn a share of the pool fee paid on each mint.
+
+- **What yolo does with it:** passes the node's quote tag through to the mined block, whatever
+  `--payout` and `--text` say. Every upgraded node enforces YED's rules on every block, so a pool
+  has nothing to switch on. yolo needs no change for the upgrade and keeps mining across its
+  activation block (tested on regtest). It does not touch the wYEC bridge.
+- **Node it needs:** any ycashd v4.5.0 or 6.20.0 for plain mining; for tagged blocks, a ycashd
+  built from the `upgrade/vault` branch of [ycash-dd](https://github.com/boyfromcave/ycash-dd) or
+  [ycash6](https://github.com/boyfromcave/ycash6) (see *Node requirements*).
+- **Status: proposed, not live.** It runs on a local test network (regtest) only. It has not been
+  adopted by the Ycash Foundation, has not been audited, and has no activation height on mainnet
+  or testnet.
+- **Try it:** *Regtest quick start* below, or the node's
+  [devnet](https://github.com/boyfromcave/ycash-dd/blob/upgrade/vault/contrib/yellowback/devnet/README.md).
 
 One binary, no modes: two flags, `--payout` and `--text`, decide the coinbase. JSON-RPC
 straight to the node (no `ycash-cli` shell-outs), one tokio task per miner plus a template
@@ -68,9 +76,9 @@ tag's payout key defaults to it (`-yellowbackpayoutaddress=` overrides).
 
 **The tag's `payoutKey` is always the node's, whatever `--payout` says.** The Yellowback tag
 inside the coinbase scriptSig comes from the node (`coinbaseaux.flags`) and carries the
-node's `-yellowbackpayoutaddress` (MINER-2); `yolo` rewrites only `vout[0]`. So without
-`--payout` a miner is paid at its username, but the quote and the enforcement-fee
-eligibility that the spec credits to the tag's `payoutKey` (FEE-2) accrue to the pool
+node's `-yellowbackpayoutaddress`; `yolo` rewrites only `vout[0]`. So without
+`--payout` a miner is paid at its username, but the quote and the pool-fee
+eligibility that Yellowback credits to the tag's `payoutKey` accrue to the pool
 operator's key, and the miner is **not** a registered Yellowback miner by mining here. `yolo`
 logs this once at startup and `/status` says `"tagPayoutKey":"node"`.
 
@@ -78,10 +86,8 @@ logs this once at startup and `/status` says `"tagPayoutKey":"node"`.
 
 Under Yellowback a miner's block carries a 36-byte tag in its coinbase scriptSig (the push
 `0x24 'Y' 'E' 'D' '!'` followed by version, flags, the YEC/USD price in micro-USD, a source
-mask and the miner's payout key) — the miner's price quote (on the `harden/yellowback` line also a
-bare signal; the vault upgrade retired signalling, so a node without a fresh quote serves no tag).
-The node offers
-the tag to pool software through `getblocktemplate` twice: inside `coinbasetxn.data` (the whole
+mask and the miner's payout key) — the miner's price quote; a node without a fresh quote serves
+no tag. The node offers the tag to pool software through `getblocktemplate` twice: inside `coinbasetxn.data` (the whole
 coinbase the node built, tag included) and as `coinbaseaux.flags` (the tag bytes alone, for
 software that assembles its own scriptSig). `--text` decides which carrier `yolo` uses:
 
@@ -93,7 +99,7 @@ software that assembles its own scriptSig). `--text` decides which carrier `yolo
 The rebuilt scriptSig is kept within the consensus limit of 100 bytes: the tag is 37 bytes
 with its push and the height push up to 5, so the text is truncated to what fits (62 bytes on
 mainnet heights) and a warning is logged when that happens. The Perl `cenote` sliced the
-height push off and appended its text, discarding the node's tag (Y-F1); the Rust one keeps it.
+height push off and appended its text, discarding the node's tag; the Rust one keeps it.
 An empty `--text ""` gives `height push ‖ flags` with nothing pushed after.
 
 A hidden `--no-flags` (meaningful only with `--text`) reproduces the Perl `cenote`'s
@@ -102,7 +108,7 @@ tag-dropping scriptSig for the negative test. It only works in a binary built wi
 reports `"noFlags":true` and every block is logged `tag: none`.
 
 On every template change the server decodes the scriptSig it is about to serve with the node's
-own byte scan and logs `tag: quote|signal|none`; the same fields are on `GET /status`
+own byte scan and logs `tag: quote|signal|none` (`signal` is a tag with a zero price); the same fields are on `GET /status`
 (`--status-port`):
 
 ```
@@ -193,13 +199,12 @@ listen address.
   to it. It receives the rewards only under `--payout <that address>`. A mined reward matures
   after 100 blocks and, on Ycash, must first be sent in full to a shielded address before it
   can be spent freely.
-- For tagged blocks: a node built from `upgrade/vault` (ycash-dd or ycash6) where YED is live —
-  no enabling flag: it is on wherever `UPGRADE_VAULT` and the network's YED attestor set are
-  configured (regtest: `-nuparams=6d5b7a31:<h> -yellowbackattestorset=<setid>`) — plus the
-  Yellowback payout address (`-yellowbackpayoutaddress=`) and a running quote agent
+- For tagged blocks: a node built from `upgrade/vault` (ycash-dd or ycash6) where YED is live.
+  There is no switch: YED is on once the vault upgrade has activated and the network's YED
+  attestor set is configured (regtest: `-nuparams=6d5b7a31:<h> -yellowbackattestorset=<setid>`).
+  Add the Yellowback payout address (`-yellowbackpayoutaddress=`) and a running quote agent
   (`yed_setquote`). See `doc/yellowback-mining.md` and `contrib/yellowback/pool/README.md` in the
-  node repository. On a `harden/yellowback` node the switch is `-experimentalfeatures
-  -yellowback` instead. Where YED is not live (a stock node, or before the activation) the
+  node repository. Where YED is not live (a stock node, or before the activation) the
   template's `coinbaseaux.flags` is empty and `yolo` behaves exactly as the Perl did (`--text`
   then gives `height push ‖ push(text)`).
 - ycashd v4.5.0 or 6.20.0 (either node line). The header root is read from `lightclientroothash` (v4.5.0, and
@@ -222,7 +227,7 @@ ycashd -regtest -datadir=$D/a -server -rpcuser=u -rpcpassword=p -rpcport=26301 -
        -nuparams=5ba81b19:1 -nuparams=76b809bb:1 -nuparams=374d694f:1 -nuparams=8e471bd6:1 \
        -nuparams=66314da3:1 -nuparams=19bd2d2f:1 -nuparams=6d5b7a31:110 \
        -yellowbacksigmaref=0 -mineraddress=$(ycash-cli … getnewaddress)
-#   a generated burst runs ahead of the clock (Y-F5): mint the address and generate 101 on the
+#   a generated burst runs ahead of the clock: mint the address and generate 101 on the
 #   first start with -mocktime=$(( $(date +%s) - 3600 )), then restart without it. (ycashd 6.20.0
 #   refuses setmocktime unless started with -mocktime, and there setmocktime 0 means the epoch.)
 ycash-cli -regtest … generate 101                            # on the -mocktime start
@@ -240,11 +245,6 @@ ycash-cli -regtest … yed_gettag <height>
 curl http://127.0.0.1:26402/status
 ```
 
-On a `harden/yellowback` node (no network upgrade) drop `-nuparams=6d5b7a31:110` and the attestor
-set, and start both nodes with `-experimentalfeatures -yellowback -yellowbackstartheight=1`
-instead; on an `upgrade/vault` node those two Yellowback switches are retired
-(`-yellowbackstartheight` is an init error).
-
 `cargo test --features regtest` does all of this unattended when `YCASHD` points at the node
 binary, ycashd v4.5.0 or 6.20.0 (`STRATUM_MINER`, `PYTHON`, `YOLO_REGTEST_SCRATCH`,
 `YOLO_REGTEST_RPC_BASE` and `YOLO_REGTEST_P2P_BASE` override the defaults, which assume the
@@ -255,20 +255,17 @@ per case: the four cells of the payout × text grid (username / `--payout`, with
 accepted and `yed_gettag` says `found: false`) and a 90-byte `--text` (scriptSig exactly
 100 bytes, tag intact). It skips when `YCASHD` is unset.
 
-**Against an `upgrade/vault` node set `YOLO_REGTEST_VAULT=<h>`** (h ≥ 104; workspace
-`docs/plans/yellowback-upgrade-plan.md` §15.10): the nodes start with `-nuparams=6d5b7a31:<h>`
-and without the retired switches, yolo first mines blocks 102 through `h + 1` with no Yellowback
+**Against an `upgrade/vault` node set `YOLO_REGTEST_VAULT=<h>`** (h ≥ 104): the nodes start
+with `-nuparams=6d5b7a31:<h>`, yolo first mines blocks 102 through `h + 1` with no Yellowback
 state (case `across-vault-activation`: every block accepted, the tip's branch ID `6d5b7a31` on
 both nodes), then node A creates the YED attestor set (`set_create`, one block), both nodes
-restart with `-yellowbackattestorset=<setid>`, and the six cases run as above. Without
-`YOLO_REGTEST_VAULT` the test starts the nodes with `-experimentalfeatures -yellowback
--yellowbackstartheight=1` and needs a `harden/yellowback` node.
+restart with `-yellowbackattestorset=<setid>`, and the six cases run as above. (Without
+`YOLO_REGTEST_VAULT` the test needs a `harden/yellowback` node; see the note at the end.)
 
 ## Differences from the Perl
 
 The Perl scripts are the behavioural and wire-format reference (`tests/fixtures/` were recorded
-from them and `tests/wire.rs` replays them byte for byte). What changed on purpose, numbered as
-in the workspace plan's findings:
+from them and `tests/wire.rs` replays them byte for byte). What changed on purpose:
 
 - **Three scripts became one: why.** The three Perl scripts are one program copy-pasted three
   times — `stratumpool` (2020-10-17); `stratumsolo` two days later, which is pool minus the
@@ -280,17 +277,17 @@ in the workspace plan's findings:
   `mining.extranonce.subscribe` is acknowledged without re-issuing the job (`stratumpool`'s
   behaviour; `stratumsolo` re-sent the same job). The wire shapes are unchanged and the
   recorded Perl exchanges still replay.
-- **Y-F1** `--text` no longer drops the Yellowback tag: `coinbaseaux.flags` is appended after
+- `--text` keeps the Yellowback tag: `coinbaseaux.flags` is appended after
   the height push, and the scriptSig is parsed for its real length (the Perl assumed 5 bytes).
-- **Y-F2** work is re-issued when `coinbaseaux.flags` changes, not only on height, target or
+- Work is re-issued when `coinbaseaux.flags` changes, not only on height, target or
   sapling-root changes, so a new quote reaches miners within one poll instead of one block.
-- **Y-F4** `mining.submit` is answered `true` only when `submitblock` returned `null`; every
+- `mining.submit` is answered `true` only when `submitblock` returned `null`; every
   rejection string is logged, counted and reported to the miner as `false` (the Perl answered
   `true` to `Block decode failed`, `time-too-old`, …).
-- **Y-F5** the job time is `max(template.curtime, now)`, not the wall clock alone.
-- **Y-F6** `nonce1` is exactly 14 bytes / 28 hex chars, as the Perl actually sent (its comment
+- The job time is `max(template.curtime, now)`, not the wall clock alone.
+- `nonce1` is exactly 14 bytes / 28 hex chars, as the Perl actually sent (its comment
   said 16).
-- **Y-F8** the port is a flag (`--port`, default 3333), and the payout output is rewritten
+- The port is a flag (`--port`, default 3333), and the payout output is rewritten
   through a real v4 transaction parser instead of a regex over the hex.
 - JSON-RPC over HTTP directly (`--rpc`, `--rpc-cookie`, `--conf`), no `ycash-cli` on `PATH`.
 - `--equihash auto`, `GET /status`, the tag log line.
@@ -298,3 +295,11 @@ in the workspace plan's findings:
 Kept: the stratum message shapes and field order, the byte-reversed header hex, the 60 s
 keepalive re-notify, `nTime` taken from the miner's submit, the 2 MB block size cap, the
 disconnect on any unknown method.
+
+## Note: nodes on the `harden/yellowback` branch
+
+The nodes' `harden/yellowback` branch carries a version of Yellowback that needs no network
+upgrade; yolo mines for it unchanged. There, Yellowback is switched on with
+`-experimentalfeatures -yellowback -yellowbackstartheight=1` (drop `-nuparams=6d5b7a31:…` and the
+attestor set from the quick start), and `cargo test --features regtest` without
+`YOLO_REGTEST_VAULT` expects such a node. An `upgrade/vault` node refuses `-yellowbackstartheight` at startup.
