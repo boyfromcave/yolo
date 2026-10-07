@@ -142,7 +142,7 @@ mod tests {
         let mut t2 = t.clone();
         t2.coinbaseaux.flags = String::new();
         assert_ne!(t2.change_key(), k);
-        // a node without -yellowback omits coinbaseaux entirely
+        // a node where Yellowback is not live (no vault upgrade or no YED attestor set) omits coinbaseaux in coinbasetxn mode
         let mut v: serde_json::Value = serde_json::from_str(include_str!("../tests/vectors/regtest-template-4-noflags.json")).unwrap();
         v.as_object_mut().unwrap().remove("coinbaseaux");
         v.as_object_mut().unwrap().remove("lightclientroothash");

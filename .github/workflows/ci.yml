@@ -199,5 +199,6 @@ jobs:
           export YOLO_REGTEST_SCRATCH="$RUNNER_TEMP/yolo-regtest" YOLO_REGTEST_POOL_NODE_ARGS="$POOL_NODE_ARGS"
           # upgrade/vault nodes: Yellowback is a module of the Vault upgrade (README, "The vault
           # network upgrade"); the test mines 102..=h+1 across the activation first.
-          if [ "$REF_NAME" = upgrade/vault ]; then export YOLO_REGTEST_VAULT=110; fi
+          # Other node lines have no vault upgrade: YOLO_REGTEST_LEGACY keeps the -yellowback flags.
+          if [ "$REF_NAME" = upgrade/vault ]; then export YOLO_REGTEST_VAULT=110; else export YOLO_REGTEST_LEGACY=1; fi
           cargo test --locked --features regtest --test regtest -- --nocapture
