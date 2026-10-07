@@ -28,14 +28,17 @@
 //! Works against ycashd v4.5.0 (ycash-dd) and 6.20.0 (the ycash6 build: plain `ref/ycash6`
 //! leaves Equihash (48,5) on regtest under these upgrades, baseline fix 3).
 //!
-//! **The vault upgrade** (`upgrade/vault` nodes, docs/plans/yellowback-upgrade-plan.md §15.10):
-//! set `YOLO_REGTEST_VAULT=<h>` (h ≥ 104). Yellowback is then a consensus module of the network
-//! upgrade `Vault` (branch id `6d5b7a31`) rather than `-yellowback`: the nodes start with
+//! **The vault upgrade** (`upgrade/vault` nodes, docs/plans/yellowback-upgrade-plan.md §15.10) is
+//! the default on this branch: the upgrade activates at `YOLO_REGTEST_VAULT=<h>` (h ≥ 104,
+//! default 110). Yellowback is a consensus module of the network upgrade `Vault` (branch id
+//! `6d5b7a31`) rather than `-yellowback`: the nodes start with
 //! `-nuparams=6d5b7a31:<h>` (and without `-yellowback`/`-yellowbackstartheight`, which that node
 //! refuses), yolo mines the blocks from 102 through `h + 1` before any Yellowback state exists
 //! (the case `across-vault-activation`: every block accepted, the chain tip's branch id becomes
 //! `6d5b7a31`), then node A creates the YED attestor set (`set_create`) and both nodes restart
 //! with `-yellowbackattestorset=<setid>`, after which the six cases run as before.
+//! `YOLO_REGTEST_LEGACY=1` runs against a node without the vault upgrade (`harden/yellowback`)
+//! instead: `NODE_ARGS` as they are, with `-experimentalfeatures -yellowback`.
 #![cfg(feature = "regtest")]
 
 use std::path::{Path, PathBuf};
@@ -66,7 +69,10 @@ const NODE_ARGS: &[&str] = &[
 /// The vault upgrade's consensus branch id (upgrade plan U-9).
 const VAULT_BRANCH_ID: &str = "6d5b7a31";
 
-/// `NODE_ARGS` for this run: unchanged without `YOLO_REGTEST_VAULT`; with it, the vault upgrade at
+/// The default vault activation height (the CI's `YOLO_REGTEST_VAULT` on upgrade/vault).
+const DEFAULT_VAULT_HEIGHT: u64 = 110;
+
+/// `NODE_ARGS` for this run: unchanged under `YOLO_REGTEST_LEGACY`; otherwise the vault upgrade at
 /// `h` and none of the retired Yellowback switches (finding (31): an init error on that node).
 fn node_args(vault: Option<u64>) -> Vec<String> {
     let Some(h) = vault else { return NODE_ARGS.iter().map(|a| a.to_string()).collect() };
@@ -360,7 +366,8 @@ async fn payout_text_grid_against_a_regtest_node() {
     log(&format!("scratch {}", scratch.display()));
 
     let pool_node_args: Vec<String> = std::env::var("YOLO_REGTEST_POOL_NODE_ARGS").unwrap_or_default().split_whitespace().map(String::from).collect();
-    let vault: Option<u64> = std::env::var("YOLO_REGTEST_VAULT").ok().map(|v| v.parse().expect("YOLO_REGTEST_VAULT is a height"));
+    let legacy = std::env::var("YOLO_REGTEST_LEGACY").is_ok_and(|v| !v.is_empty() && v != "0");
+    let vault: Option<u64> = if legacy { None } else { Some(std::env::var("YOLO_REGTEST_VAULT").ok().map_or(DEFAULT_VAULT_HEIGHT, |v| v.parse().expect("YOLO_REGTEST_VAULT is a height"))) };
     if let Some(h) = vault {
         assert!(h >= 104, "YOLO_REGTEST_VAULT must be at least 104 (yolo mines 102..=h+1 across it)");
         log(&format!("vault mode: -nuparams={}:{}", VAULT_BRANCH_ID, h));
