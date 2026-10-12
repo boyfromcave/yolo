@@ -411,7 +411,9 @@ async fn payout_text_grid_against_a_regtest_node() {
         }
         log(&format!("across-vault-activation: yolo mined 102..={} through the upgrade at {}; tip branch {}", h + 1, h, VAULT_BRANCH_ID));
         // The YED attestor set (U-22): created after activation, then both nodes restart naming it.
-        let created = a.call("set_create", json!([{"seats": 15, "unlockthreshold": 1, "cancelthreshold": 1, "slashthreshold": 1, "open": true, "maturity": 1}]));
+        // maturity 2: the post-quantum nodes refuse less than MIN_SET_MATURITY (regtest 2, mainnet 16,128;
+        // D-Q-31, set_create's "maturity must be at least"); the pre-quantum upgrade/vault nodes take it too.
+        let created = a.call("set_create", json!([{"seats": 15, "unlockthreshold": 1, "cancelthreshold": 1, "slashthreshold": 1, "open": true, "maturity": 2}]));
         let setid = created["setid"].as_str().unwrap().to_string();
         let deadline = Instant::now() + Duration::from_secs(30);
         while a.call("getrawmempool", json!([])).as_array().map(|m| m.is_empty()).unwrap_or(true) {
