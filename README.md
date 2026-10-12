@@ -20,9 +20,14 @@ each block's coinbase, and pools that do earn a share of the pool fee paid on ea
   `--payout` and `--text` say. Every upgraded node enforces YED's rules on every block, so a pool
   has nothing to switch on. yolo needs no change for the upgrade and keeps mining across its
   activation block (tested on regtest). It does not touch the wYEC bridge.
+- **Post-quantum vaults:** the post-quantum layer (the nodes' `upgrade/quantum-vaults` branches,
+  which join `upgrade/vault` at release) rides the same activation and leaves the coinbase, the
+  quote tag and the mining RPCs as they are, so yolo needs no change for it either. Blocks may
+  then carry large post-quantum transactions; yolo passes the node's template through.
 - **Node it needs:** any ycashd v4.5.0 or 6.20.0 for plain mining; for tagged blocks, a ycashd
   built from the `upgrade/vault` branch of [ycash-dd](https://github.com/boyfromcave/ycash-dd) or
   [ycash6](https://github.com/boyfromcave/ycash6) (see *Node requirements*).
+- **More:** the parent project, [Ycash vaults and Yellowback](https://github.com/boyfromcave/yellowback).
 - **Status: proposed, not live.** It runs on a local test network (regtest) only. It has not been
   adopted by the Ycash Foundation, has not been audited, and has no activation height on mainnet
   or testnet.
@@ -233,8 +238,9 @@ ycashd -regtest -datadir=$D/a -server -rpcuser=u -rpcpassword=p -rpcport=26301 -
 ycash-cli -regtest … generate 101                            # on the -mocktime start
 # node B: the same with -rpcport=26302 -port=27302 -connect=127.0.0.1:27301 (getblocktemplate needs a peer)
 # mine past 110 (through yolo, below, or generate); then create the YED attestor set on node A:
-ycash-cli -regtest … set_create '{"seats":15,"unlockthreshold":1,"cancelthreshold":1,"slashthreshold":1,"open":true,"maturity":1}'
+ycash-cli -regtest … set_create '{"seats":15,"unlockthreshold":1,"cancelthreshold":1,"slashthreshold":1,"open":true,"maturity":2}'
 ycash-cli -regtest … generate 1                              # the result's setid is now on chain
+#   (maturity 2: the post-quantum line's regtest floor; upgrade/vault nodes accept 1 or more)
 # restart both nodes with -yellowbackattestorset=<setid> added
 ycash-cli -regtest … yed_setquote 50000 1                    # $0.05, source 1: the template now carries a quote tag
 
