@@ -1,21 +1,6 @@
 # OSV-Scanner exceptions (SECURITY-CI.md). Each entry: the advisory, why it is accepted for now, and an
 # ignoreUntil at most 90 days out, after which the scan fails again until it is fixed or re-justified.
 
-# contrib/semgrep/requirements.txt is the hash-locked Semgrep CLI that the semgrep workflow installs on a
-# throwaway CI runner (it never ships in the pool binary). The file is shared verbatim by every
-# Yellowback repo and is regenerated together with config.json "semgrep_version" across all of them
-# (contrib/semgrep/README.md, "Changing the policy"), so the bump is made there, not here alone.
-[[IgnoredVulns]]
-id = "GHSA-6q48-6c7w-9gw2"
-ignoreUntil = 2026-11-22T00:00:00Z
-reason = "certifi (alias PYSEC-2026-4320) in the CI-only Semgrep toolchain (contrib/semgrep/requirements.txt, shared verbatim across Yellowback repos); bumped with the next semgrep_version move"
-
-[[IgnoredVulns]]
-id = "GHSA-84m7-p3x7-pcfv"
-ignoreUntil = 2026-11-22T00:00:00Z
-reason = "mcp in the CI-only Semgrep toolchain; semgrep's MCP server is never started by scan.py; bumped with the next semgrep_version move"
-
-[[IgnoredVulns]]
-id = "GHSA-xcq7-p3pf-p88h"
-ignoreUntil = 2026-11-22T00:00:00Z
-reason = "opentelemetry-api in the CI-only Semgrep toolchain; scan.py runs with --metrics=off and exports no telemetry; bumped with the next semgrep_version move"
+# contrib/semgrep/requirements.txt (the shared, hash-locked Semgrep CLI, copied byte-for-byte from
+# ycash-dd) has no open advisory: certifi, mcp and opentelemetry-* are overridden there to fixed
+# versions (contrib/semgrep/security-overrides.txt), so it needs no entry here.
