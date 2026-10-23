@@ -1,0 +1,88 @@
+{
+  "_comment": "Semgrep scan policy for yolo, the Rust stratum pool (contrib/semgrep/README.md). The workflow, scan.py, triage.py and requirements.txt are the same in every Yellowback repo; this file, accepted.json and rules/ are yolo's own.",
+  "semgrep_version": "1.179.0",
+  "rule_sources": [
+    {
+      "name": "semgrep-rules",
+      "repo": "https://github.com/semgrep/semgrep-rules",
+      "commit": "16b9e6d45f10649f6a531ec4838ed9924372c3bc",
+      "license": "Semgrep Rules License v1.0: free, for our own use; fetched at scan time, never copied in, never quoted in PRs",
+      "id_prefix": "",
+      "paths": [
+        "rust",
+        "bash",
+        "dockerfile",
+        "generic/secrets",
+        "yaml/github-actions"
+      ]
+    },
+    {
+      "name": "trailofbits",
+      "repo": "https://github.com/trailofbits/semgrep-rules",
+      "commit": "31390b3a99c04c81522d1b37c8d1900aa2dd4094",
+      "license": "AGPL-3.0",
+      "id_prefix": "trailofbits.",
+      "paths": [
+        "rs",
+        "generic",
+        "yaml/github-actions"
+      ]
+    }
+  ],
+  "local_rules": "contrib/semgrep/rules",
+  "categories": [
+    "security"
+  ],
+  "exclude_rules": {},
+  "audit_rules": {},
+  "bucket_overrides": [],
+  "non_production_paths": [
+    "tests/**",
+    "legacy/**",
+    "contrib/**",
+    "*.md"
+  ],
+  "buckets": {
+    "critical": {
+      "sla_days": 7,
+      "color": "b60205",
+      "label": "semgrep:critical"
+    },
+    "high": {
+      "sla_days": 30,
+      "color": "d93f0b",
+      "label": "semgrep:high"
+    },
+    "medium": {
+      "sla_days": 90,
+      "color": "fbca04",
+      "label": "semgrep:medium"
+    },
+    "low": {
+      "sla_days": 180,
+      "color": "0e8a16",
+      "label": "semgrep:low"
+    }
+  },
+  "autofix_rules": [],
+  "autofix_never_paths": [
+    "src/codec.rs",
+    "src/equihash.rs",
+    "src/template.rs",
+    "src/tx.rs",
+    "src/work.rs",
+    "src/tag.rs",
+    "tests/vectors/**",
+    "legacy/**"
+  ],
+  "fail_on": [
+    "critical"
+  ],
+  "base_branch": "upgrade/vault",
+  "branch_prefix": "semgrep/",
+  "pr_labels": [
+    "security",
+    "semgrep"
+  ],
+  "overdue_label": "sla:overdue"
+}

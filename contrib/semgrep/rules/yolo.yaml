@@ -1,0 +1,93 @@
+# yolo-specific Semgrep rules, scanned beside the pinned rule packs (contrib/semgrep/README.md).
+# metadata.bucket pins a rule's bucket; without it the bucket follows severity/impact/confidence.
+# Tests: contrib/semgrep/rules/yolo.rs (`semgrep --test contrib/semgrep/rules`; `ruleid:` / `ok:` marks).
+rules:
+  - id: yolo.rpc.yed-call
+    languages: [generic]
+    paths:
+      include: ["/src/**"]
+    pattern-regex: '"yed_[A-Za-z0-9_]*"'
+    message: >-
+      A `yed_*` RPC name in the pool's code (src/; the regtest harness in tests/ drives its own nodes and
+      may). A pool reaches the node only through the stock mining RPCs
+      (getblocktemplate, submitblock, validateaddress, getblockchaininfo) and never needs a node change
+      (workspace CLAUDE.md rule 2; docs/plans/role-pool-regtest-plan.md §6).
+    severity: ERROR
+    metadata:
+      category: security
+      bucket: critical
+      cwe: ["CWE-284: Improper Access Control"]
+      references: ["docs/plans/role-pool-regtest-plan.md §6"]
+
+  - id: yolo.rpc.non-stock-method
+    languages: [rust]
+    paths:
+      include: ["/src/**"]
+    patterns:
+      - pattern: $CLIENT.call($METHOD, ...)
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: ^"(?!(getblocktemplate|submitblock|validateaddress|getblockchaininfo)").*"$
+    message: >-
+      The pool calls an RPC outside the stock mining set (getblocktemplate, submitblock, validateaddress,
+      getblockchaininfo). Adding one widens the node interface the pool depends on; it needs the plan
+      (docs/plans/role-pool-regtest-plan.md §6) changed first.
+    severity: WARNING
+    metadata:
+      category: security
+      bucket: high
+      impact: MEDIUM
+      likelihood: LOW
+      confidence: HIGH
+      cwe: ["CWE-284: Improper Access Control"]
+
+  - id: yolo.net.unbounded-read
+    languages: [rust]
+    paths:
+      include: ["/src/**"]
+    pattern-either:
+      - pattern: $R.read_line(...)
+      - pattern: $R.read_until(...)
+      - pattern: $R.read_to_end(...)
+      - patterns:
+          - pattern: $R.read_to_string(...)
+          - pattern-not: std::fs::read_to_string(...)
+    message: >-
+      An unbounded read. A miner (or anything on the stratum or status port) controls how many bytes
+      arrive before a newline or EOF; read through stratum::read_line_capped (MAX_LINE) or a fixed-size
+      buffer with a timeout, so one connection cannot grow memory without limit.
+    severity: ERROR
+    metadata:
+      category: security
+      bucket: high
+      impact: HIGH
+      likelihood: MEDIUM
+      confidence: MEDIUM
+      cwe: ["CWE-400: Uncontrolled Resource Consumption"]
+
+  - id: yolo.stratum.panic-on-miner-input
+    languages: [rust]
+    paths:
+      include: ["/src/stratum.rs", "/src/status.rs", "/src/equihash.rs", "/src/work.rs", "/src/tag.rs"]
+    patterns:
+      - pattern-either:
+          - pattern: $X.unwrap()
+          - pattern: $X.expect(...)
+          - pattern: panic!(...)
+          - pattern: unreachable!(...)
+          - pattern: todo!(...)
+          - pattern: unimplemented!(...)
+      - pattern-not-inside: |
+          mod tests { ... }
+    message: >-
+      A panic path in code that handles what a miner sends (stratum messages, shares, solutions, the
+      status port). A malformed message must become an error reply or a disconnect, never a panic of
+      the connection task or the process: use `?`, `ok_or`, `unwrap_or` or a match.
+    severity: ERROR
+    metadata:
+      category: security
+      bucket: high
+      impact: HIGH
+      likelihood: MEDIUM
+      confidence: MEDIUM
+      cwe: ["CWE-248: Uncaught Exception"]

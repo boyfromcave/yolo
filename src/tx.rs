@@ -41,13 +41,13 @@ fn span(pos: usize, len: u64) -> Result<usize, String> {
 }
 
 fn u32_at(data: &[u8], pos: usize) -> Result<u32, String> {
-    let b = data.get(pos..pos + 4).ok_or("truncated u32")?;
-    Ok(u32::from_le_bytes(b.try_into().unwrap()))
+    let b: [u8; 4] = data.get(pos..pos + 4).and_then(|b| b.try_into().ok()).ok_or("truncated u32")?;
+    Ok(u32::from_le_bytes(b))
 }
 
 fn u64_at(data: &[u8], pos: usize) -> Result<u64, String> {
-    let b = data.get(pos..pos + 8).ok_or("truncated u64")?;
-    Ok(u64::from_le_bytes(b.try_into().unwrap()))
+    let b: [u8; 8] = data.get(pos..pos + 8).and_then(|b| b.try_into().ok()).ok_or("truncated u64")?;
+    Ok(u64::from_le_bytes(b))
 }
 
 impl Coinbase {
