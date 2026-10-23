@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — security CI
+
+- Security CI (SECURITY-CI.md): Semgrep with yolo's own rules (no `yed_*` RPC, stock mining RPCs
+  only, no unbounded socket reads, no panics on miner input), CodeQL (Rust, Actions), and
+  `secops.yml` (zizmor, gitleaks, OSV-Scanner); Dependabot security updates only, grouped.
+- The byte-array reads in `codec.rs`, `tx.rs` and `tag.rs` convert without `unwrap` (they were
+  length-checked already; behaviour unchanged).
+- rustls-webpki 0.103.16 (RUSTSEC-2026-0382), webpki-roots 1.0.10 (RUSTSEC-2026-0381).
+
 ## Unreleased — hardening (security audit 2026-10-01)
 
 - Stratum reader bounded at 8 KiB per line; a longer line closes the socket (H-1).

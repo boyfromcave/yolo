@@ -1,0 +1,160 @@
+name: semgrep
+
+# Semgrep static analysis, with one rolling PR per severity bucket (contrib/semgrep/README.md).
+# The same file in every Yellowback repo; what each scans is its contrib/semgrep/config.json.
+#
+#   pull_request          diff-aware scan against the PR's base: only findings the PR adds are reported,
+#                         and the job fails when one lands in a config.json "fail_on" bucket (critical).
+#   push (any branch but  full scan on the default branch; diff-aware against the default branch elsewhere.
+#   semgrep/**)           Report only. A push to the default branch also runs `sync`.
+#   nightly 02:17 UTC     full scan of the default branch, then `sync`.
+#   workflow_dispatch     full scan of the chosen ref; `sync` when it is the default branch and sync=true.
+#
+#   sync                  at most four PRs, one per bucket (critical 7 / high 30 / medium 90 / low 180 days),
+#                         on the bot-owned branches semgrep/<bucket>: that bucket's autofixes and its ledger
+#                         (first seen, due date). Updated in place, closed when the bucket is empty.
+#
+# Semgrep Community Edition only: the LGPL-2.1 `semgrep` package from PyPI, hash-locked
+# (contrib/semgrep/requirements.txt), with the rule libraries of config.json "rule_sources" (semgrep-rules,
+# Trail of Bits, 0xdea) fetched at pinned commits: no registry, no login, no Pro engine, no metrics. Results go to the run's step summary and artifacts, and to
+# GitHub code scanning (SARIF; free for public repositories). PRs opened with the default GITHUB_TOKEN do not start
+# other workflows; set the repository secret SEMGREP_PR_TOKEN (contents + pull requests: write) to have CI
+# run on them. GITHUB_TOKEN also needs "Allow GitHub Actions to create and approve pull requests".
+on:
+  push:
+    branches-ignore: ['semgrep/**']
+  pull_request:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      sync:
+        description: 'After the scan, open/update/close the per-severity PRs (default branch only)'
+        type: boolean
+        default: true
+      dry_run:
+        description: 'Print the PR actions instead of performing them'
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: semgrep-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      full: ${{ steps.mode.outputs.full }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0  # a diff-aware scan needs the merge base
+          persist-credentials: false
+      - name: Mode
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          baseline='' enforce=''
+          if [ "$EVENT" = pull_request ]; then
+            baseline=$PR_BASE enforce=--enforce
+          elif [ "$EVENT" = push ] && [ "$REF_NAME" != "$DEFAULT_BRANCH" ]; then
+            baseline=$(git merge-base HEAD "origin/$DEFAULT_BRANCH")
+          fi
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+          echo "enforce=$enforce" >> "$GITHUB_OUTPUT"
+          if [ -z "$baseline" ]; then echo "full=true" >> "$GITHUB_OUTPUT"; else echo "full=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Scan
+        env:
+          BASELINE: ${{ steps.mode.outputs.baseline }}
+          ENFORCE: ${{ steps.mode.outputs.enforce }}
+          SEMGREP_RULES_CACHE: ${{ runner.temp }}/semgrep-rules
+        run: |
+          args=(--install --out semgrep-out)
+          if [ -n "$BASELINE" ]; then args+=(--baseline "$BASELINE"); fi
+          if [ -n "$ENFORCE" ]; then args+=(--enforce); fi
+          rc=0
+          python3 contrib/semgrep/scan.py "${args[@]}" || rc=$?
+          cat semgrep-out/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+          exit "$rc"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !cancelled() }}
+        with:
+          name: semgrep
+          # The triaged files only: semgrep's raw results.json quotes the rules' own text, which stays
+          # on the runner (contrib/semgrep/triage.py, top comment).
+          path: |
+            semgrep-out/findings.json
+            semgrep-out/summary.md
+            semgrep-out/results.sarif
+            semgrep-out/audit.md
+            semgrep-out/audit.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+  code-scanning:
+    needs: scan
+    if: ${{ !cancelled() && (needs.scan.result == 'success' || needs.scan.result == 'failure') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: semgrep
+          path: semgrep-out
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: semgrep-out/results.sarif
+          category: semgrep
+
+  sync:
+    needs: scan
+    # Full scans of the default branch only (a scheduled run is always the default branch, and its
+    # payload carries no repository.default_branch).
+    if: >-
+      ${{ !cancelled() && needs.scan.result == 'success' && needs.scan.outputs.full == 'true'
+      && (github.event_name == 'schedule'
+          || (github.ref_name == github.event.repository.default_branch
+              && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.sync)))) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write  # labels
+    concurrency:
+      group: semgrep-sync
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0  # semgrep/<bucket> branches are compared against the scanned commit
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: semgrep
+          path: semgrep-out
+      - name: Sync per-severity PRs
+        env:
+          GH_TOKEN: ${{ secrets.SEMGREP_PR_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: |
+          gh auth setup-git
+          args=(--findings semgrep-out/findings.json --sha "$SHA" --repo "$REPO" --run-url "$RUN_URL")
+          if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+          python3 contrib/semgrep/triage.py sync "${args[@]}"

@@ -1,0 +1,127 @@
+name: secops
+
+# Security legs other than Semgrep and CodeQL (SECURITY-CI.md). Each job reports to code scanning
+# (SARIF, its own category) and the run summary; none opens a PR or an issue.
+#
+#   zizmor        every workflow under .github/workflows (default persona); fails on any finding.
+#   gitleaks      PR: the PR's own commits, fails on a new leak. Nightly / dispatch: full history.
+#   osv-scanner   every lockfile (Cargo.lock, the hash-locked pip requirements); fails on a known vuln
+#                 not listed in osv-scanner.toml.
+#   Rust          cargo-deny + cargo-audit run in ci.yml's `audit` job (kept there, not duplicated).
+#
+# Tools are pinned to exact releases, checked against the sha256 recorded here (binaries) or
+# hash-locked (pip --require-hashes). Actions are pinned by commit; the comment carries the tag.
+on:
+  push:
+    branches: [upgrade/vault]
+  pull_request:
+  schedule:
+    - cron: '43 3 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: secops-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  OSV_SCANNER_VERSION: 2.6.0
+  OSV_SCANNER_SHA256: ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108
+
+jobs:
+  zizmor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: install zizmor (hash-locked)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zizmor"
+          "$RUNNER_TEMP/zizmor/bin/pip" install --quiet --disable-pip-version-check --require-hashes --no-deps \
+            -r .github/secops/zizmor-requirements.txt
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rc=0
+          "$RUNNER_TEMP/zizmor/bin/zizmor" --format sarif .github/workflows > zizmor.sarif || rc=$?
+          "$RUNNER_TEMP/zizmor/bin/zizmor" --format plain .github/workflows >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          exit "$rc"
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: ${{ !cancelled() && hashFiles('zizmor.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
+
+  gitleaks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: install gitleaks
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+      - name: gitleaks
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          opts=()
+          if [ "$EVENT" = pull_request ]; then opts=(--log-opts="$PR_BASE..$PR_HEAD"); fi
+          rc=0
+          "$RUNNER_TEMP/gitleaks" git --no-banner --redact "${opts[@]}" \
+            --report-format sarif --report-path gitleaks.sarif . || rc=$?
+          if [ "$rc" = 0 ]; then echo "gitleaks: no leaks found" >> "$GITHUB_STEP_SUMMARY";
+          else echo "gitleaks: leaks found (redacted; see code scanning, category gitleaks)" >> "$GITHUB_STEP_SUMMARY"; fi
+          exit "$rc"
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: ${{ !cancelled() && hashFiles('gitleaks.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+  osv-scanner:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: install osv-scanner
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  $RUNNER_TEMP/osv-scanner" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/osv-scanner"
+      - name: osv-scanner
+        run: |
+          rc=0
+          "$RUNNER_TEMP/osv-scanner" scan source --config osv-scanner.toml -r --format sarif --output-file osv.sarif . || rc=$?
+          { echo '```'; "$RUNNER_TEMP/osv-scanner" scan source --config osv-scanner.toml -r . 2>&1 || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: ${{ !cancelled() && hashFiles('osv.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        with:
+          sarif_file: osv.sarif
+          category: osv-scanner

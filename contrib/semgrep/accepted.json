@@ -1,0 +1,33 @@
+{
+  "_comment": "Accepted Semgrep findings (contrib/semgrep/README.md, 'Accepting a finding'). findings: fingerprint -> {rule, path, reason, by, date}. rule_paths: [{rule (glob), paths (globs), reason, by, date}]. Every entry needs a reason a reviewer can check.",
+  "findings": {
+    "e8d06a1f65f661c2": {
+      "rule": "yolo.net.unbounded-read",
+      "path": "src/rpc.rs",
+      "reason": "The JSON-RPC response body from the pool's own ycashd (the configured --rpc URL, not a miner). ureq 3's Body::read_to_string is bounded: it applies .limit(MAX_BODY_SIZE), 10 MB (ureq-3.4.2 src/body/mod.rs, read_to_string), and errors beyond it.",
+      "by": "secops CI setup",
+      "date": "2026-10-23"
+    }
+  },
+  "rule_paths": [
+    {
+      "rule": "generic.secrets.*",
+      "paths": [
+        "tests/vectors/**",
+        "tests/fixtures/**"
+      ],
+      "reason": "Regtest getblocktemplate vectors: the flagged values are block/tree hashes (previousblockhash, lightclientroothash, ...), public chain data, not secrets (checked 2026-10-23). A secret anywhere else is still reported.",
+      "by": "secops CI setup",
+      "date": "2026-10-23"
+    },
+    {
+      "rule": "rust.lang.security.temp-dir",
+      "paths": [
+        "tests/**"
+      ],
+      "reason": "The regtest harness's scratch directory for its own throwaway nodes (YOLO_REGTEST_SCRATCH overrides it; CI sets it to RUNNER_TEMP). Test-only, never in the pool binary.",
+      "by": "secops CI setup",
+      "date": "2026-10-23"
+    }
+  ]
+}

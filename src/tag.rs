@@ -70,7 +70,7 @@ pub fn height_push(height: u32) -> Vec<u8> {
         out.push((n & 0xff) as u8);
         n >>= 8;
     }
-    if out.last().unwrap() & 0x80 != 0 {
+    if out.last().is_some_and(|b| b & 0x80 != 0) {
         out.push(0);
     }
     let mut v = vec![out.len() as u8];
@@ -84,9 +84,9 @@ fn decode_body(body: &[u8]) -> Option<(u8, u8, i64, u16, [u8; 20])> {
     }
     let version = body[0];
     let flags = body[1];
-    let price = i64::from_le_bytes(body[2..10].try_into().unwrap());
-    let mask = u16::from_le_bytes(body[10..12].try_into().unwrap());
-    let payout: [u8; 20] = body[12..32].try_into().unwrap();
+    let price = i64::from_le_bytes(body[2..10].try_into().ok()?);
+    let mask = u16::from_le_bytes(body[10..12].try_into().ok()?);
+    let payout: [u8; 20] = body[12..32].try_into().ok()?;
     if version != TAG_VERSION || flags & 0xfe != 0 {
         return None;
     }

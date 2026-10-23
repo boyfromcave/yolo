@@ -47,12 +47,14 @@ pub fn compact_size(n: u64) -> Vec<u8> {
 /// Reads a compact size at `pos`; returns (value, bytes consumed).
 pub fn read_compact_size(data: &[u8], pos: usize) -> Result<(u64, usize), String> {
     let first = *data.get(pos).ok_or("compact size: out of data")?;
-    let take = |n: usize| -> Result<&[u8], String> { data.get(pos + 1..pos + 1 + n).ok_or_else(|| "compact size: truncated".to_string()) };
+    fn take<const N: usize>(data: &[u8], pos: usize) -> Result<[u8; N], String> {
+        data.get(pos + 1..pos + 1 + N).and_then(|b| b.try_into().ok()).ok_or_else(|| "compact size: truncated".to_string())
+    }
     Ok(match first {
         0..=252 => (first as u64, 1),
-        0xfd => (u16::from_le_bytes(take(2)?.try_into().unwrap()) as u64, 3),
-        0xfe => (u32::from_le_bytes(take(4)?.try_into().unwrap()) as u64, 5),
-        _ => (u64::from_le_bytes(take(8)?.try_into().unwrap()), 9),
+        0xfd => (u16::from_le_bytes(take(data, pos)?) as u64, 3),
+        0xfe => (u32::from_le_bytes(take(data, pos)?) as u64, 5),
+        _ => (u64::from_le_bytes(take(data, pos)?), 9),
     })
 }
 
