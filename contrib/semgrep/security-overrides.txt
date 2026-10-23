@@ -1,0 +1,21 @@
+# Security overrides for contrib/semgrep/requirements.txt: transitive dependencies of semgrep moved past
+# the exact/compatible pins semgrep declares, to versions that fix a published advisory (OSV-Scanner,
+# .github/workflows/secops.yml). scan.py installs with --no-deps, so semgrep's own pins are not re-checked;
+# each override was verified by a full scan (the semgrep job) before it landed. Drop a line once semgrep
+# itself requires the fixed version.
+#   certifi   PYSEC-2026-4320 / GHSA-6q48-6c7w-9gw2 (emSign roots with compromised intermediates)
+#   mcp       GHSA-84m7-p3x7-pcfv (StreamableHTTP session accumulation); semgrep pins mcp==1.29.0
+#   opentelemetry-*  GHSA-xcq7-p3pf-p88h (unbounded tracestate parsing); semgrep pins ~=1.37.0. The
+#             API, SDK, exporters and instrumentations move together (one release train).
+certifi==2026.10.19
+mcp==1.30.0
+opentelemetry-api==1.45.1
+opentelemetry-sdk==1.45.1
+opentelemetry-exporter-otlp-proto-http==1.45.1
+opentelemetry-exporter-otlp-proto-common==1.45.1
+opentelemetry-proto==1.45.1
+opentelemetry-instrumentation==0.66b1
+opentelemetry-instrumentation-requests==0.66b1
+opentelemetry-instrumentation-threading==0.66b1
+opentelemetry-semantic-conventions==0.66b1
+opentelemetry-util-http==0.66b1

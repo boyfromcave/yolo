@@ -5,12 +5,15 @@
 """Run the Semgrep scan the CI workflow runs (.github/workflows/semgrep.yml), on a laptop or in CI.
 
   contrib/semgrep/scan.py [--baseline REF] [--enforce] [--out DIR] [--install]
+  contrib/semgrep/scan.py --test [--install]
 
   --baseline REF  diff-aware: report only findings that are new versus REF (a PR's base)
   --enforce       exit 1 when a bucket named in config.json "fail_on" has findings
   --out DIR       where results.json, results.sarif, findings.json and summary.md go (default semgrep-out/)
   --install       when no semgrep of config.json "semgrep_version" is on PATH, install it into a venv
                   under the cache from contrib/semgrep/requirements.txt (hash-locked, CPython 3.12)
+  --test          run the local rules' tests instead of a scan (`semgrep --test` over config.json
+                  "local_rules": each rules file <name>.yaml beside its annotated test file <name>.<ext>)
 
 Semgrep Community Edition only: the LGPL-2.1 `semgrep` package from PyPI, no login, no registry, no
 Pro engine, --metrics=off. The rules are config.json "rule_sources" (each a git repository at a pinned
@@ -70,6 +73,7 @@ def main():
     ap.add_argument("--enforce", action="store_true")
     ap.add_argument("--out", default="semgrep-out")
     ap.add_argument("--install", action="store_true")
+    ap.add_argument("--test", action="store_true")
     args = ap.parse_args()
 
     os.chdir(subprocess.run(["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True,
@@ -78,6 +82,9 @@ def main():
         cfg = json.load(f)
     cache = os.environ.get("SEMGREP_RULES_CACHE") or os.path.expanduser("~/.cache/ycash-semgrep")
     semgrep = semgrep_binary(cfg, cache, args.install)
+    if args.test:
+        return subprocess.run([semgrep, "--test", "--metrics=off", "--disable-version-check",
+                               cfg["local_rules"]]).returncode
     roots = {src["name"]: rules_checkout(src, cache) for src in cfg["rule_sources"]}
 
     os.makedirs(args.out, exist_ok=True)
