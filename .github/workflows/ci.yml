@@ -134,24 +134,20 @@ jobs:
       NODE_RUN_ID: ${{ inputs.node_run_id }}
       NODE_OF_RECORD: ${{ matrix.of_record }}
       REF_NAME: ${{ github.ref_name }}
+      # The node branch, from a fixed list: this run's branch when it is one of the two lines,
+      # else the node line's branch of record. Nothing a dispatcher types reaches the checkout.
+      NODE_BRANCH: ${{ contains(fromJSON('["upgrade/vault", "harden/yellowback"]'), github.ref_name) && github.ref_name || matrix.of_record }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - name: node branch for this run
-        id: node
-        run: |
-          case "$REF_NAME" in
-            upgrade/vault|harden/yellowback) branch=$REF_NAME ;;
-            *) branch=$NODE_OF_RECORD ;;
-          esac
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-          echo "node line $NODE_REPO @ $branch"
+        run: echo "node line $NODE_REPO @ $NODE_BRANCH"
       # The stratum test miner (Python, stdlib only) lives in the node tree.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ env.NODE_REPO }}
-          ref: ${{ steps.node.outputs.branch }}
+          ref: ${{ env.NODE_BRANCH }}
           path: node
           persist-credentials: false
           sparse-checkout: |
@@ -160,11 +156,19 @@ jobs:
       - name: download ycashd from the node line's CI
         env:
           GH_TOKEN: ${{ github.token }}
-          NODE_BRANCH: ${{ steps.node.outputs.branch }}
         run: |
           dst="$RUNNER_TEMP/node"; mkdir -p "$dst"
-          if [ -n "$NODE_RUN_ID" ]; then runs=$NODE_RUN_ID; else
-            runs=$(gh run list -R "$NODE_REPO" -w yellowback-tests.yml -b "$NODE_BRANCH" -L 20 --json databaseId -q '.[].databaseId')
+          # Only a run of the node line's own branch, started by a push, the schedule or a dispatch:
+          # never a pull_request run, whose artifact a fork's code built (a fork PR's head branch
+          # may carry the same name), and never another branch's run.
+          trusted='select(.event == "push" or .event == "schedule" or .event == "workflow_dispatch")'
+          if [ -n "$NODE_RUN_ID" ]; then
+            case "$NODE_RUN_ID" in ''|*[!0-9]*) echo "::error::node_run_id is not a run id"; exit 1 ;; esac
+            runs=$(gh run view "$NODE_RUN_ID" -R "$NODE_REPO" --json databaseId,event,headBranch \
+              -q "select(.headBranch == \"$NODE_BRANCH\") | $trusted | .databaseId")
+            [ -n "$runs" ] || { echo "::error::run $NODE_RUN_ID is not a push/schedule/dispatch run of $NODE_REPO $NODE_BRANCH"; exit 1; }
+          else
+            runs=$(gh run list -R "$NODE_REPO" -w yellowback-tests.yml -b "$NODE_BRANCH" -L 20 --json databaseId,event -q ".[] | $trusted | .databaseId")
           fi
           for r in $runs; do
             if gh run download "$r" -R "$NODE_REPO" -n "$NODE_ARTIFACT" -D "$RUNNER_TEMP/dl" 2>/dev/null; then
@@ -178,13 +182,10 @@ jobs:
           else echo "::error::no artifact $NODE_ARTIFACT (node-bin.tar / node-bin.tgz) in $NODE_REPO runs on $NODE_BRANCH ($runs)"; ls -lR "$RUNNER_TEMP/dl" 2>/dev/null || true; exit 1; fi
           test -x "$dst/src/ycashd" && test -x "$dst/src/ycash-cli"
           ls -l "$dst/src"
-      - name: cache zcash params
-        id: params
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.zcash-params
-          key: zcash-params-${{ hashFiles('node/zcutil/fetch-params.sh') }}
-      - if: steps.params.outputs.cache-hit != 'true'
+      # Not cached: this job runs code from another repository's tree (fetch-params.sh, ycashd) in
+      # the dispatching branch's cache scope, the default branch's on a nightly, so it saves no
+      # cache entry (rust-cache below restores, save-if: false).
+      - name: fetch zcash params
         run: node/zcutil/fetch-params.sh
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

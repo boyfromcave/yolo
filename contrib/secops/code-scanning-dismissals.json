@@ -1,0 +1,19 @@
+{
+  "_comment": "Code-scanning alerts dismissed by .github/workflows/code-scanning.yml (contrib/secops/code-scanning-triage.py). One entry per tool + rule + path glob: reason is one of 'false positive', 'won't fix', 'used in tests'; comment is the argument a reviewer can check (280 characters reach GitHub). A real finding is fixed in code, never listed here.",
+  "dismissals": [
+    {
+      "tool": "CodeQL",
+      "rule": "rust/log-injection",
+      "path": "tests/regtest.rs",
+      "reason": "used in tests",
+      "comment": "Integration test (--features regtest): the value is the body of the pool's /status reply to the test's own request on a loopback socket, printed in a panic message on failure. No production log; src/stratum.rs logs miner names through shown() ({:?}, length-bounded)."
+    },
+    {
+      "tool": "CodeQL",
+      "rule": "rust/log-injection",
+      "path": "tests/wire.rs",
+      "reason": "used in tests",
+      "comment": "Test-only: assert! messages print the reply the in-process test server sent to the test's own loopback client (lines 349, 402). No production log; src/stratum.rs logs miner-supplied worker names through shown() ({:?} escaped, length-bounded)."
+    }
+  ]
+}

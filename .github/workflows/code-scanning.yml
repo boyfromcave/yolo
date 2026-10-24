@@ -1,0 +1,52 @@
+# Code-scanning triage: apply the reviewed dismissals and export the open alerts.
+#
+# GitHub code scanning (Security -> Code scanning) collects the SARIF of CodeQL, Semgrep, zizmor,
+# gitleaks, OSV-Scanner, cargo-deny and Checkov. An alert that is a false positive, test-only
+# material or an accepted risk is dismissed here from `contrib/secops/code-scanning-dismissals.json`,
+# the reviewed record (one entry per tool + rule + path glob, with the reason a reviewer can check),
+# instead of by hand in the web UI, so the decision is in the repository's history. A real finding
+# is fixed in code, never listed there.
+#
+# The job's own GITHUB_TOKEN carries security-events: write, which the API needs; the workflow
+# changes nothing else. It runs on a push that changes the dismissals file, nightly (alerts a new
+# scan re-opens are re-dismissed while their entry stands), and by hand. `dry_run` only prints.
+name: code-scanning
+on:
+  push:
+    branches: ['upgrade/vault']
+    paths: ['contrib/secops/code-scanning-dismissals.json', '.github/workflows/code-scanning.yml']
+  schedule:
+    - cron: '53 3 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: only print what would be dismissed
+        type: boolean
+        default: false
+permissions: {}
+concurrency:
+  group: code-scanning-triage
+  cancel-in-progress: false
+jobs:
+  triage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Apply the dismissals and export the open alerts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: python3 contrib/secops/code-scanning-triage.py --repo "$REPO" --dismissals contrib/secops/code-scanning-dismissals.json --export open-alerts.json $([ "$DRY_RUN" = true ] && echo --dry-run)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !cancelled() }}
+        with:
+          name: code-scanning-alerts
+          path: open-alerts.json
+          retention-days: 14
