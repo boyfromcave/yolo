@@ -1,0 +1,285 @@
+[
+ {
+  "number": 5,
+  "created_at": "2026-10-23T06:10:25Z",
+  "updated_at": "2026-10-23T06:10:25Z",
+  "url": "https://api.github.com/repos/boyfromcave/yolo/code-scanning/alerts/5",
+  "html_url": "https://github.com/boyfromcave/yolo/security/code-scanning/5",
+  "state": "open",
+  "fixed_at": null,
+  "dismissed_by": null,
+  "dismissed_at": null,
+  "dismissed_reason": null,
+  "dismissed_comment": null,
+  "rule": {
+   "id": "actions/untrusted-checkout/medium",
+   "severity": "warning",
+   "description": "Checkout of untrusted code in a non-privileged context",
+   "name": "actions/untrusted-checkout/medium",
+   "tags": [
+    "actions",
+    "external/cwe/cwe-829",
+    "security"
+   ],
+   "full_description": "Checking out and running the build script from a fork executes untrusted code. Even in a non-privileged workflow, this can be abused, for example to compromise self-hosted runners or to poison caches and artifacts that are later consumed by privileged workflows.",
+   "help": "## Overview\n\nGitHub workflows can be triggered through various repository events, including incoming pull requests (PRs) or comments on Issues/PRs. Under certain conditions described below, attackers can take over a repository by opening malicious PRs from forks. The attacks can result in malicious code execution causing unauthorized changes to the repository or exfiltration of repository secrets and a compromise of connected systems.\n\n## Workflow Security Model\n\nIn GitHub Actions, there is a distinction between unprivileged and privileged workflows. For example, a workflow with a `pull_request` trigger is unprivileged while a workflow with `pull_request_target` is privileged.\n\nThis is relevant especially for PRs from forks. Normal PRs can only be submitted by people who have write access to a repository, while PRs from forks can be submitted by anyone.\n\nOn a PR from a fork, an unprivileged `pull_request` workflow has only limited capabilities but a privileged `pull_request_target` workflow is much more dangerous. A privileged workflow:\n\n  * Runs in the context of the base repository\n  * Has access to organization and repository secrets (e.g., API keys, deployment tokens)\n  * Has a read/write `GITHUB_TOKEN` by default\n  * Can access private resources\n\nCertain triggers automatically grant a workflow elevated privileges:\n\n  * `pull_request_target` as described above\n  * `workflow_run`: Triggered when another workflow completes.\n  * `issue_comment`: Triggered when a comment is made on an issue or PR.\n\n## Attack Details\n\n  * A repository has a privileged workflow\n  * An attacker forks the repository and adds malicious code (e.g., in the build script)\n  * The attacker opens a PR from the fork, and, if needed, comments on the PR\n  * The workflow in the base repository checks out the forked code\n  * The workflow runs the malicious code\n\nPlease note that not only build scripts can be malicious code vectors. There is a large number of other possibilities. Some of them are listed in the [LOTP](https://boostsecurityio.github.io/lotp/) catalog.\n\n## Recommendation\n\n- Avoid using `pull_request_target` unless necessary.\n- Employ unprivileged `pull_request` workflows followed by `workflow_run` for privileged operations.\n- Use labels like `safe to test` to vet PRs and manage the execution context appropriately.\n\nThe best practice is to handle the potentially untrusted pull request via the **pull_request** trigger so that it is isolated in an unprivileged environment. The workflow processing the pull request should then store any results like code coverage or failed/passed tests in artifacts and exit. A second privileged workflow with the access to repository secrets, triggered by the completion of the first workflow using `workflow_run` trigger event, downloads the artifacts and make any necessary modifications to the repository or interact with third party services that require repository secrets (e.g. API tokens).\n\nThe artifacts downloaded from the first workflow should be considered untrusted and must be verified.\n\nAdditionally, ensure that least privilege are used both at the workflow level (through event triggers and workflow permissions) and job level (through job permissions).\n\n## Example\n\n### Incorrect Usage\n\nThe following workflow checks-out untrusted code in a privileged context and runs user-controlled code (in this case package.json scripts) which will grant privileged access to the attacker:\n\n```yaml\non: pull_request_target\n\njobs:\n  build:\n    name: Build and test\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v2\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}\n\n      - uses: actions/setup-node@v1\n      - run: |\n          npm install # scripts in package.json from PR would be executed here\n          npm build\n\n      - uses: completely/fakeaction@v2\n        with:\n          arg1: ${{ secrets.supersecret }}\n\n      - uses: fakerepo/comment-on-pr@v1\n        with:\n          message: |\n            Thank you!\n```\n\n### Correct Usage\n\nAn example shows how to use two workflows: one for processing the untrusted PR and the other for using the results in a safe context.\n\n**ReceivePR.yml** (untrusted PR handling with artifact creation):\n\n```yaml\nname: Receive PR\non:\n  pull_request:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v2\n      - name: Build\n        run: /bin/bash ./build.sh\n      - name: Save PR number\n        run: |\n          mkdir -p ./pr\n          echo ${{ github.event.number }} > ./pr/NR\n      - uses: actions/upload-artifact@v2\n        with:\n          name: pr\n          path: pr/\n```\n\n**CommentPR.yml** (processing artifacts with privileged access):\n\n```yaml\nname: Comment on the pull request\non:\n  workflow_run:\n    workflows: [\"Receive PR\"]\n    types:\n      - completed\njobs:\n  upload:\n    runs-on: ubuntu-latest\n    if: >\n      github.event.workflow_run.event == 'pull_request' &&\n      github.event.workflow_run.conclusion == 'success'\n    steps:\n      - name: \"Download artifact\"\n        uses: actions/github-script@v3.1.0\n        with:\n          script: |\n            var artifacts = await github.actions.listWorkflowRunArtifacts({\n                owner: context.repo.owner,\n                repo: context.repo.repo,\n                run_id: ${{github.event.workflow_run.id }},\n            });\n            var matchArtifact = artifacts.data.artifacts.filter((artifact) => {\n              return artifact.name == \"pr\";\n            })[0];\n            var download = await github.actions.downloadArtifact({\n                owner: context.repo.owner,\n                repo: context.repo.repo,\n                artifact_id: matchArtifact.id,\n                archive_format: 'zip',\n            });\n            var fs = require('fs');\n            fs.writeFileSync('${{github.workspace}}/pr.zip', Buffer.from(download.data));\n      - run: |\n          mkdir -p tmp\n          unzip -d tmp/ pr.zip\n      - name: \"Comment on PR\"\n        uses: actions/github-script@v3\n        with:\n          github-token: ${{ secrets.GITHUB_TOKEN }}\n          script: |\n            var fs = require('fs');\n            var issue_number = Number(fs.readFileSync('./tmp/NR'));\n            // Verify that the file contains a numeric value\n            const contains_numeric = /\\d/.test(issue_number);\n            if (contains_numeric) {\n                await github.issues.createComment({\n                  owner: context.repo.owner,\n                  repo: context.repo.repo,\n                  issue_number: issue_number,\n                  body: 'Everything is OK. Thank you for the PR!'\n                });\n            }\n```\n\n## References\n\n- GitHub Security Lab Research: [Keeping your GitHub Actions and workflows secure Part 1: Preventing pwn requests](https://securitylab.github.com/research/github-actions-preventing-pwn-requests/).\n- Mitigating risks of untrusted checkout: [GitHub Docs](https://docs.github.com/en/enterprise-cloud@latest/actions/reference/security/secure-use#mitigating-the-risks-of-untrusted-code-checkout).\n- Securing with least privilege: [Workflow secure use](https://docs.github.com/en/actions/reference/security/secure-use).\n- Living Off the Pipeline: [LOTP](https://boostsecurityio.github.io/lotp/).\n",
+   "security_severity_level": "medium"
+  },
+  "tool": {
+   "name": "CodeQL",
+   "guid": null,
+   "version": "2.27.3"
+  },
+  "most_recent_instance": {
+   "ref": "refs/heads/upgrade/vault",
+   "analysis_key": ".github/workflows/codeql.yml:analyze",
+   "environment": "{\"language\":\"actions\"}",
+   "category": "codeql/actions",
+   "state": "open",
+   "commit_sha": "f31a3c1efbf6645ae6f23234faac830deefbc44b",
+   "message": {
+    "text": "Potential unsafe checkout of untrusted pull request on non-privileged workflow."
+   },
+   "location": {
+    "path": ".github/workflows/ci.yml",
+    "start_line": 151,
+    "end_line": 160,
+    "start_column": 9,
+    "end_column": 7
+   },
+   "classifications": []
+  },
+  "instances_url": "https://api.github.com/repos/boyfromcave/yolo/code-scanning/alerts/5/instances",
+  "dismissal_approved_by": null,
+  "assignees": [],
+  "linked_pull_requests": [],
+  "linked_issues": []
+ },
+ {
+  "number": 4,
+  "created_at": "2026-10-23T06:10:25Z",
+  "updated_at": "2026-10-23T06:10:25Z",
+  "url": "https://api.github.com/repos/boyfromcave/yolo/code-scanning/alerts/4",
+  "html_url": "https://github.com/boyfromcave/yolo/security/code-scanning/4",
+  "state": "open",
+  "fixed_at": null,
+  "dismissed_by": null,
+  "dismissed_at": null,
+  "dismissed_reason": null,
+  "dismissed_comment": null,
+  "rule": {
+   "id": "actions/cache-poisoning/poisonable-step",
+   "severity": "error",
+   "description": "Cache Poisoning via execution of untrusted code",
+   "name": "actions/cache-poisoning/poisonable-step",
+   "tags": [
+    "actions",
+    "external/cwe/cwe-349",
+    "security"
+   ],
+   "full_description": "The cache can be poisoned by untrusted code, leading to a cache poisoning attack.",
+   "help": "## Overview\n\nGitHub Actions cache poisoning is a technique that allows an attacker to inject malicious content into the Action's cache from unprivileged workflow, potentially leading to code execution in privileged workflows.\n\nAn attacker with the ability to run code in the context of the default branch (e.g. through Code Injection or Execution of Untrusted Code) can exploit this to:\n\n1. Steal the cache access token and URL.\n2. Overflow the cache to trigger eviction of legitimate entries.\n3. Poison cache entries with malicious payloads.\n4. Achieve code execution in privileged workflows that restore the poisoned cache.\n\nThis allows lateral movement from low-privileged to high-privileged workflows within a repository.\n\n### Cache Structure\n\nIn GitHub Actions, cache scopes are primarily determined by the branch structure. Branches are considered the main security boundary for GitHub Actions caching. This means that cache entries are generally scoped to specific branches.\n\n- **Access to Parent Branch Caches**: Feature branches (or child branches) created off of a parent branch (like `main` or `dev`) can access caches from the parent branch. For instance, a feature branch off of `main` will be able to access the cache from `main`.\n\n- **Sibling Branches**: Sibling branches, meaning branches that are created from the same parent but not from each other, do not share caches. For example, two branches created off of `main` will not be able to access each other\u2019s caches directly.\n\nDue to the above design, if something is cached in the context of the default branch (e.g., `main`), it becomes accessible to any feature branch derived from `main`.\n\n## Recommendation\n\n1. Avoid using caching in workflows that handle sensitive operations like releases.\n2. If caching must be used:\n   - Validate restored cache contents before use.\n   - Use short-lived, workflow-specific cache keys.\n   - Clear caches regularly.\n3. Implement strict isolation between untrusted and privileged workflow execution.\n4. Never run untrusted code in the context of the default branch.\n5. Sign the cache value cryptographically and verify the signature before usage.\n\n## Example\n\nGitHub gives workflows triggered by low-trust events, such as `issue_comment`,\n`pull_request_target`, and `workflow_run`, read-only access to the default branch cache scope.\nThis query therefore reports only workflows whose trigger can write to that scope.\n\n### Incorrect Usage\n\nThe following write-capable manually dispatched workflow fetches an unvalidated revision and then\nexecutes code from it. The executed code can use the cache token to poison the default branch cache\nif an untrusted integration or automation can influence the dispatch input.\n\n```yaml\nname: Vulnerable Workflow\non:\n  workflow_dispatch:\n    inputs:\n      head_sha:\n        required: true\njobs:\n  test:\n    permissions: {}\n    runs-on: ubuntu-latest\n    steps:\n      - env:\n          HEAD_SHA: ${{ github.event.inputs.head_sha }}\n        run: |\n          git fetch origin \"$HEAD_SHA\"\n          git checkout \"$HEAD_SHA\"\n      - name: Run tests\n        run: npm install\n```\n\n### Correct Usage\n\nThe following workflow runs untrusted code in a non-privileged job and the cache is scoped to the Pull Request branch.\n\n```yaml\nname: Secure Workflow\non:\n  pull_request:\n    branches: [main]\npermissions: {}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v3\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}\n      - name: Run tests\n        run: ./run_tests.sh\n```\n\n## References\n\n- Adnan Khan's Blog: [The Monsters in Your Build Cache \u2013 GitHub Actions Cache Poisoning](https://adnanthekhan.com/2024/05/06/the-monsters-in-your-build-cache-github-actions-cache-poisoning/).\n- GitHub Docs: [Cache access for low-trust workflow triggers](https://docs.github.com/actions/reference/workflows-and-actions/dependency-caching#cache-access-for-low-trust-workflow-triggers).\n- Scribe Security Blog: [Cache Poisoning in GitHub Actions](https://scribesecurity.com/blog/github-cache-poisoning/).\n",
+   "security_severity_level": "high"
+  },
+  "tool": {
+   "name": "CodeQL",
+   "guid": null,
+   "version": "2.27.3"
+  },
+  "most_recent_instance": {
+   "ref": "refs/heads/upgrade/vault",
+   "analysis_key": ".github/workflows/codeql.yml:analyze",
+   "environment": "{\"language\":\"actions\"}",
+   "category": "codeql/actions",
+   "state": "open",
+   "commit_sha": "f31a3c1efbf6645ae6f23234faac830deefbc44b",
+   "message": {
+    "text": "Potential cache poisoning in the context of the default branch due to privilege checkout of untrusted code from steps.node.outputs.branch. (workflow_dispatch)."
+   },
+   "location": {
+    "path": ".github/workflows/ci.yml",
+    "start_line": 193,
+    "end_line": 204,
+    "start_column": 9,
+    "end_column": 80
+   },
+   "classifications": []
+  },
+  "instances_url": "https://api.github.com/repos/boyfromcave/yolo/code-scanning/alerts/4/instances",
+  "dismissal_approved_by": null,
+  "assignees": [],
+  "linked_pull_requests": [],
+  "linked_issues": []
+ },
+ {
+  "number": 3,
+  "created_at": "2026-10-23T06:08:11Z",
+  "updated_at": "2026-10-23T06:08:11Z",
+  "url": "https://api.github.com/repos/boyfromcave/yolo/code-scanning/alerts/3",
+  "html_url": "https://github.com/boyfromcave/yolo/security/code-scanning/3",
+  "state": "open",
+  "fixed_at": null,
+  "dismissed_by": null,
+  "dismissed_at": null,
+  "dismissed_reason": null,
+  "dismissed_comment": null,
+  "rule": {
+   "id": "rust/log-injection",
+   "severity": "error",
+   "description": "Log injection",
+   "name": "rust/log-injection",
+   "tags": [
+    "external/cwe/cwe-117",
+    "security"
+   ],
+   "full_description": "Building log entries from user-controlled sources is vulnerable to insertion of forged log entries by a malicious user.",
+   "help": "# Log injection\nIf unsanitized user input is written to a log entry, a malicious user may be able to forge new log entries.\n\nForgery can occur if a user provides some input with characters that are interpreted when the log output is displayed. If the log is displayed as a plain text file, then new line characters can be used by a malicious user. If the log is displayed as HTML, then arbitrary HTML may be included to spoof log entries.\n\n\n## Recommendation\nUser input should be suitably sanitized before it is logged.\n\nIf the log entries are in plain text, then line breaks should be removed from user input using `String::replace` or similar. Care should also be taken that user input is clearly marked in log entries.\n\nFor log entries that will be displayed in HTML, user input should be HTML-encoded before being logged, to prevent forgery and other forms of HTML injection.\n\n\n## Example\nIn the first example, a username, provided by the user via command line arguments, is logged using the `log` crate. If a malicious user provides `Guest\\n[INFO] User: Admin\\n` as a username parameter, the log entry will be split into multiple lines, where the second line will appear as `[INFO] User: Admin`, potentially forging a legitimate admin login entry.\n\n\n```rust\nuse std::env;\nuse log::info;\n\nfn main() {\n    env_logger::init();\n\n    // Get username from command line arguments\n    let args: Vec<String> = env::args().collect();\n    let username = args.get(1).unwrap_or(&String::from(\"Guest\")).clone();\n\n    // BAD: log message constructed with unsanitized user input\n    info!(\"User login attempt: {}\", username);\n}\n\n```\nIn the second example, `String::replace` is used to ensure no line endings are present in the user input before logging.\n\n\n```rust\nuse std::env;\nuse log::info;\n\nfn sanitize_for_logging(input: &str) -> String {\n    // Remove newlines and carriage returns to prevent log injection\n    input.replace('\\n', \"\").replace('\\r', \"\")\n}\n\nfn main() {\n    env_logger::init();\n\n    // Get username from command line arguments\n    let args: Vec<String> = env::args().collect();\n    let username = args.get(1).unwrap_or(&String::from(\"Guest\")).clone();\n\n    // GOOD: log message constructed with sanitized user input\n    let sanitized_username = sanitize_for_logging(username.as_str());\n    info!(\"User login attempt: {}\", sanitized_username);\n}\n\n```\n\n## References\n* OWASP: [Log Injection](https://owasp.org/www-community/attacks/Log_Injection).\n* Common Weakness Enumeration: [CWE-117](https://cwe.mitre.org/data/definitions/117.html).\n",
+   "security_severity_level": "medium"
+  },
+  "tool": {
+   "name": "CodeQL",
+   "guid": null,
+   "version": "2.27.3"
+  },
+  "most_recent_instance": {
+   "ref": "refs/heads/upgrade/vault",
+   "analysis_key": ".github/workflows/codeql.yml:analyze",
+   "environment": "{\"language\":\"rust\"}",
+   "category": "codeql/rust",
+   "state": "open",
+   "commit_sha": "f31a3c1efbf6645ae6f23234faac830deefbc44b",
+   "message": {
+    "text": "Log entry depends on a user-provided value."
+   },
+   "location": {
+    "path": "tests/wire.rs",
+    "start_line": 402,
+    "end_line": 402,
+    "start_column": 59,
+    "end_column": 62
+   },
+   "classifications": [
+    "test"
+   ]
+  },
+  "instances_url": "https://api.github.com/repos/boyfromcave/yolo/code-scanning/alerts/3/instances",
+  "dismissal_approved_by": null,
+  "assignees": [],
+  "linked_pull_requests": [],
+  "linked_issues": []
+ },
+ {
+  "number": 2,
+  "created_at": "2026-10-23T06:08:11Z",
+  "updated_at": "2026-10-23T06:08:11Z",
+  "url": "https://api.github.com/repos/boyfromcave/yolo/code-scanning/alerts/2",
+  "html_url": "https://github.com/boyfromcave/yolo/security/code-scanning/2",
+  "state": "open",
+  "fixed_at": null,
+  "dismissed_by": null,
+  "dismissed_at": null,
+  "dismissed_reason": null,
+  "dismissed_comment": null,
+  "rule": {
+   "id": "rust/log-injection",
+   "severity": "error",
+   "description": "Log injection",
+   "name": "rust/log-injection",
+   "tags": [
+    "external/cwe/cwe-117",
+    "security"
+   ],
+   "full_description": "Building log entries from user-controlled sources is vulnerable to insertion of forged log entries by a malicious user.",
+   "help": "# Log injection\nIf unsanitized user input is written to a log entry, a malicious user may be able to forge new log entries.\n\nForgery can occur if a user provides some input with characters that are interpreted when the log output is displayed. If the log is displayed as a plain text file, then new line characters can be used by a malicious user. If the log is displayed as HTML, then arbitrary HTML may be included to spoof log entries.\n\n\n## Recommendation\nUser input should be suitably sanitized before it is logged.\n\nIf the log entries are in plain text, then line breaks should be removed from user input using `String::replace` or similar. Care should also be taken that user input is clearly marked in log entries.\n\nFor log entries that will be displayed in HTML, user input should be HTML-encoded before being logged, to prevent forgery and other forms of HTML injection.\n\n\n## Example\nIn the first example, a username, provided by the user via command line arguments, is logged using the `log` crate. If a malicious user provides `Guest\\n[INFO] User: Admin\\n` as a username parameter, the log entry will be split into multiple lines, where the second line will appear as `[INFO] User: Admin`, potentially forging a legitimate admin login entry.\n\n\n```rust\nuse std::env;\nuse log::info;\n\nfn main() {\n    env_logger::init();\n\n    // Get username from command line arguments\n    let args: Vec<String> = env::args().collect();\n    let username = args.get(1).unwrap_or(&String::from(\"Guest\")).clone();\n\n    // BAD: log message constructed with unsanitized user input\n    info!(\"User login attempt: {}\", username);\n}\n\n```\nIn the second example, `String::replace` is used to ensure no line endings are present in the user input before logging.\n\n\n```rust\nuse std::env;\nuse log::info;\n\nfn sanitize_for_logging(input: &str) -> String {\n    // Remove newlines and carriage returns to prevent log injection\n    input.replace('\\n', \"\").replace('\\r', \"\")\n}\n\nfn main() {\n    env_logger::init();\n\n    // Get username from command line arguments\n    let args: Vec<String> = env::args().collect();\n    let username = args.get(1).unwrap_or(&String::from(\"Guest\")).clone();\n\n    // GOOD: log message constructed with sanitized user input\n    let sanitized_username = sanitize_for_logging(username.as_str());\n    info!(\"User login attempt: {}\", sanitized_username);\n}\n\n```\n\n## References\n* OWASP: [Log Injection](https://owasp.org/www-community/attacks/Log_Injection).\n* Common Weakness Enumeration: [CWE-117](https://cwe.mitre.org/data/definitions/117.html).\n",
+   "security_severity_level": "medium"
+  },
+  "tool": {
+   "name": "CodeQL",
+   "guid": null,
+   "version": "2.27.3"
+  },
+  "most_recent_instance": {
+   "ref": "refs/heads/upgrade/vault",
+   "analysis_key": ".github/workflows/codeql.yml:analyze",
+   "environment": "{\"language\":\"rust\"}",
+   "category": "codeql/rust",
+   "state": "open",
+   "commit_sha": "f31a3c1efbf6645ae6f23234faac830deefbc44b",
+   "message": {
+    "text": "Log entry depends on a user-provided value."
+   },
+   "location": {
+    "path": "tests/wire.rs",
+    "start_line": 349,
+    "end_line": 349,
+    "start_column": 99,
+    "end_column": 102
+   },
+   "classifications": [
+    "test"
+   ]
+  },
+  "instances_url": "https://api.github.com/repos/boyfromcave/yolo/code-scanning/alerts/2/instances",
+  "dismissal_approved_by": null,
+  "assignees": [],
+  "linked_pull_requests": [],
+  "linked_issues": []
+ },
+ {
+  "number": 1,
+  "created_at": "2026-10-23T06:08:11Z",
+  "updated_at": "2026-10-23T06:08:11Z",
+  "url": "https://api.github.com/repos/boyfromcave/yolo/code-scanning/alerts/1",
+  "html_url": "https://github.com/boyfromcave/yolo/security/code-scanning/1",
+  "state": "open",
+  "fixed_at": null,
+  "dismissed_by": null,
+  "dismissed_at": null,
+  "dismissed_reason": null,
+  "dismissed_comment": null,
+  "rule": {
+   "id": "rust/log-injection",
+   "severity": "error",
+   "description": "Log injection",
+   "name": "rust/log-injection",
+   "tags": [
+    "external/cwe/cwe-117",
+    "security"
+   ],
+   "full_description": "Building log entries from user-controlled sources is vulnerable to insertion of forged log entries by a malicious user.",
+   "help": "# Log injection\nIf unsanitized user input is written to a log entry, a malicious user may be able to forge new log entries.\n\nForgery can occur if a user provides some input with characters that are interpreted when the log output is displayed. If the log is displayed as a plain text file, then new line characters can be used by a malicious user. If the log is displayed as HTML, then arbitrary HTML may be included to spoof log entries.\n\n\n## Recommendation\nUser input should be suitably sanitized before it is logged.\n\nIf the log entries are in plain text, then line breaks should be removed from user input using `String::replace` or similar. Care should also be taken that user input is clearly marked in log entries.\n\nFor log entries that will be displayed in HTML, user input should be HTML-encoded before being logged, to prevent forgery and other forms of HTML injection.\n\n\n## Example\nIn the first example, a username, provided by the user via command line arguments, is logged using the `log` crate. If a malicious user provides `Guest\\n[INFO] User: Admin\\n` as a username parameter, the log entry will be split into multiple lines, where the second line will appear as `[INFO] User: Admin`, potentially forging a legitimate admin login entry.\n\n\n```rust\nuse std::env;\nuse log::info;\n\nfn main() {\n    env_logger::init();\n\n    // Get username from command line arguments\n    let args: Vec<String> = env::args().collect();\n    let username = args.get(1).unwrap_or(&String::from(\"Guest\")).clone();\n\n    // BAD: log message constructed with unsanitized user input\n    info!(\"User login attempt: {}\", username);\n}\n\n```\nIn the second example, `String::replace` is used to ensure no line endings are present in the user input before logging.\n\n\n```rust\nuse std::env;\nuse log::info;\n\nfn sanitize_for_logging(input: &str) -> String {\n    // Remove newlines and carriage returns to prevent log injection\n    input.replace('\\n', \"\").replace('\\r', \"\")\n}\n\nfn main() {\n    env_logger::init();\n\n    // Get username from command line arguments\n    let args: Vec<String> = env::args().collect();\n    let username = args.get(1).unwrap_or(&String::from(\"Guest\")).clone();\n\n    // GOOD: log message constructed with sanitized user input\n    let sanitized_username = sanitize_for_logging(username.as_str());\n    info!(\"User login attempt: {}\", sanitized_username);\n}\n\n```\n\n## References\n* OWASP: [Log Injection](https://owasp.org/www-community/attacks/Log_Injection).\n* Common Weakness Enumeration: [CWE-117](https://cwe.mitre.org/data/definitions/117.html).\n",
+   "security_severity_level": "medium"
+  },
+  "tool": {
+   "name": "CodeQL",
+   "guid": null,
+   "version": "2.27.3"
+  },
+  "most_recent_instance": {
+   "ref": "refs/heads/upgrade/vault",
+   "analysis_key": ".github/workflows/codeql.yml:analyze",
+   "environment": "{\"language\":\"rust\"}",
+   "category": "codeql/rust",
+   "state": "open",
+   "commit_sha": "f31a3c1efbf6645ae6f23234faac830deefbc44b",
+   "message": {
+    "text": "Log entry depends on a user-provided value."
+   },
+   "location": {
+    "path": "tests/regtest.rs",
+    "start_line": 340,
+    "end_line": 340,
+    "start_column": 58,
+    "end_column": 99
+   },
+   "classifications": [
+    "test"
+   ]
+  },
+  "instances_url": "https://api.github.com/repos/boyfromcave/yolo/code-scanning/alerts/1/instances",
+  "dismissal_approved_by": null,
+  "assignees": [],
+  "linked_pull_requests": [],
+  "linked_issues": []
+ }
+]
