@@ -1,0 +1,34 @@
+# Export the repository's open code-scanning alerts into the job log (temporary triage aid).
+name: code-scanning-export
+on:
+  push:
+    branches: ['claude/semgrep-security-issues-5rnmte-alerts']
+  workflow_dispatch:
+permissions: {}
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      security-events: read
+    steps:
+      - name: List open code-scanning alerts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api --paginate -X GET "repos/$REPO/code-scanning/alerts" -f state=open -f per_page=100 > alerts.json || { echo "ALERTS-BEGIN"; echo "NO-CODE-SCANNING"; echo "ALERTS-END"; exit 0; }
+          python3 - <<'PY'
+          import json
+          raw=open('alerts.json').read()
+          dec=json.JSONDecoder(); i=0; alerts=[]
+          while i < len(raw):
+              while i < len(raw) and raw[i].isspace(): i+=1
+              if i>=len(raw): break
+              obj,j=dec.raw_decode(raw,i); alerts+=obj; i=j
+          print(len(alerts),'open alerts')
+          print('ALERTS-BEGIN')
+          for a in alerts:
+              print('ALERT', json.dumps({'number':a['number'],'tool':a['tool']['name'],'rule':a['rule']['id'],'severity':a['rule'].get('security_severity_level') or a['rule'].get('severity'),'desc':a['rule'].get('description'),'path':a['most_recent_instance']['location'].get('path'),'line':a['most_recent_instance']['location'].get('start_line'),'message':(a['most_recent_instance'].get('message',{}).get('text') or '')[:300]}, separators=(',',':')))
+          print('ALERTS-END')
+          PY
