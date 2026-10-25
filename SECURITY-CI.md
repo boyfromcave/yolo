@@ -10,9 +10,10 @@ reports to *Security → Code scanning* (one category per tool) and the run's st
 | Semgrep (semgrep-rules `rust`, `bash`, `dockerfile`, `generic/secrets`, `yaml/github-actions`; Trail of Bits `rs`, `generic`, `yaml/github-actions`; yolo's own `contrib/semgrep/rules/`) | `semgrep.yml` | PR (diff-aware), push, nightly 02:17 UTC | PR fails on a new **critical** finding | code scanning `semgrep`, rolling PRs `semgrep/<bucket>` |
 | CodeQL (`rust`, `actions`; `security-extended`, build-mode none) | `codeql.yml` | PR, push to `upgrade/vault`, weekly | code scanning's own PR check (new alerts only) | code scanning `codeql/<language>` |
 | zizmor (workflow security, default persona) | `secops.yml` `zizmor` | PR, push to `upgrade/vault`, nightly 03:43 UTC | fails on any finding | code scanning `zizmor` |
-| gitleaks (secrets) | `secops.yml` `gitleaks` | PR (its commits), nightly/dispatch (full history) | fails on a leak | code scanning `gitleaks` (values redacted) |
+| gitleaks (secrets) | `secops.yml` `gitleaks` | PR (its commits), push/nightly/dispatch (full history) | fails on a leak not in `.gitleaksignore` | code scanning `gitleaks` (values redacted) |
 | OSV-Scanner (`Cargo.lock`, hash-locked pip requirements) | `secops.yml` `osv-scanner` | PR, push, nightly | fails on a known vulnerability not in `osv-scanner.toml` | code scanning `osv-scanner` |
 | cargo-deny (licences, sources, bans, advisories) + cargo-audit | `ci.yml` `audit` | every push and PR | fails on an advisory / policy breach | job log |
+| Code-scanning triage (reviewed dismissals) | `code-scanning.yml` | push to `upgrade/vault` changing the dismissals file, nightly 03:53 UTC, dispatch (`dry_run`) | none; dismisses alerts listed in `contrib/secops/code-scanning-dismissals.json` | job log, artifact `code-scanning-alerts` |
 | Dependabot | `.github/dependabot.yml` | GitHub | security updates only, grouped per ecosystem (cargo, github-actions, pip) | one PR per ecosystem |
 
 ## yolo's own Semgrep rules
@@ -40,6 +41,9 @@ reports to *Security → Code scanning* (one category per tool) and the run's st
 - **gitleaks**: a fingerprint in `.gitleaksignore` with a comment, for test vectors and public
   constants only. A real secret is rotated, never ignored.
 - **zizmor**: fix the workflow; an inline `# zizmor: ignore[<audit>]` only with the reason beside it.
+- **Code-scanning alerts** (any tool): a false positive, test-only hit or accepted risk is an entry in
+  `contrib/secops/code-scanning-dismissals.json` (tool, rule, path glob, reason, comment);
+  `.github/workflows/code-scanning.yml` dismisses the matching alerts. A real finding is fixed, never listed.
 - **cargo-deny / cargo-audit**: `deny.toml` (`[advisories] ignore`) with the reason.
 
 ## Repository settings (owner)
