@@ -4,3 +4,10 @@
 # contrib/semgrep/requirements.txt (the shared, hash-locked Semgrep CLI, copied byte-for-byte from
 # ycash-dd) has no open advisory: certifi, mcp and opentelemetry-* are overridden there to fixed
 # versions (contrib/semgrep/security-overrides.txt), so it needs no entry here.
+
+# --- Cargo.lock ---
+
+[[IgnoredVulns]]
+id = "GHSA-qwgh-2vcv-g2f7"
+ignoreUntil = 2027-01-25T00:00:00Z
+reason = "Cargo.lock: block-buffer 0.10.4 under digest 0.10 (sha2, the pool's hashing). GHSA-qwgh-2vcv-g2f7 (moderate, GitHub-only, not in the RustSec database cargo-deny reads): a panic caught inside a digest's compress callback can leave block-buffer's cursor out of range, so a later use of the same buffer reads or writes out of bounds. Fixed only in 0.12.1 (the digest 0.11 line); the digest 0.10 line, which every released sha2/sha3/blake2 still uses, has no fixed release. Nothing in yolo calls catch_unwind, so a panic inside a compress callback is never caught and the cursor is never reused. Revisit when the RustCrypto hashes ship on digest 0.11."
