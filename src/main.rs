@@ -104,10 +104,10 @@ fn main() {
     } else if let Some(cookie) = conf.as_ref().and_then(|c| c.datadir.clone()).map(|d| {
         let mut d = d;
         if let Some(c) = conf.as_ref() {
-            if c.regtest {
-                d.push("regtest")
-            } else if c.testnet {
-                d.push("testnet3")
+            // The node's per-network directory: regtest, or one of the three re-forked testnets
+            // (testnet-yb-fast, testnet-yb-slow, testnet-legacy; the old testnet3 chain is gone)
+            if let Some(sub) = c.network_subdir().unwrap_or_else(|e| fail(&e)) {
+                d.push(sub)
             }
         }
         d.join(".cookie")
