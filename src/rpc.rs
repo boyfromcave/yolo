@@ -28,6 +28,8 @@ pub struct ConfFile {
     pub rpcconnect: Option<String>,
     pub regtest: bool,
     pub testnet: bool,
+    /// `testnetprofile=`: which of the three testnets (fast, slow, legacy) a `testnet=1` node runs.
+    pub testnetprofile: Option<String>,
     pub datadir: Option<PathBuf>,
 }
 
@@ -50,6 +52,7 @@ impl ConfFile {
                 "rpcconnect" => c.rpcconnect = Some(v.to_string()),
                 "regtest" => c.regtest = v == "1",
                 "testnet" => c.testnet = v == "1",
+                "testnetprofile" => c.testnetprofile = Some(v.to_string()),
                 "datadir" => c.datadir = Some(PathBuf::from(v)),
                 _ => {}
             }
@@ -62,14 +65,37 @@ impl ConfFile {
         Ok(ConfFile::parse(&text))
     }
 
-    /// Default RPC port for the network the conf selects (Ycash: 8832 / 18832 / 18232).
+    /// Default RPC port for the network the conf selects (Ycash: mainnet 8832, regtest 18232; the
+    /// testnets fast 18832, slow 18932, legacy 19032).
     pub fn default_rpc_port(&self) -> u16 {
         if self.regtest {
             18232
         } else if self.testnet {
-            18832
+            match self.testnetprofile.as_deref() {
+                Some("slow") => 18932,
+                Some("legacy") => 19032,
+                _ => 18832,
+            }
         } else {
             8832
+        }
+    }
+
+    /// The node's per-network subdirectory of `datadir` (none on mainnet). A testnet node needs
+    /// `testnetprofile=` (the node itself refuses to start without one).
+    pub fn network_subdir(&self) -> Result<Option<&'static str>, String> {
+        if self.regtest {
+            return Ok(Some("regtest"));
+        }
+        if !self.testnet {
+            return Ok(None);
+        }
+        match self.testnetprofile.as_deref() {
+            Some("fast") => Ok(Some("testnet-yb-fast")),
+            Some("slow") => Ok(Some("testnet-yb-slow")),
+            Some("legacy") => Ok(Some("testnet-legacy")),
+            Some(p) => Err(format!("unknown testnetprofile={} (fast, slow or legacy)", p)),
+            None => Err("testnet=1 without testnetprofile= (fast, slow or legacy)".to_string()),
         }
     }
 
@@ -217,6 +243,13 @@ mod tests {
         assert_eq!(c.url(), "http://127.0.0.1:18832");
         assert_eq!(ConfFile::parse("").url(), "http://127.0.0.1:8832");
         assert_eq!(ConfFile::parse("regtest=1").url(), "http://127.0.0.1:18232");
+        assert_eq!(ConfFile::parse("testnet=1\ntestnetprofile=slow\n").url(), "http://127.0.0.1:18932");
+        assert_eq!(ConfFile::parse("testnet=1\ntestnetprofile=legacy\n").url(), "http://127.0.0.1:19032");
+        assert_eq!(ConfFile::parse("testnet=1\ntestnetprofile=fast\n").network_subdir(), Ok(Some("testnet-yb-fast")));
+        assert_eq!(ConfFile::parse("testnet=1\ntestnetprofile=legacy\n").network_subdir(), Ok(Some("testnet-legacy")));
+        assert!(ConfFile::parse("testnet=1\n").network_subdir().is_err());
+        assert!(ConfFile::parse("testnet=1\ntestnetprofile=x\n").network_subdir().is_err());
+        assert_eq!(ConfFile::parse("").network_subdir(), Ok(None));
         // rpcbind is a listen address, never a connect host; rpcconnect is
         assert_eq!(ConfFile::parse("rpcbind=0.0.0.0\n").url(), "http://127.0.0.1:8832");
         assert_eq!(ConfFile::parse("rpcbind=0.0.0.0\nrpcconnect=10.0.0.5\n").url(), "http://10.0.0.5:8832");
