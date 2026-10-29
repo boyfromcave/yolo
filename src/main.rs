@@ -107,7 +107,8 @@ fn main() {
             if c.regtest {
                 d.push("regtest")
             } else if c.testnet {
-                d.push("testnet3")
+                // The re-forked testnet's datadir (testnet plan N1, T-2); the old testnet3 chain is gone
+                d.push("testnet-yb")
             }
         }
         d.join(".cookie")
