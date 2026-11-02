@@ -178,7 +178,7 @@ jobs:
             contrib/yellowback/devnet
             zcutil
       # zakurad-bin (workspace docs/plans/kogany/ci-design.md, "Artifact contracts"): kogany's
-      # kogany-yellowback.yml uploads zakurad-bin.tgz (zakurad, zakurad-bin.json; dev profile,
+      # a kogany workflow uploads zakurad-bin.tgz (zakurad, zakurad-bin.json; dev profile,
       # --features ycash, ubuntu-24.04, linked against the runner's librocksdb) from push, schedule
       # and dispatch runs. Only such a run at kogany_ref is taken, never a pull_request run.
       - name: kogany's zakurad-bin at kogany_ref
@@ -190,7 +190,7 @@ jobs:
         run: |
           case "$KOGANY_REF" in *[!0-9a-f]*|'') echo "::error::kogany_ref is not a commit id"; exit 1 ;; esac
           trusted='select(.event == "push" or .event == "schedule" or .event == "workflow_dispatch")'
-          runs=$(gh run list -R boyfromcave/kogany -w kogany-yellowback.yml -c "$KOGANY_REF" -L 20 --json databaseId,event,headSha \
+          runs=$(gh run list -R boyfromcave/kogany -c "$KOGANY_REF" -L 50 --json databaseId,event,headSha \
             -q ".[] | select(.headSha == \"$KOGANY_REF\") | $trusted | .databaseId" 2>/dev/null || true)
           for r in $runs; do
             if gh run download "$r" -R boyfromcave/kogany -n zakurad-bin -D "$RUNNER_TEMP/zk-dl" 2>/dev/null \
