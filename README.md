@@ -266,6 +266,10 @@ through 111 with no Yellowback state (case `across-vault-activation`: every bloc
 tip's branch ID `6d5b7a31` on both nodes), then node A creates the YED attestor set
 (`set_create`, one block), both nodes restart with `-yellowbackattestorset=<setid>`, and the six
 cases run as above. `YOLO_REGTEST_VAULT=<h>` (h ≥ 104) moves the activation height.
+`YOLO_REGTEST_KOGANY=<zakurad>` (a kogany node built with `--features ycash`, the third node
+line) runs the same cases with yolo serving kogany's templates: kogany joins as a third node
+peered with node A, the two ycashd nodes keep the wallet roles and check every block (kogany never
+solves Equihash), and until kogany registers the YED module its tag carries its mock's payout key.
 
 ## Differences from the Perl
 

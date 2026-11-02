@@ -39,6 +39,16 @@
 //! with `-yellowbackattestorset=<setid>`, after which the six cases run as before.
 //! `YOLO_REGTEST_LEGACY=1` runs against a node without the vault upgrade (`harden/yellowback`)
 //! instead: `NODE_ARGS` as they are, with `-experimentalfeatures -yellowback`.
+//!
+//! **The kogany mode** (`YOLO_REGTEST_KOGANY=<zakurad built with --features ycash>`, vault mode
+//! only; kogany plan W8-c): a kogany node (`Kogany`) joins as a third node, dialling node A over
+//! P2P, and yolo serves *its* templates; nodes A and B stay ycashd and keep the wallet roles
+//! (`getnewaddress`, `generate`, `set_create`; kogany is wallet-less, plan K-3). kogany never
+//! solves Equihash (K-16), so every block is solved by the Python miner and must reach both
+//! ycashd nodes, which verify (48,5). The block facts (`yed_gettag`, `getblock`) are read from
+//! node A. Until plan W5-f kogany's Yellowback state is its mock (`KOGANY_YED_RPC_MOCK=1`): the
+//! tag carries the mock's fixture payout key, which `yed_setquote` reports, instead of
+//! `mineraddress`'s. Only the test layer differs; yolo's code is unchanged.
 #![cfg(feature = "regtest")]
 
 use std::path::{Path, PathBuf};
@@ -163,14 +173,6 @@ impl Node {
         panic!("node {} never answered RPC", self.index);
     }
 
-    fn call(&self, method: &str, params: Value) -> Value {
-        self.rpc.call(method, params).unwrap_or_else(|e| panic!("node {} {}: {}", self.index, method, e))
-    }
-
-    fn height(&self) -> u64 {
-        self.call("getblockcount", json!([])).as_u64().unwrap()
-    }
-
     fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
             if child.try_wait().unwrap().is_none() {
@@ -188,6 +190,30 @@ impl Node {
     }
 }
 
+/// What the cases ask of a node, a ycashd [`Node`] or a kogany [`Kogany`]: its RPC.
+trait Rpc {
+    fn client(&self) -> &RpcClient;
+    fn label(&self) -> String;
+
+    fn call(&self, method: &str, params: Value) -> Value {
+        self.client().call(method, params).unwrap_or_else(|e| panic!("{} {}: {}", self.label(), method, e))
+    }
+
+    fn height(&self) -> u64 {
+        self.call("getblockcount", json!([])).as_u64().unwrap()
+    }
+}
+
+impl Rpc for Node {
+    fn client(&self) -> &RpcClient {
+        &self.rpc
+    }
+
+    fn label(&self) -> String {
+        format!("node {}", self.index)
+    }
+}
+
 impl Drop for Node {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
@@ -197,7 +223,100 @@ impl Drop for Node {
     }
 }
 
-fn wait_height(nodes: &[&Node], height: u64, timeout: Duration) -> bool {
+/// The kogany mode's pool node (`YOLO_REGTEST_KOGANY=<zakurad>`): a `zakurad --features ycash`
+/// on the same Ycash regtest, wallet-less (kogany plan K-3), dialling ycashd node B over P2P. It
+/// validates Equihash (48,5) by shape only and never solves it (K-16): the Python miner solves its
+/// templates and node B, which verifies the proof of work, must accept every block. Until plan
+/// W5-f registers the YED module, its Yellowback state is `MockYedState`
+/// (`KOGANY_YED_RPC_MOCK=1`), so `yed_setquote` sets the tag and the tag's payout key is the
+/// mock's fixture key, not `mineraddress`. Killed on drop.
+struct Kogany {
+    rpc: RpcClient,
+    datadir: PathBuf,
+    p2p_port: u16,
+    child: Child,
+}
+
+impl Kogany {
+    fn start(zakurad: &Path, scratch: &Path, rpc_port: u16, p2p_port: u16, peer_p2p_port: u16, vault: u64, miner_address: &str) -> Kogany {
+        let datadir = scratch.join("kogany");
+        let _ = std::fs::remove_dir_all(&datadir);
+        std::fs::create_dir_all(&datadir).unwrap();
+        let root = datadir.display();
+        let heights = ["Overwinter", "Sapling", "Ycash", "Blossom", "Heartwood", "Canopy"].iter().map(|k| format!("{} = 1\n", k)).collect::<String>();
+        let toml = format!(
+            "[network]\nlisten_addr = \"127.0.0.1:{p2p}\"\ninitial_testnet_peers = [\"127.0.0.1:{peer}\"]\np2p_stack = \"legacy\"\nmax_connections_per_ip = 1\n\
+             cache_dir = \"{root}/network\"\nidentity_dir = \"{root}/identity\"\n\n[network.network]\nregtest = true\n\n\
+             [network.network.params.activation_heights]\n{heights}Vault = {vault}\n\n[network.zakura]\nlisten_addr = \"127.0.0.1:{v2}\"\n\n\
+             [rpc]\nlisten_addr = \"127.0.0.1:{rpc}\"\nenable_cookie_auth = false\ncookie_dir = \"{root}/rpc\"\n\n\
+             [state]\ncache_dir = \"{root}/state\"\nephemeral = false\n\n[mempool]\ndebug_enable_at_height = 0\n\n\
+             [mining]\ninternal_miner = false\nminer_address = \"{miner_address}\"\n\n[tracing]\nuse_color = false\nfilter = \"info\"\n",
+            p2p = p2p_port,
+            peer = peer_p2p_port,
+            v2 = p2p_port + 100,
+            rpc = rpc_port,
+        );
+        let conf = datadir.join("zakurad.toml");
+        std::fs::write(&conf, toml).unwrap();
+        let log = std::fs::File::create(datadir.join("zakurad.log")).unwrap();
+        let child = Command::new(zakurad)
+            .arg("-c")
+            .arg(&conf)
+            .arg("start")
+            .env("KOGANY_YED_RPC_MOCK", "1")
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot start {}: {}", zakurad.display(), e));
+        let rpc = RpcClient::new(&format!("http://127.0.0.1:{}", rpc_port), &RpcAuth { user: "u".into(), password: "p".into() });
+        let mut k = Kogany { rpc, datadir, p2p_port, child };
+        let deadline = Instant::now() + Duration::from_secs(150);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(250));
+            if let Some(status) = k.child.try_wait().unwrap() {
+                panic!("kogany exited at start ({}); see {}/zakurad.log", status, k.datadir.display());
+            }
+            if k.rpc.call("getblockcount", json!([])).is_ok() {
+                return k;
+            }
+        }
+        panic!("kogany never answered RPC; see {}/zakurad.log", k.datadir.display());
+    }
+
+    /// Wait until kogany lists a peer, its only one being `b` (kogany dials it; after `b`
+    /// restarts, `b` is asked to dial kogany back). `b`'s own list would not do: it holds node B.
+    fn wait_peer(&self, b: &Node) {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut asked = Instant::now();
+        while self.call("getpeerinfo", json!([])).as_array().is_none_or(|p| p.is_empty()) {
+            assert!(Instant::now() < deadline, "kogany and node B never connected; see {}/zakurad.log", self.datadir.display());
+            if asked.elapsed() > Duration::from_secs(5) {
+                let _ = b.rpc.call("addnode", json!([format!("127.0.0.1:{}", self.p2p_port), "onetry"]));
+                asked = Instant::now();
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+}
+
+impl Rpc for Kogany {
+    fn client(&self) -> &RpcClient {
+        &self.rpc
+    }
+
+    fn label(&self) -> String {
+        "kogany".into()
+    }
+}
+
+impl Drop for Kogany {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn wait_height(nodes: &[&dyn Rpc], height: u64, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if nodes.iter().all(|n| n.height() >= height) {
@@ -226,8 +345,9 @@ struct Outcome {
     vout0_addresses: Vec<String>,
 }
 
-/// Serves one case in-process, mines one block through the Python miner, returns the block's facts.
-async fn run_case(case: &Case, a: &Node, b: &Node, python: &Path, miner: &Path) -> Outcome {
+/// Serves one case in-process from `a`'s templates, mines one block through the Python miner,
+/// returns the block's facts as `facts` reports them (`a`, or node B when `a` is kogany).
+async fn run_case(case: &Case, a: &dyn Rpc, b: &dyn Rpc, facts: &dyn Rpc, python: &Path, miner: &Path) -> Outcome {
     let before = a.height();
     let config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
@@ -239,7 +359,7 @@ async fn run_case(case: &Case, a: &Node, b: &Node, python: &Path, miner: &Path) 
         equihash: EquihashArg::Fixed(Equihash::REGTEST),
         limits: yolo::Limits::default(),
     };
-    let bound = yolo::bind(a.rpc.clone(), config).await.unwrap();
+    let bound = yolo::bind(a.client().clone(), config).await.unwrap();
     let addr = bound.addr;
     let status_addr = bound.status_addr.unwrap();
     let state = bound.state();
@@ -279,9 +399,9 @@ async fn run_case(case: &Case, a: &Node, b: &Node, python: &Path, miner: &Path) 
     server.abort();
 
     let height = before + 1;
-    assert!(wait_height(&[a, b], height, Duration::from_secs(30)), "{}: nodes did not reach {} ({} / {})", case.name, height, a.height(), b.height());
-    let tag = a.call("yed_gettag", json!([height.to_string()]));
-    let block = a.call("getblock", json!([height.to_string(), 2]));
+    assert!(wait_height(&[a, b, facts], height, Duration::from_secs(30)), "{}: nodes did not reach {} ({} / {} / {})", case.name, height, a.height(), b.height(), facts.height());
+    let tag = facts.call("yed_gettag", json!([height.to_string()]));
+    let block = facts.call("getblock", json!([height.to_string(), 2]));
     let coinbase = &block["tx"][0];
     let script_sig = hex::decode(coinbase["vin"][0]["coinbase"].as_str().unwrap()).unwrap();
     let vout0_addresses = coinbase["vout"][0]["scriptPubKey"]["addresses"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
@@ -291,7 +411,7 @@ async fn run_case(case: &Case, a: &Node, b: &Node, python: &Path, miner: &Path) 
 
 /// Serves yolo with no Yellowback state (no quote, no tag) and mines `blocks` blocks through the
 /// Python miner in one session: the vault mode's walk across the activation height.
-async fn run_plain(name: &str, a: &Node, b: &Node, python: &Path, miner: &Path, user: &str, blocks: u64) {
+async fn run_plain(name: &str, a: &dyn Rpc, b: &dyn Rpc, python: &Path, miner: &Path, user: &str, blocks: u64) {
     let before = a.height();
     let config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
@@ -303,7 +423,7 @@ async fn run_plain(name: &str, a: &Node, b: &Node, python: &Path, miner: &Path, 
         equihash: EquihashArg::Fixed(Equihash::REGTEST),
         limits: yolo::Limits::default(),
     };
-    let bound = yolo::bind(a.rpc.clone(), config).await.unwrap();
+    let bound = yolo::bind(a.client().clone(), config).await.unwrap();
     let addr = bound.addr;
     let status_addr = bound.status_addr.unwrap();
     let state = bound.state();
@@ -368,6 +488,12 @@ async fn payout_text_grid_against_a_regtest_node() {
     let pool_node_args: Vec<String> = std::env::var("YOLO_REGTEST_POOL_NODE_ARGS").unwrap_or_default().split_whitespace().map(String::from).collect();
     let legacy = std::env::var("YOLO_REGTEST_LEGACY").is_ok_and(|v| !v.is_empty() && v != "0");
     let vault: Option<u64> = if legacy { None } else { Some(std::env::var("YOLO_REGTEST_VAULT").ok().map_or(DEFAULT_VAULT_HEIGHT, |v| v.parse().expect("YOLO_REGTEST_VAULT is a height"))) };
+    let kogany_bin = std::env::var_os("YOLO_REGTEST_KOGANY").filter(|v| !v.is_empty()).map(PathBuf::from);
+    if let Some(z) = &kogany_bin {
+        assert!(z.exists(), "YOLO_REGTEST_KOGANY = {} does not exist", z.display());
+        assert!(vault.is_some(), "YOLO_REGTEST_KOGANY runs in the vault mode only (kogany has no -yellowback switch)");
+        log(&format!("kogany mode: the pool node is {}", z.display()));
+    }
     if let Some(h) = vault {
         assert!(h >= 104, "YOLO_REGTEST_VAULT must be at least 104 (yolo mines 102..=h+1 across it)");
         log(&format!("vault mode: -nuparams={}:{}", VAULT_BRANCH_ID, h));
@@ -397,12 +523,41 @@ async fn payout_text_grid_against_a_regtest_node() {
     assert_eq!(a.height(), 101, "node A kept its chain across the restart");
     b.start(&ycashd);
     assert!(wait_height(&[&a, &b], 101, Duration::from_secs(60)), "node B did not sync the initial chain");
+    // The kogany mode: kogany joins as a third node, dialling A, and serves the pool; A and B stay
+    // the wallet (mineraddress, set_create, generate) and the C++ check of every block kogany
+    // builds and yolo's miner solves (kogany plan W8-c). A's 101 blocks reach kogany by submitblock.
+    let kogany = kogany_bin.as_ref().map(|z| {
+        let k = Kogany::start(z, &scratch, rpc_base + 2, p2p_base + 2, p2p_base, vault.unwrap(), &mineraddress);
+        for height in 1..=101u64 {
+            let hash = a.call("getblockhash", json!([height]));
+            let raw = a.call("getblock", json!([hash, 0]));
+            let verdict = k.call("submitblock", json!([raw]));
+            assert!(verdict.is_null() || verdict == json!("duplicate"), "kogany refused block {}: {}", height, verdict);
+        }
+        k.wait_peer(&a);
+        assert!(wait_height(&[&k], 101, Duration::from_secs(60)), "kogany did not take the initial chain");
+        k
+    });
+    // The node yolo serves: kogany in the kogany mode, else node A.
+    fn pool<'x>(kogany: &'x Option<Kogany>, a: &'x Node) -> &'x dyn Rpc {
+        match kogany {
+            Some(k) => k,
+            None => a,
+        }
+    }
     if let Some(h) = vault {
         // Across the activation through yolo: templates before, at and after the upgrade height.
-        let info = a.call("getblockchaininfo", json!([]));
+        let info = pool(&kogany, &a).call("getblockchaininfo", json!([]));
         assert_ne!(info["consensus"]["nextblock"], json!(VAULT_BRANCH_ID), "the upgrade is not active at 102");
         let user = b.call("getnewaddress", json!([])).as_str().unwrap().to_string();
-        run_plain("across-vault-activation", &a, &b, &python, &miner, &user, h + 1 - a.height()).await;
+        run_plain("across-vault-activation", pool(&kogany, &a), &b, &python, &miner, &user, h + 1 - a.height()).await;
+        if let Some(k) = &kogany {
+            assert!(wait_height(&[&a], h + 1, Duration::from_secs(30)), "node A did not take kogany's blocks");
+            let info = k.call("getblockchaininfo", json!([]));
+            assert_eq!(info["consensus"]["chaintip"], json!(VAULT_BRANCH_ID), "kogany: the tip is past the vault activation");
+            assert_eq!(info["upgrades"][VAULT_BRANCH_ID]["activationheight"], json!(h), "kogany: Vault height");
+            assert_eq!(k.call("getbestblockhash", json!([])), b.call("getbestblockhash", json!([])), "kogany and node B share the tip");
+        }
         for node in [&a, &b] {
             let info = node.call("getblockchaininfo", json!([]));
             assert_eq!(info["consensus"]["chaintip"], json!(VAULT_BRANCH_ID), "node {}: the tip is past the vault activation", node.index);
@@ -430,10 +585,17 @@ async fn payout_text_grid_against_a_regtest_node() {
         a.start(&ycashd);
         b.start(&ycashd);
         assert!(wait_height(&[&a, &b], height, Duration::from_secs(60)), "the nodes did not come back at {}", height);
+        if let Some(k) = &kogany {
+            k.wait_peer(&a);
+            assert!(wait_height(&[k], height, Duration::from_secs(60)), "kogany did not follow node A to {}", height);
+        }
         log(&format!("YED attestor set {} at {}; nodes restarted with it", setid, height));
     }
-    a.call("yed_setquote", json!([QUOTE_MICRO_USD, 1]));
-    let template = a.call("getblocktemplate", json!([]));
+    let ack = pool(&kogany, &a).call("yed_setquote", json!([QUOTE_MICRO_USD, 1]));
+    // The tag's payout key: mineraddress's on ycashd; on kogany the mock's fixture key until W5-f,
+    // which yed_setquote reports as nextTag.payoutAddress.
+    let tag_payout = if kogany.is_some() { ack["nextTag"]["payoutAddress"].as_str().expect("yed_setquote nextTag.payoutAddress").to_string() } else { mineraddress.clone() };
+    let template = pool(&kogany, &a).call("getblocktemplate", json!([]));
     let flags = hex::decode(template["coinbaseaux"]["flags"].as_str().unwrap_or("")).unwrap();
     assert_eq!(flags.len(), 37, "the template carries a 37-byte quote tag: {:?}", template["coinbaseaux"]);
     let miner_addr = b.call("getnewaddress", json!([])).as_str().unwrap().to_string();
@@ -452,7 +614,7 @@ async fn payout_text_grid_against_a_regtest_node() {
         case("text-90", None, Some(&long_text), false, &miner_addr),
     ];
     for case in &cases {
-        let o = run_case(case, &a, &b, &python, &miner).await;
+        let o = run_case(case, pool(&kogany, &a), &b, &a, &python, &miner).await;
         let hp = height_push(o.height as u32);
         let rebuilt = |t: &str| {
             let mut want = hp.clone();
@@ -463,22 +625,22 @@ async fn payout_text_grid_against_a_regtest_node() {
         };
         match case.name {
             "username" => {
-                assert_quote(case.name, &o.tag, &mineraddress);
+                assert_quote(case.name, &o.tag, &tag_payout);
                 assert_eq!(o.vout0_addresses, vec![miner_addr.clone()], "no --payout pays the miner's username");
                 assert!(o.script_sig.starts_with(&hp) && o.script_sig.ends_with(&flags), "no --text keeps the node's scriptSig");
             }
             "fixed" => {
-                assert_quote(case.name, &o.tag, &mineraddress);
+                assert_quote(case.name, &o.tag, &tag_payout);
                 assert_eq!(o.vout0_addresses, vec![mineraddress.clone()], "--payout pays the fixed address");
                 assert!(o.script_sig.starts_with(&hp) && o.script_sig.ends_with(&flags), "no --text keeps the node's scriptSig");
             }
             "username-text" => {
-                assert_quote(case.name, &o.tag, &mineraddress);
+                assert_quote(case.name, &o.tag, &tag_payout);
                 assert_eq!(o.vout0_addresses, vec![miner_addr.clone()], "no --payout pays the miner's username");
                 assert_eq!(o.script_sig, rebuilt(text), "--text scriptSig = height push ‖ flags ‖ push(text)");
             }
             "fixed-text" => {
-                assert_quote(case.name, &o.tag, &mineraddress);
+                assert_quote(case.name, &o.tag, &tag_payout);
                 assert_eq!(o.vout0_addresses, vec![miner_addr.clone()], "--payout pays the fixed address, whatever the username");
                 assert_eq!(o.script_sig, rebuilt(text), "--text scriptSig = height push ‖ flags ‖ push(text)");
             }
@@ -490,7 +652,7 @@ async fn payout_text_grid_against_a_regtest_node() {
                 assert_eq!(o.script_sig, want, "--no-flags scriptSig = height push ‖ push(text)");
             }
             "text-90" => {
-                assert_quote(case.name, &o.tag, &mineraddress);
+                assert_quote(case.name, &o.tag, &tag_payout);
                 assert_eq!(o.script_sig.len(), 100, "--text at the scriptSig limit: exactly 100 bytes");
                 let fixed = hp.len() + flags.len();
                 let used = 100 - fixed - 1;

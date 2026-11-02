@@ -7,7 +7,9 @@
 # Nightly tier (workflow_dispatch with tier=nightly; component repos carry no schedule, the node
 # lines do):
 #   regtest (ubuntu)       tests/regtest.rs against a real ycashd of each node line, the binary taken
-#                          from that node line's own CI build artifact (see the job's comment)
+#                          from that node line's own CI build artifact (see the job's comment); the
+#                          kogany entry (report-only) serves yolo from a zakurad built from a pinned
+#                          kogany commit, beside two ycash6 nodes (kogany plan W8-c)
 #
 # Third-party actions are pinned by commit, never by tag; the comment carries the tag (bump both).
 name: ci
@@ -114,8 +116,10 @@ jobs:
   # (retention 3 days, so "newest run" works).
   regtest:
     if: github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly'
-    name: regtest (${{ matrix.node }})
+    name: regtest (${{ matrix.node_line || matrix.node }})
     needs: check
+    # The kogany entry is report-only (kogany plan §5, W8-c): it never fails the run.
+    continue-on-error: ${{ matrix.node_line == 'kogany' }}
     strategy:
       fail-fast: false
       matrix:
@@ -126,8 +130,20 @@ jobs:
           - node: ycash6
             of_record: feature/yellowback
             pool_node_args: -allowdeprecated=none
+          # The third node line (AGENTS.md "The third node line"): yolo serves a kogany node's
+          # templates (YOLO_REGTEST_KOGANY, tests/regtest.rs "The kogany mode"), the ycash6 nodes
+          # (always upgrade/vault: the mode needs the Vault upgrade) hold the wallet and check every
+          # block. zakurad is built here from kogany_ref, kogany's vaults/kogany-compat at W8-a/b
+          # plus W6-a (kogany's own Actions stay off, so it publishes no artifact). Until
+          # boyfromcave/zakura-common-ycash exists on GitHub (kogany plan K-2), kogany's
+          # [patch.crates-io] cannot resolve and this entry fails at the build step.
+          - node: ycash6
+            node_line: kogany
+            of_record: upgrade/vault
+            pool_node_args: ""
+            kogany_ref: 34bdc2729bb6162019039b462b801460d3b2f426
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.node_line == 'kogany' && 180 || 60 }}
     env:
       NODE_REPO: boyfromcave/${{ matrix.node }}
       NODE_ARTIFACT: node-bin
@@ -136,7 +152,9 @@ jobs:
       REF_NAME: ${{ github.ref_name }}
       # The node branch, from a fixed list: this run's branch when it is one of the two lines,
       # else the node line's branch of record. Nothing a dispatcher types reaches the checkout.
-      NODE_BRANCH: ${{ contains(fromJSON('["upgrade/vault", "harden/yellowback"]'), github.ref_name) && github.ref_name || matrix.of_record }}
+      # The kogany entry always takes upgrade/vault (its of_record).
+      NODE_BRANCH: ${{ matrix.node_line != 'kogany' && contains(fromJSON('["upgrade/vault", "harden/yellowback"]'), github.ref_name) && github.ref_name || matrix.of_record }}
+      NODE_LINE: ${{ matrix.node_line || matrix.node }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -153,6 +171,30 @@ jobs:
           sparse-checkout: |
             contrib/yellowback/devnet
             zcutil
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: matrix.node_line == 'kogany'
+        with:
+          repository: boyfromcave/kogany
+          ref: ${{ matrix.kogany_ref }}
+          path: kogany
+          persist-credentials: false
+      # kogany's setup-zakura-build action, run as its script (librocksdb-dev; no libclang, no protoc).
+      - name: kogany build packages
+        if: matrix.node_line == 'kogany'
+        env:
+          INSTALL_LIBCLANG: "false"
+          INSTALL_PROTOC: "false"
+        run: bash kogany/.github/actions/setup-zakura-build/install-ubuntu-packages.sh
+      # kogany's own rust-toolchain.toml applies inside its tree. Not cached (another repository's
+      # build in this repository's cache scope).
+      - name: build zakurad (kogany, --features ycash)
+        if: matrix.node_line == 'kogany'
+        working-directory: kogany
+        env:
+          CARGO_INCREMENTAL: 0
+        run: |
+          cargo build --locked -p zakura --features ycash --bin zakurad
+          ./target/debug/zakurad --version
       - name: download ycashd from the node line's CI
         env:
           GH_TOKEN: ${{ github.token }}
@@ -201,5 +243,8 @@ jobs:
           # upgrade/vault nodes: Yellowback is a module of the Vault upgrade (README, "The vault
           # network upgrade"); the test mines 102..=h+1 across the activation first.
           # Other node lines have no vault upgrade: YOLO_REGTEST_LEGACY keeps the -yellowback flags.
-          if [ "$REF_NAME" = upgrade/vault ]; then export YOLO_REGTEST_VAULT=110; else export YOLO_REGTEST_LEGACY=1; fi
+          # The kogany line: yolo serves kogany's templates, in the vault mode always.
+          if [ "$NODE_LINE" = kogany ]; then
+            export YOLO_REGTEST_VAULT=110 YOLO_REGTEST_KOGANY="$GITHUB_WORKSPACE/kogany/target/debug/zakurad"
+          elif [ "$REF_NAME" = upgrade/vault ]; then export YOLO_REGTEST_VAULT=110; else export YOLO_REGTEST_LEGACY=1; fi
           cargo test --locked --features regtest --test regtest -- --nocapture
