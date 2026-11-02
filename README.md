@@ -146,7 +146,7 @@ yolo [OPTIONS]
   --port <PORT>              stratum listen port                          [default: 3333]
   --bind <BIND>              address to bind the stratum listener to     [default: 0.0.0.0]
   --password <PASSWORD>      password miners must send in mining.authorize (unset: any)
-  --rpc <URL>                node JSON-RPC URL (default from --conf, else http://127.0.0.1:18232 on regtest / 8832)
+  --rpc <URL>                node JSON-RPC URL (default from --conf, else http://127.0.0.1:18832 on regtest / 8832)
   --rpc-user <USER>          RPC username (with --rpc-password)
   --rpc-password <PASSWORD>  RPC password (with --rpc-user)
   --rpc-cookie <PATH>        read the RPC credentials from the node's .cookie file
@@ -266,7 +266,7 @@ through 111 with no Yellowback state (case `across-vault-activation`: every bloc
 tip's branch ID `6d5b7a31` on both nodes), then node A creates the YED attestor set
 (`set_create`, one block), both nodes restart with `-yellowbackattestorset=<setid>`, and the six
 cases run as above. `YOLO_REGTEST_VAULT=<h>` (h ≥ 104) moves the activation height.
-`YOLO_REGTEST_KOGANY=<zakurad>` (a kogany node built with `--features ycash`, the third node
+`YOLO_REGTEST_KOGANY=<koganyd>` (a kogany node built with `--features ycash`, the third node
 line) runs the same cases with yolo serving kogany's templates: kogany joins as a third node
 peered with node A, the two ycashd nodes keep the wallet roles and check every block (kogany never
 solves Equihash), and until kogany registers the YED module its tag carries its mock's payout key.
