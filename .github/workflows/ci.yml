@@ -8,8 +8,10 @@
 # lines do):
 #   regtest (ubuntu)       tests/regtest.rs against a real ycashd of each node line, the binary taken
 #                          from that node line's own CI build artifact (see the job's comment); the
-#                          kogany entry (report-only) serves yolo from a zakurad built from a pinned
-#                          kogany commit, beside two ycash6 nodes (kogany plan W8-c)
+#                          kogany entry (report-only) serves yolo from a zakurad at a pinned kogany
+#                          commit, beside two ycash6 nodes (kogany plan W8-c): kogany's zakurad-bin
+#                          artifact at that commit when one exists (the contract of the workspace's
+#                          docs/plans/kogany/ci-design.md), else a build at the commit
 #
 # Third-party actions are pinned by commit, never by tag; the comment carries the tag (bump both).
 name: ci
@@ -17,8 +19,9 @@ name: ci
 on:
   push:
     # The one branch list: harden/yellowback (P1 hardening), upgrade/vault (the network upgrade),
-    # main (the branch of record, AGENTS.md rule 2).
-    branches: &branches [main, harden/yellowback, upgrade/vault]
+    # main (the branch of record, AGENTS.md rule 2), vaults/kogany-compat (the kogany work's
+    # integration branch, kogany plan §4.2 rule 0).
+    branches: &branches [main, harden/yellowback, upgrade/vault, vaults/kogany-compat]
   pull_request:
     branches: *branches
   workflow_dispatch:
@@ -113,7 +116,8 @@ jobs:
   # harden/yellowback -> harden/yellowback, anything else -> the node line's branch of record.
   # NODE_ARTIFACT is the node lines' yellowback-tests `build` job artifact `node-bin`: node-bin.tar
   # (ycash-dd) or node-bin.tgz (ycash6), whose tar keeps src/ycashd and src/ycash-cli executable
-  # (retention 3 days, so "newest run" works).
+  # (ycash6 keeps it 30 days outside pull requests and refreshes a branch tip nightly; ycash-dd 3 days;
+  # "newest run" takes the newest that still has it).
   regtest:
     if: github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly'
     name: regtest (${{ matrix.node_line || matrix.node }})
@@ -132,14 +136,16 @@ jobs:
             pool_node_args: -allowdeprecated=none
           # The third node line (AGENTS.md "The third node line"): yolo serves a kogany node's
           # templates (YOLO_REGTEST_KOGANY, tests/regtest.rs "The kogany mode"), the ycash6 nodes
-          # (always upgrade/vault: the mode needs the Vault upgrade) hold the wallet and check every
-          # block. zakurad is built here from kogany_ref, kogany's vaults/kogany-compat at W8-a/b
-          # plus W6-a (kogany's own Actions stay off, so it publishes no artifact). Until
+          # (always vaults/kogany-compat, the kogany work's ycash6 branch: the mode needs the Vault
+          # upgrade) hold the wallet and check every block. zakurad at kogany_ref, kogany's
+          # vaults/kogany-compat at W8-a/b plus W6-a: kogany's zakurad-bin artifact of a push,
+          # schedule or dispatch run at that commit when one exists, else built here. Until
           # boyfromcave/zakura-common-ycash exists on GitHub (kogany plan K-2), kogany's
-          # [patch.crates-io] cannot resolve and this entry fails at the build step.
+          # [patch.crates-io] cannot resolve, kogany publishes nothing, and this entry fails at
+          # the build step.
           - node: ycash6
             node_line: kogany
-            of_record: upgrade/vault
+            of_record: vaults/kogany-compat
             pool_node_args: ""
             kogany_ref: 34bdc2729bb6162019039b462b801460d3b2f426
     runs-on: ubuntu-latest
@@ -152,7 +158,7 @@ jobs:
       REF_NAME: ${{ github.ref_name }}
       # The node branch, from a fixed list: this run's branch when it is one of the two lines,
       # else the node line's branch of record. Nothing a dispatcher types reaches the checkout.
-      # The kogany entry always takes upgrade/vault (its of_record).
+      # The kogany entry always takes vaults/kogany-compat (its of_record).
       NODE_BRANCH: ${{ matrix.node_line != 'kogany' && contains(fromJSON('["upgrade/vault", "harden/yellowback"]'), github.ref_name) && github.ref_name || matrix.of_record }}
       NODE_LINE: ${{ matrix.node_line || matrix.node }}
     steps:
@@ -171,6 +177,33 @@ jobs:
           sparse-checkout: |
             contrib/yellowback/devnet
             zcutil
+      # zakurad-bin (workspace docs/plans/kogany/ci-design.md, "Artifact contracts"): kogany's
+      # kogany-yellowback.yml uploads zakurad-bin.tgz (zakurad, zakurad-bin.json; dev profile,
+      # --features ycash, ubuntu-24.04, linked against the runner's librocksdb) from push, schedule
+      # and dispatch runs. Only such a run at kogany_ref is taken, never a pull_request run.
+      - name: kogany's zakurad-bin at kogany_ref
+        id: zakurad
+        if: matrix.node_line == 'kogany'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KOGANY_REF: ${{ matrix.kogany_ref }}
+        run: |
+          case "$KOGANY_REF" in *[!0-9a-f]*|'') echo "::error::kogany_ref is not a commit id"; exit 1 ;; esac
+          trusted='select(.event == "push" or .event == "schedule" or .event == "workflow_dispatch")'
+          runs=$(gh run list -R boyfromcave/kogany -w kogany-yellowback.yml -c "$KOGANY_REF" -L 20 --json databaseId,event,headSha \
+            -q ".[] | select(.headSha == \"$KOGANY_REF\") | $trusted | .databaseId" 2>/dev/null || true)
+          for r in $runs; do
+            if gh run download "$r" -R boyfromcave/kogany -n zakurad-bin -D "$RUNNER_TEMP/zk-dl" 2>/dev/null \
+               && [ -f "$RUNNER_TEMP/zk-dl/zakurad-bin.tgz" ]; then
+              mkdir -p "$RUNNER_TEMP/zk" && tar xzf "$RUNNER_TEMP/zk-dl/zakurad-bin.tgz" -C "$RUNNER_TEMP/zk"
+              cat "$RUNNER_TEMP/zk/zakurad-bin.json"
+              echo "ZAKURAD=$RUNNER_TEMP/zk/zakurad" >> "$GITHUB_ENV"
+              echo "got=true" >> "$GITHUB_OUTPUT"
+              echo "zakurad from boyfromcave/kogany run $r"; exit 0
+            fi
+          done
+          echo "got=false" >> "$GITHUB_OUTPUT"
+          echo "no zakurad-bin of boyfromcave/kogany at $KOGANY_REF: building it here"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         if: matrix.node_line == 'kogany'
         with:
@@ -178,7 +211,9 @@ jobs:
           ref: ${{ matrix.kogany_ref }}
           path: kogany
           persist-credentials: false
-      # kogany's setup-zakura-build action, run as its script (librocksdb-dev; no libclang, no protoc).
+          sparse-checkout: ${{ steps.zakurad.outputs.got == 'true' && '.github/actions/setup-zakura-build' || '' }}
+      # kogany's setup-zakura-build action, run as its script (librocksdb-dev; no libclang, no
+      # protoc): the build needs it, and so does a downloaded zakurad at run time.
       - name: kogany build packages
         if: matrix.node_line == 'kogany'
         env:
@@ -188,13 +223,18 @@ jobs:
       # kogany's own rust-toolchain.toml applies inside its tree. Not cached (another repository's
       # build in this repository's cache scope).
       - name: build zakurad (kogany, --features ycash)
-        if: matrix.node_line == 'kogany'
+        if: matrix.node_line == 'kogany' && steps.zakurad.outputs.got != 'true'
         working-directory: kogany
         env:
           CARGO_INCREMENTAL: 0
         run: |
           cargo build --locked -p zakura --features ycash --bin zakurad
-          ./target/debug/zakurad --version
+          echo "ZAKURAD=$GITHUB_WORKSPACE/kogany/target/debug/zakurad" >> "$GITHUB_ENV"
+      - name: zakurad runs here
+        if: matrix.node_line == 'kogany'
+        run: |
+          if ldd "$ZAKURAD" | grep 'not found'; then echo "::error::zakurad needs a library this runner lacks"; exit 1; fi
+          "$ZAKURAD" --version
       - name: download ycashd from the node line's CI
         env:
           GH_TOKEN: ${{ github.token }}
@@ -245,6 +285,6 @@ jobs:
           # Other node lines have no vault upgrade: YOLO_REGTEST_LEGACY keeps the -yellowback flags.
           # The kogany line: yolo serves kogany's templates, in the vault mode always.
           if [ "$NODE_LINE" = kogany ]; then
-            export YOLO_REGTEST_VAULT=110 YOLO_REGTEST_KOGANY="$GITHUB_WORKSPACE/kogany/target/debug/zakurad"
+            export YOLO_REGTEST_VAULT=110 YOLO_REGTEST_KOGANY="$ZAKURAD"
           elif [ "$REF_NAME" = upgrade/vault ]; then export YOLO_REGTEST_VAULT=110; else export YOLO_REGTEST_LEGACY=1; fi
           cargo test --locked --features regtest --test regtest -- --nocapture
