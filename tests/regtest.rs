@@ -40,7 +40,7 @@
 //! `YOLO_REGTEST_LEGACY=1` runs against a node without the vault upgrade (`harden/yellowback`)
 //! instead: `NODE_ARGS` as they are, with `-experimentalfeatures -yellowback`.
 //!
-//! **The kogany mode** (`YOLO_REGTEST_KOGANY=<zakurad built with --features ycash>`, vault mode
+//! **The kogany mode** (`YOLO_REGTEST_KOGANY=<koganyd built with --features ycash>`, vault mode
 //! only; kogany plan W8-c): a kogany node (`Kogany`) joins as a third node, dialling node A over
 //! P2P, and yolo serves *its* templates; nodes A and B stay ycashd and keep the wallet roles
 //! (`getnewaddress`, `generate`, `set_create`; kogany is wallet-less, plan K-3). kogany never
@@ -223,7 +223,7 @@ impl Drop for Node {
     }
 }
 
-/// The kogany mode's pool node (`YOLO_REGTEST_KOGANY=<zakurad>`): a `zakurad --features ycash`
+/// The kogany mode's pool node (`YOLO_REGTEST_KOGANY=<koganyd>`): a `koganyd --features ycash`
 /// on the same Ycash regtest, wallet-less (kogany plan K-3), dialling ycashd node B over P2P. It
 /// validates Equihash (48,5) by shape only and never solves it (K-16): the Python miner solves its
 /// templates and node B, which verifies the proof of work, must accept every block. Until plan
@@ -238,7 +238,7 @@ struct Kogany {
 }
 
 impl Kogany {
-    fn start(zakurad: &Path, scratch: &Path, rpc_port: u16, p2p_port: u16, peer_p2p_port: u16, vault: u64, miner_address: &str) -> Kogany {
+    fn start(koganyd: &Path, scratch: &Path, rpc_port: u16, p2p_port: u16, peer_p2p_port: u16, vault: u64, miner_address: &str) -> Kogany {
         let datadir = scratch.join("kogany");
         let _ = std::fs::remove_dir_all(&datadir);
         std::fs::create_dir_all(&datadir).unwrap();
@@ -256,10 +256,10 @@ impl Kogany {
             v2 = p2p_port + 100,
             rpc = rpc_port,
         );
-        let conf = datadir.join("zakurad.toml");
+        let conf = datadir.join("koganyd.toml");
         std::fs::write(&conf, toml).unwrap();
-        let log = std::fs::File::create(datadir.join("zakurad.log")).unwrap();
-        let child = Command::new(zakurad)
+        let log = std::fs::File::create(datadir.join("koganyd.log")).unwrap();
+        let child = Command::new(koganyd)
             .arg("-c")
             .arg(&conf)
             .arg("start")
@@ -267,20 +267,20 @@ impl Kogany {
             .stdout(log.try_clone().unwrap())
             .stderr(log)
             .spawn()
-            .unwrap_or_else(|e| panic!("cannot start {}: {}", zakurad.display(), e));
+            .unwrap_or_else(|e| panic!("cannot start {}: {}", koganyd.display(), e));
         let rpc = RpcClient::new(&format!("http://127.0.0.1:{}", rpc_port), &RpcAuth { user: "u".into(), password: "p".into() });
         let mut k = Kogany { rpc, datadir, p2p_port, child };
         let deadline = Instant::now() + Duration::from_secs(150);
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(250));
             if let Some(status) = k.child.try_wait().unwrap() {
-                panic!("kogany exited at start ({}); see {}/zakurad.log", status, k.datadir.display());
+                panic!("kogany exited at start ({}); see {}/koganyd.log", status, k.datadir.display());
             }
             if k.rpc.call("getblockcount", json!([])).is_ok() {
                 return k;
             }
         }
-        panic!("kogany never answered RPC; see {}/zakurad.log", k.datadir.display());
+        panic!("kogany never answered RPC; see {}/koganyd.log", k.datadir.display());
     }
 
     /// Wait until kogany lists a peer, its only one being `b` (kogany dials it; after `b`
@@ -289,7 +289,7 @@ impl Kogany {
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut asked = Instant::now();
         while self.call("getpeerinfo", json!([])).as_array().is_none_or(|p| p.is_empty()) {
-            assert!(Instant::now() < deadline, "kogany and node B never connected; see {}/zakurad.log", self.datadir.display());
+            assert!(Instant::now() < deadline, "kogany and node B never connected; see {}/koganyd.log", self.datadir.display());
             if asked.elapsed() > Duration::from_secs(5) {
                 let _ = b.rpc.call("addnode", json!([format!("127.0.0.1:{}", self.p2p_port), "onetry"]));
                 asked = Instant::now();

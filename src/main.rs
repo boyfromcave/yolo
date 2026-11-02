@@ -37,7 +37,7 @@ struct Cli {
     /// Password miners must send in mining.authorize (unset: any).
     #[arg(long)]
     password: Option<String>,
-    /// Node JSON-RPC URL (default from --conf, else http://127.0.0.1:18232 on regtest / 8832).
+    /// Node JSON-RPC URL (default from --conf, else http://127.0.0.1:18832 on regtest / 8832).
     #[arg(long, value_name = "URL")]
     rpc: Option<String>,
     /// RPC username (with --rpc-password).
@@ -94,7 +94,7 @@ fn main() {
     }
 
     let conf = cli.conf.as_deref().map(|p| ConfFile::load(p).unwrap_or_else(|e| fail(&e)));
-    let url = cli.rpc.clone().or_else(|| conf.as_ref().map(ConfFile::url)).unwrap_or_else(|| "http://127.0.0.1:18232".to_string());
+    let url = cli.rpc.clone().or_else(|| conf.as_ref().map(ConfFile::url)).unwrap_or_else(|| "http://127.0.0.1:18832".to_string());
     let auth = if let Some(cookie) = &cli.rpc_cookie {
         read_cookie(cookie).unwrap_or_else(|e| fail(&e))
     } else if let (Some(user), Some(password)) = (cli.rpc_user.clone(), cli.rpc_password.clone()) {
