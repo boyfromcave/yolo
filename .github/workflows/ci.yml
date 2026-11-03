@@ -194,8 +194,8 @@ jobs:
             -q ".[] | select(.headSha == \"$KOGANY_REF\") | $trusted | .databaseId" 2>/dev/null || true)
           for r in $runs; do
             if gh run download "$r" -R boyfromcave/kogany -n koganyd-bin -D "$RUNNER_TEMP/zk-dl" 2>/dev/null \
-               && [ -f "$RUNNER_TEMP/zk-dl/koganyd-bin.tgz" ]; then
-              mkdir -p "$RUNNER_TEMP/zk" && tar xzf "$RUNNER_TEMP/zk-dl/koganyd-bin.tgz" -C "$RUNNER_TEMP/zk"
+               && [ -f "$RUNNER_TEMP/zk-dl/koganyd-bin.tgz" ] && mkdir -p "$RUNNER_TEMP/zk" \
+               && tar xzf "$RUNNER_TEMP/zk-dl/koganyd-bin.tgz" -C "$RUNNER_TEMP/zk"; then
               cat "$RUNNER_TEMP/zk/koganyd-bin.json"
               echo "KOGANYD=$RUNNER_TEMP/zk/koganyd" >> "$GITHUB_ENV"
               echo "got=true" >> "$GITHUB_OUTPUT"
@@ -208,7 +208,8 @@ jobs:
         if: matrix.node_line == 'kogany'
         with:
           repository: boyfromcave/kogany
-          ref: ${{ matrix.kogany_ref }}
+          # The literal of matrix.kogany_ref (bump both): a fixed commit, nothing a dispatcher types.
+          ref: dd834da8b77e882b9e6a00b3ce70f2b30b930c37
           path: kogany
           persist-credentials: false
           sparse-checkout: ${{ steps.koganyd.outputs.got == 'true' && '.github/actions/setup-zakura-build' || '' }}
@@ -232,7 +233,10 @@ jobs:
           echo "KOGANYD=$GITHUB_WORKSPACE/kogany/target/debug/koganyd" >> "$GITHUB_ENV"
       - name: koganyd runs here
         if: matrix.node_line == 'kogany'
+        env:
+          KOGANY_REF: ${{ matrix.kogany_ref }}
         run: |
+          [ "$(git -C kogany rev-parse HEAD)" = "$KOGANY_REF" ] || { echo "::error::the kogany checkout's ref differs from matrix.kogany_ref"; exit 1; }
           if ldd "$KOGANYD" | grep 'not found'; then echo "::error::koganyd needs a library this runner lacks"; exit 1; fi
           "$KOGANYD" --version
       - name: download ycashd from the node line's CI
