@@ -65,11 +65,12 @@ impl ConfFile {
         Ok(ConfFile::parse(&text))
     }
 
-    /// Default RPC port for the network the conf selects (Ycash: mainnet 8832, regtest 18232; the
-    /// testnets fast 18832, slow 18932, legacy 19032).
+    /// Default RPC port for the network the conf selects, ycashd's (chainparamsbase.cpp): mainnet
+    /// 8832, regtest 18832 (shared with the fast testnet; 18232 is Zcash's), the testnets fast 18832,
+    /// slow 18932, legacy 19032.
     pub fn default_rpc_port(&self) -> u16 {
         if self.regtest {
-            18232
+            18832
         } else if self.testnet {
             match self.testnetprofile.as_deref() {
                 Some("slow") => 18932,
@@ -242,7 +243,7 @@ mod tests {
         let c = ConfFile::parse("testnet=1\n");
         assert_eq!(c.url(), "http://127.0.0.1:18832");
         assert_eq!(ConfFile::parse("").url(), "http://127.0.0.1:8832");
-        assert_eq!(ConfFile::parse("regtest=1").url(), "http://127.0.0.1:18232");
+        assert_eq!(ConfFile::parse("regtest=1").url(), "http://127.0.0.1:18832");
         assert_eq!(ConfFile::parse("testnet=1\ntestnetprofile=slow\n").url(), "http://127.0.0.1:18932");
         assert_eq!(ConfFile::parse("testnet=1\ntestnetprofile=legacy\n").url(), "http://127.0.0.1:19032");
         assert_eq!(ConfFile::parse("testnet=1\ntestnetprofile=fast\n").network_subdir(), Ok(Some("testnet-yb-fast")));
@@ -253,6 +254,16 @@ mod tests {
         // rpcbind is a listen address, never a connect host; rpcconnect is
         assert_eq!(ConfFile::parse("rpcbind=0.0.0.0\n").url(), "http://127.0.0.1:8832");
         assert_eq!(ConfFile::parse("rpcbind=0.0.0.0\nrpcconnect=10.0.0.5\n").url(), "http://10.0.0.5:8832");
+    }
+
+    #[test]
+    fn regtest_default_port_is_ycashd() {
+        // ycashd's regtest RPC port is 18832 (CBaseRegTestParams), as on the fast testnet; 18232 is
+        // zcashd's, and a yolo with no rpcport= on Ycash regtest reached nothing there.
+        let c = ConfFile::parse("regtest=1\n");
+        assert_eq!(c.default_rpc_port(), 18832);
+        assert_eq!(c.default_rpc_port(), ConfFile::parse("testnet=1\ntestnetprofile=fast\n").default_rpc_port());
+        assert_eq!(ConfFile::parse("regtest=1\nrpcport=18700\n").url(), "http://127.0.0.1:18700");
     }
 
     #[test]
