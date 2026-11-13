@@ -48,6 +48,9 @@ pub struct Limits {
     /// `--share-ratio`: the target sent to miners is this many times easier than the block's
     /// (capped at the all-ones target). 1 = the block target, as the Perl did.
     pub share_ratio: u32,
+    /// `--share-target-round`: send and check the share target rounded down to a power of two
+    /// (`work::round_share_target`); off by default, no effect at `share_ratio` 1.
+    pub share_target_round: bool,
 }
 
 impl Default for Limits {
@@ -63,6 +66,7 @@ impl Default for Limits {
             address_cache_ttl: Duration::from_secs(600),
             check_pow: true,
             share_ratio: 1,
+            share_target_round: false,
         }
     }
 }
@@ -281,6 +285,7 @@ impl Shared {
             "highHash": g.high_hash,
             "shares": g.shares,
             "shareRatio": self.limits.share_ratio,
+            "shareTargetRound": self.limits.share_target_round,
             "uptimeSeconds": self.started.elapsed().as_secs(),
         })
     }

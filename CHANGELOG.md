@@ -2,6 +2,10 @@
 
 ## Unreleased — header time after an idle chain, shares, stale submits
 
+- `--share-target-round` (off by default): the share target is sent and checked rounded down to a
+  power of two, within B ≤ R ≤ S (B the block target, S the `--share-ratio` target; R > S/2 unless
+  it is B), for miners that may lose precision turning the target into a difficulty and back (a
+  candidate cause of miniZ's high-hash rate on testnet-yb-fast). `/status` `shareTargetRound`.
 - A submit for a job on a parent that is no longer the tip (a newer block came in, or the pool's
   own block was just accepted) or for an unknown job id is **stale**: answered at once with
   `[21, "Stale share" | "Job not found", null]`, never sent to `submitblock`, never counted against

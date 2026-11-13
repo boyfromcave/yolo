@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 use crate::codec::dsha256;
 use crate::poller::job_time;
 use crate::state::State;
-use crate::work::{assemble_block, assemble_header, build_work, meets_target, share_target, BuildParams, Submit, Work};
+use crate::work::{assemble_block, assemble_header, build_work, meets_target, round_share_target, share_target, BuildParams, Submit, Work};
 
 /// Bytes of nonce the pool fixes per client: the Perl's `nonce1_size` is 16 but
 /// `sprintf("%04x", id) . newkey(16 - 4)` yields 4 + 24 = 28 hex chars, i.e. 14 bytes
@@ -108,6 +108,19 @@ pub fn msg_submit_result(id: &Value, ok: bool) -> String {
 /// and cannot tell from a stale one.
 pub fn msg_refused(id: &Value, code: u32, message: &str) -> String {
     format!("{{\"id\":{},\"result\": false,\"error\": {}}}\n", id_text(id), serde_json::json!([code, message, null]))
+}
+
+/// The target sent to miners in `mining.set_target`, and the one their shares are checked
+/// against: the block target times `--share-ratio` (capped at all ones), rounded down to a power
+/// of two under `--share-target-round` (`round_share_target`: never easier than the ratio gives,
+/// never harder than the block target).
+fn miner_target(block_target: &str, limits: &crate::state::Limits) -> Result<String, String> {
+    let share = share_target(block_target, limits.share_ratio)?;
+    if limits.share_target_round && limits.share_ratio > 1 {
+        round_share_target(&share, block_target)
+    } else {
+        Ok(share)
+    }
 }
 
 /// Stratum error codes (see `msg_refused`).
@@ -393,7 +406,7 @@ impl Client {
         }
         if !self.ready {
             // --share-ratio: an easier target than the block's keeps a miner talking between blocks
-            let target = share_target(&template.target, state.limits.share_ratio).unwrap_or_else(|_| template.target.clone());
+            let target = miner_target(&template.target, &state.limits).unwrap_or_else(|_| template.target.clone());
             out.push_str(&msg_set_target(&target));
             self.ready = true;
         }
@@ -650,7 +663,7 @@ impl Client {
         }
         match if state.limits.check_pow { meets_target(&header, &work.target) } else { Ok(true) } {
             Ok(true) => {}
-            Ok(false) if state.limits.share_ratio > 1 && share_target(&work.target, state.limits.share_ratio).and_then(|t| meets_target(&header, &t)).unwrap_or(false) => {
+            Ok(false) if state.limits.share_ratio > 1 && miner_target(&work.target, &state.limits).and_then(|t| meets_target(&header, &t)).unwrap_or(false) => {
                 // A share neither counts as a bad submit nor clears the count (see `bad_submits`).
                 let shares = &mut self.jobs[slot].shares;
                 if shares.len() >= SHARES_PER_JOB {
