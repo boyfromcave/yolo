@@ -393,12 +393,13 @@ async fn garbage_and_unknown_methods_disconnect() {
     let rows = load_fixture("stratum-perl-solo.jsonl");
     let (node, _) = fake_node(template_from_fixture(&rows)).await;
     let addr = start_server(Flags::SOLO, node).await;
-    for bad in ["not json\n", "{\"id\":1,\"method\":\"mining.get_transactions\",\"params\":[]}\n"] {
+    // garbage has no id to answer; an unknown method is answered with an error, then closed
+    for (bad, reply) in [("not json\n", ""), ("{\"id\":1,\"method\":\"mining.get_transactions\",\"params\":[]}\n", "{\"id\":1,\"result\": false,\"error\": [20,\"Unknown method\",null]}\n")] {
         let mut s = TcpStream::connect(addr).await.unwrap();
         s.write_all(bad.as_bytes()).await.unwrap();
         let mut out = Vec::new();
-        let n = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await.expect("server should close").unwrap();
-        assert_eq!(n, 0, "no reply to {:?}, got {:?}", bad, String::from_utf8_lossy(&out));
+        tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await.expect("server should close").unwrap();
+        assert_eq!(String::from_utf8_lossy(&out), reply, "reply to {:?}", bad);
     }
 }
 
@@ -546,10 +547,6 @@ impl Miner {
         assert_eq!(self.response(5).await.unwrap()["result"], json!(true));
         nonce1
     }
-    /// Waits for the first job; returns its id.
-    async fn job(&mut self) -> String {
-        self.notify().await[0].as_str().unwrap().to_string()
-    }
     /// Waits for the next `mining.notify`; returns its params.
     async fn notify(&mut self) -> Value {
         loop {
@@ -646,24 +643,31 @@ async fn bad_submits_stay_local_and_get_the_miner_disconnected() {
     let (addr, status_addr, _) = start_hardened(limits, node).await;
     let mut m = Miner::connect(addr).await;
     m.subscribe_and_authorize(FIXTURE_ADDRESS).await;
-    let job = m.job().await;
+    let mut job = m.notify().await;
     let sol = format!("24{}", "ab".repeat(36));
-    // unknown job: rejected as stale, not counted as a bad submit
+    // unknown job: answered stale (21), not counted as a bad submit nor as a refusal
     m.send(&format!("{{\"id\":9,\"method\":\"mining.submit\",\"params\":[\"w\",\"999\",\"b61cba6a\",\"{}\",\"{}\"]}}", "0".repeat(36), sol)).await;
-    assert_eq!(m.response(5).await.unwrap()["result"], json!(false));
+    let v = m.response(5).await.unwrap();
+    assert_eq!(v["result"], json!(false));
+    assert_eq!(v["error"], json!([21, "Job not found", null]));
     assert_eq!(status(status_addr).await["lastSubmitVerdict"], json!("stale"));
     // three submits that hash above the regtest target: rejected locally, then disconnected
+    // (a stale answer leaves the miner on its job; each refusal after it hands out a new one)
     for i in 0..3 {
-        let job = m.notify().await;
+        if i > 0 {
+            job = m.notify().await;
+        }
         m.send(&format!("{{\"id\":{},\"method\":\"mining.submit\",\"params\":[\"w\",{},{},\"{}{:02x}\",\"{}\"]}}", 10 + i, job[0], job[5], "f".repeat(34), i, sol)).await;
-        assert_eq!(m.response(5).await.unwrap()["result"], json!(false), "submit {}", i);
+        let v = m.response(5).await.unwrap();
+        assert_eq!(v["result"], json!(false), "submit {}", i);
+        assert_eq!(v["error"], json!([23, "high-hash", null]), "submit {}", i);
     }
     assert!(m.closed(5).await, "the miner must be disconnected after max_bad_submits");
     let st = status(status_addr).await;
     assert_eq!(st["lastSubmitVerdict"], json!("high-hash"));
-    assert_eq!(st["rejected"], json!(4));
+    assert_eq!(st["rejected"], json!(3));
+    assert_eq!(st["stale"], json!(1));
     assert!(submitted.lock().unwrap().is_empty(), "nothing may reach submitblock: {:?}", submitted.lock().unwrap());
-    let _ = job;
 }
 
 /// Audit H-4: one authorize per connection, a per-IP budget, and cached validateaddress.
@@ -676,8 +680,13 @@ async fn authorize_is_once_rate_limited_and_cached() {
     let mut m = Miner::connect(addr).await;
     m.subscribe_and_authorize(FIXTURE_ADDRESS).await;
     assert!(state.cached_address(FIXTURE_ADDRESS).is_some(), "the answer is cached");
+    // the same worker again is answered (no node call, no budget); another worker is refused
+    // with an answer, then the socket is closed
     m.send(&format!("{{\"id\":3,\"method\":\"mining.authorize\",\"params\":[\"{}\",\"x\"]}}", FIXTURE_ADDRESS)).await;
-    assert!(m.closed(5).await, "a second authorize closes the socket");
+    assert_eq!(m.response(5).await.unwrap()["result"], json!(true), "a repeated authorize for the same worker");
+    m.send("{\"id\":4,\"method\":\"mining.authorize\",\"params\":[\"smOtherWorkerAddress00000000000000\",\"x\"]}").await;
+    assert_eq!(m.response(5).await.unwrap()["error"], json!("Auth Failed"));
+    assert!(m.closed(5).await, "an authorize for another worker closes the socket");
     // invalid answers are cached too, and the per-IP budget (3) closes the fourth attempt
     let mut m = Miner::connect(addr).await;
     m.send("{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"nope\",\"x\"]}").await;
@@ -1021,9 +1030,142 @@ async fn a_block_retried_after_an_rpc_error_is_not_a_duplicate() {
     assert_eq!(m.response(5).await.unwrap()["result"], json!(true));
     assert_eq!(status(status_addr).await["lastSubmitVerdict"], json!("accepted"));
     assert_eq!(submitted.lock().unwrap().len(), 2);
-    // a third time: the node gave a verdict, so now it is a duplicate
+    // a third time: the block is on the chain, the job's parent is no longer the tip: stale,
+    // never forwarded
     m.send(&line).await;
-    assert_eq!(m.response(5).await.unwrap()["result"], json!(false));
-    assert_eq!(status(status_addr).await["lastSubmitVerdict"], json!("duplicate"));
+    assert_eq!(m.response(5).await.unwrap()["error"], json!([21, "Stale share", null]));
+    assert_eq!(status(status_addr).await["lastSubmitVerdict"], json!("stale"));
     assert_eq!(submitted.lock().unwrap().len(), 2);
+}
+
+/// The miniZ drop on testnet-yb-fast (2026-11-13): after a new block a GPU miner flushes the
+/// solutions it still holds for the previous job. Each must be answered at once with a stale
+/// error (21), never forwarded as a block on a parent the chain has moved past, never counted
+/// against the miner, and must not hand it yet another clean job; a job replaced at the same
+/// height (the tip unchanged) is still taken.
+#[tokio::test]
+async fn stale_submits_are_answered_at_once_and_never_forwarded() {
+    let mut t: Value = serde_json::from_str(TEMPLATE).unwrap();
+    // every hash meets an all-ones block target: each solved submit is a block
+    t["target"] = json!("f".repeat(64));
+    let (node, submitted, _) = fake_node_advancing(t, true).await;
+    let limits = yolo::Limits { max_bad_submits: 2, ..yolo::Limits::default() };
+    let (addr, status_addr, _) = start_hardened(limits, node).await;
+    let mut m = Miner::connect(addr).await;
+    let nonce1 = m.subscribe_and_authorize(FIXTURE_ADDRESS).await;
+    let old = m.notify().await;
+    let ntime = old[5].as_str().unwrap().to_string();
+    // three solutions for the same job, sent back to back as a GPU flushes them: the first is
+    // the block, the other two are stale once it is accepted (the template still on the old
+    // parent, or already the next one: stale either way)
+    let (n2a, sa) = solved(&old, &nonce1, 0);
+    let (n2b, sb) = solved(&old, &nonce1, 1_000_000);
+    let (n2c, sc) = solved(&old, &nonce1, 2_000_000);
+    m.send(&format!("{}\n{}\n{}", submit_line(1, &old, &ntime, &n2a, &sa), submit_line(2, &old, &ntime, &n2b, &sb), submit_line(3, &old, &ntime, &n2c, &sc))).await;
+    let started = std::time::Instant::now();
+    let a = m.response(5).await.expect("connected");
+    assert_eq!((a["id"].clone(), a["result"].clone()), (json!(1), json!(true)), "{}", a);
+    for id in [2, 3] {
+        let v = m.response(5).await.expect("a stale submit is answered, not left hanging");
+        assert_eq!(v["id"], json!(id));
+        assert_eq!(v["result"], json!(false));
+        assert_eq!(v["error"], json!([21, "Stale share", null]), "{}", v);
+    }
+    assert!(started.elapsed() < Duration::from_millis(900), "stale answers took {:?}", started.elapsed());
+    assert_eq!(submitted.lock().unwrap().len(), 1, "a stale job never reaches submitblock");
+    let st = status(status_addr).await;
+    assert_eq!((st["accepted"].clone(), st["stale"].clone(), st["rejected"].clone()), (json!(1), json!(2), json!(0)), "{}", st);
+    // exactly one clean job on the new parent: the stale answers handed out no further jobs
+    let new = m.notify().await;
+    assert_ne!(new[2], old[2], "the job after the block is on the new parent");
+    assert_eq!(new[7], json!(true));
+    m.send("{\"id\":9,\"method\":\"mining.extranonce.subscribe\",\"params\":[]}").await;
+    let v = m.next(5).await.expect("connected");
+    assert_eq!(v["id"], json!(9), "no other job came between: {}", v);
+    // more stale submits than max_bad_submits: still connected, the new job still mines
+    for id in 10..15u64 {
+        let (n2, s) = solved(&old, &nonce1, 3_000_000 + id * 1_000_000);
+        m.send(&submit_line(id, &old, &ntime, &n2, &s)).await;
+        assert_eq!(m.response(5).await.expect("still connected")["error"][0], json!(21));
+    }
+    let (n2, s) = solved(&new, &nonce1, 0);
+    m.send(&submit_line(20, &new, new[5].as_str().unwrap(), &n2, &s)).await;
+    assert_eq!(m.response(5).await.unwrap()["result"], json!(true), "the job on the tip is a block");
+    assert_eq!(submitted.lock().unwrap().len(), 2);
+
+    // the grace: a job replaced at the same height still builds a valid block on the tip
+    let mut t: Value = serde_json::from_str(TEMPLATE).unwrap();
+    t["target"] = json!("f".repeat(64));
+    let (node, submitted) = fake_node(t).await;
+    let (addr, _, _) = start_hardened(yolo::Limits::default(), node).await;
+    let mut m = Miner::connect(addr).await;
+    let nonce1 = m.subscribe_and_authorize(FIXTURE_ADDRESS).await;
+    let first = m.notify().await;
+    // a refused submit (wrong ntime) replaces the job on the same template
+    m.send(&submit_line(30, &first, "00000000", &"0".repeat(36), &format!("24{}", "ab".repeat(36)))).await;
+    assert_eq!(m.response(5).await.unwrap()["error"], json!([20, "bad-ntime", null]));
+    let second = m.notify().await;
+    assert_ne!(second[0], first[0]);
+    assert_eq!(second[2], first[2], "same parent");
+    let (n2, s) = solved(&first, &nonce1, 0);
+    m.send(&submit_line(31, &first, first[5].as_str().unwrap(), &n2, &s)).await;
+    assert_eq!(m.response(5).await.unwrap()["result"], json!(true), "the replaced job on the tip is still taken");
+    assert_eq!(submitted.lock().unwrap().len(), 1);
+}
+
+/// The authorize budget (audit H-4) charges what costs the node or fails: a miner reconnecting
+/// many times a minute with an address the pool has cached is never refused, while new
+/// addresses (a `validateaddress` each) and failed authorizations stay capped per IP.
+#[tokio::test]
+async fn reconnecting_miners_are_not_refused_and_authorize_floods_are() {
+    let t: Value = serde_json::from_str(TEMPLATE).unwrap();
+    let (node, _) = fake_node(t).await;
+    let limits = yolo::Limits { authorize_per_minute: 3, ..yolo::Limits::default() };
+    let (addr, _, _) = start_hardened(limits, node).await;
+    // ten reconnects within a second (three times the budget): every one authorized
+    for i in 0..10 {
+        let mut m = Miner::connect(addr).await;
+        m.send(&format!("{{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"{}\",\"x\"]}}", FIXTURE_ADDRESS)).await;
+        assert_eq!(m.response(5).await.unwrap()["result"], json!(true), "reconnect {}", i);
+    }
+    // a flood of new addresses: each a node call; the budget is spent by the third (the first
+    // reconnect above spent one), the next is refused and closed
+    let fresh = |i: usize| format!("sm{:033}", i);
+    for i in 1..3 {
+        let mut m = Miner::connect(addr).await;
+        m.send(&format!("{{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"{}\",\"x\"]}}", fresh(i))).await;
+        assert_eq!(m.response(5).await.unwrap()["result"], json!(true), "new address {}", i);
+    }
+    for user in [fresh(9), "nope".to_string(), FIXTURE_ADDRESS.to_string()] {
+        let mut m = Miner::connect(addr).await;
+        m.send(&format!("{{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"{}\",\"x\"]}}", user)).await;
+        let v = m.response(5).await.unwrap();
+        assert_eq!(v["error"], json!("Auth Failed"), "{} once the budget is spent: {}", user, v);
+        assert!(m.closed(5).await);
+    }
+
+    // failed authorizations are charged too (password guessing)
+    let rpc = RpcClient::new(&format!("http://{}", node), &RpcAuth { user: "u".into(), password: "p".into() });
+    let mut cfg = config(Flags::SOLO, false);
+    cfg.password = Some("s3cret".into());
+    cfg.limits = yolo::Limits { authorize_per_minute: 3, ..yolo::Limits::default() };
+    let bound = yolo::bind(rpc, cfg).await.unwrap();
+    let addr = bound.addr;
+    tokio::spawn(bound.serve());
+    // --payout and the right password: no node call, never charged
+    for _ in 0..5 {
+        let mut m = Miner::connect(addr).await;
+        m.send("{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"rig\",\"s3cret\"]}").await;
+        assert_eq!(m.response(5).await.unwrap()["result"], json!(true));
+    }
+    for guess in 0..4 {
+        let mut m = Miner::connect(addr).await;
+        m.send(&format!("{{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"rig\",\"guess{}\"]}}", guess)).await;
+        assert_eq!(m.response(5).await.unwrap()["error"], json!("Auth Failed"));
+        assert!(m.closed(5).await);
+    }
+    // the budget is spent: even the right password is refused for the rest of the minute
+    let mut m = Miner::connect(addr).await;
+    m.send("{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"rig\",\"s3cret\"]}").await;
+    assert_eq!(m.response(5).await.unwrap()["error"], json!("Auth Failed"));
 }
