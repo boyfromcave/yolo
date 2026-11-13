@@ -40,6 +40,9 @@ pub struct Limits {
     /// Compare each submit's block hash with the target before `submitblock` (audit H-3).
     /// Off only in the wire-replay tests, whose recorded submits belong to another coinbase.
     pub check_pow: bool,
+    /// `--share-ratio`: the target sent to miners is this many times easier than the block's
+    /// (capped at the all-ones target). 1 = the block target, as the Perl did.
+    pub share_ratio: u32,
 }
 
 impl Default for Limits {
@@ -54,6 +57,7 @@ impl Default for Limits {
             authorize_per_minute: 10,
             address_cache_ttl: Duration::from_secs(600),
             check_pow: true,
+            share_ratio: 1,
         }
     }
 }
@@ -78,6 +82,8 @@ pub struct Inner {
     pub last_verdict: String,
     pub accepted: u64,
     pub rejected: u64,
+    /// Submits that met the share target but not the block's (`--share-ratio`); never forwarded.
+    pub shares: u64,
     /// The `previousblockhash` (wire order, as `Work` carries it) of the last job the node
     /// accepted a block for: a template still on that parent is stale (the node has moved on)
     /// and no work is built from it until the poller brings the next one — otherwise a fast
@@ -134,6 +140,7 @@ impl Shared {
                 last_verdict: String::new(),
                 accepted: 0,
                 rejected: 0,
+                shares: 0,
                 accepted_parent: None,
             }),
             generation_tx,
@@ -244,6 +251,8 @@ impl Shared {
             "lastSubmitVerdict": g.last_verdict,
             "accepted": g.accepted,
             "rejected": g.rejected,
+            "shares": g.shares,
+            "shareRatio": self.limits.share_ratio,
             "uptimeSeconds": self.started.elapsed().as_secs(),
         })
     }

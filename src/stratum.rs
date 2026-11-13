@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use crate::poller::job_time;
 use crate::state::State;
-use crate::work::{assemble_block, assemble_header, build_work, meets_target, BuildParams, Submit, Work};
+use crate::work::{assemble_block, assemble_header, build_work, meets_target, share_target, BuildParams, Submit, Work};
 
 /// Bytes of nonce the pool fixes per client: the Perl's `nonce1_size` is 16 but
 /// `sprintf("%04x", id) . newkey(16 - 4)` yields 4 + 24 = 28 hex chars, i.e. 14 bytes
@@ -198,6 +198,17 @@ enum Action {
     Disconnect,
 }
 
+/// What a `mining.submit` came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Submitted {
+    /// The node accepted the block.
+    Block,
+    /// Met the share target only (`--share-ratio`).
+    Share,
+    /// Refused by the pool's own checks or by the node.
+    Refused,
+}
+
 impl Client {
     fn new(index: u64, peer: SocketAddr, generation_rx: watch::Receiver<u64>) -> Client {
         let now = Instant::now();
@@ -311,7 +322,9 @@ impl Client {
             return;
         }
         if !self.ready {
-            out.push_str(&msg_set_target(&template.target));
+            // --share-ratio: an easier target than the block's keeps a miner talking between blocks
+            let target = share_target(&template.target, state.limits.share_ratio).unwrap_or_else(|_| template.target.clone());
+            out.push_str(&msg_set_target(&target));
             self.ready = true;
         }
         if !self.mining {
@@ -458,10 +471,14 @@ impl Client {
                     warn!("miner {}: submit before authorize, disconnecting", self.index);
                     return Action::Disconnect;
                 }
-                self.mining = false;
-                self.ready = false;
-                let ok = self.submit(&id, &params, state).await;
-                out.push_str(&msg_submit_result(&id, ok));
+                let verdict = self.submit(&id, &params, state).await;
+                if verdict != Submitted::Share {
+                    // a block, accepted or not, or a refused submit: the miner starts over on fresh
+                    // work (the Perl's behaviour); a share leaves it on its job
+                    self.mining = false;
+                    self.ready = false;
+                }
+                out.push_str(&msg_submit_result(&id, verdict != Submitted::Refused));
                 if self.bad_submits >= state.limits.max_bad_submits {
                     warn!("miner {}: {} bad submits, disconnecting", self.index, self.bad_submits);
                     return Action::Disconnect;
@@ -475,17 +492,19 @@ impl Client {
         }
     }
 
-    /// `mining.submit` [worker, job id, ntime, nonce2, solution] → true only when the node
-    /// returns null; the verdict string is logged and kept for `/status`. A submit that fails
-    /// the pool's own checks (shape, unknown job, hash above target) never reaches the node
-    /// (audit H-3, H-17).
-    async fn submit(&mut self, _id: &Value, params: &[Value], state: &State) -> bool {
+    /// `mining.submit` [worker, job id, ntime, nonce2, solution] → a block the node accepted
+    /// (`submitblock` returned null), a share (`--share-ratio`: the hash meets the share target
+    /// but not the block's; counted, never forwarded, its Equihash solution unchecked: shares
+    /// only show that a miner is alive and how fast it is), or refused; a refusal's verdict
+    /// string is logged and kept for `/status`. A submit that fails the pool's own checks
+    /// (shape, unknown job, hash above the share target) never reaches the node (audit H-3, H-17).
+    async fn submit(&mut self, _id: &Value, params: &[Value], state: &State) -> Submitted {
         let p = |i: usize| params.get(i).and_then(Value::as_str).unwrap_or("");
         let job_id = p(1);
         let Some(work) = self.jobs.iter().rev().find(|w| w.job_id == job_id).cloned() else {
             warn!("miner {}: submit for unknown job {}", self.index, shown(job_id));
             self.record(state, "stale");
-            return false;
+            return Submitted::Refused;
         };
         let submit = match Submit::check(p(2), p(3), p(4), self.nonce1.len(), state.equihash) {
             Ok(s) => s,
@@ -493,23 +512,29 @@ impl Client {
                 warn!("miner {}: bad submit for job {}: {}", self.index, job_id, e);
                 self.bad_submits += 1;
                 self.record(state, "bad-submit");
-                return false;
+                return Submitted::Refused;
             }
         };
         let header = assemble_header(&work, &self.nonce1, &submit);
         match if state.limits.check_pow { meets_target(&header, &work.target) } else { Ok(true) } {
             Ok(true) => {}
+            Ok(false) if state.limits.share_ratio > 1 && share_target(&work.target, state.limits.share_ratio).and_then(|t| meets_target(&header, &t)).unwrap_or(false) => {
+                self.bad_submits = 0;
+                state.lock().shares += 1;
+                debug!("miner {}: share for job {}", self.index, job_id);
+                return Submitted::Share;
+            }
             Ok(false) => {
                 warn!("miner {}: submit for job {} is above the target, not forwarded", self.index, job_id);
                 self.bad_submits += 1;
                 self.record(state, "high-hash");
-                return false;
+                return Submitted::Refused;
             }
             Err(e) => {
                 warn!("miner {}: cannot hash submit for job {}: {}", self.index, job_id, e);
                 self.bad_submits += 1;
                 self.record(state, "bad-submit");
-                return false;
+                return Submitted::Refused;
             }
         }
         self.bad_submits = 0;
@@ -522,22 +547,22 @@ impl Client {
             Ok(Ok(None)) => {
                 info!("miner {}: block {} accepted by the node (job {}, tag {})", self.index, work.height, job_id, work.tag_kind());
                 state.block_accepted(&work.previousblockhash);
-                true
+                Submitted::Block
             }
             Ok(Ok(Some(verdict))) => {
                 warn!("miner {}: block {} rejected by the node: {}", self.index, work.height, verdict);
                 self.record(state, &verdict);
-                false
+                Submitted::Refused
             }
             Ok(Err(e)) => {
                 warn!("miner {}: submitblock failed: {}", self.index, e);
                 self.record(state, &format!("rpc-error: {}", e));
-                false
+                Submitted::Refused
             }
             Err(e) => {
                 warn!("miner {}: submitblock task: {}", self.index, e);
                 self.record(state, "task-error");
-                false
+                Submitted::Refused
             }
         }
     }

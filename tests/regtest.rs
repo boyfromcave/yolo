@@ -506,7 +506,7 @@ async fn payout_text_grid_against_a_regtest_node() {
     a.base_args = node_args(vault);
     b.base_args = node_args(vault);
     // A burst of generated blocks runs median-time-past ahead of the clock (Y-F5); generate the
-    // chain an hour in the past so the pool's `max(curtime, now)` header time is accepted. The
+    // chain an hour in the past so the node's `curtime` (the pool's header time) stays within its rules. The
     // first start runs on `-mocktime` rather than `setmocktime` + `setmocktime 0`: 6.20.0 refuses
     // `setmocktime` on a node started without `-mocktime`, and on one started with it `0` sets
     // the clock to the epoch instead of restoring the system clock (F-8). The restart below

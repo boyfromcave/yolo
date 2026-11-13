@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased — header time after an idle chain, shares
+
+- The job's nTime is the template's `curtime` (the wall clock only when the node sends none),
+  no longer `max(curtime, now)`. A chain idle for more than three hours has its median-time-past
+  that far behind the clock, the node caps `curtime` at median-time-past + 3 hours
+  (`MAX_FUTURE_BLOCK_TIME_MTP`), and every block yolo built on the wall clock was rejected
+  `time-too-far-ahead-of-mtp` (Y-F10, found mining testnet-yb-fast block 510,432 after a two-day
+  pause). The node's `curtime` is also never below median-time-past + 1, which Y-F5 needed.
+- `--share-ratio N` (default 1, unchanged behaviour): the miners' target is N times easier than the
+  block's; a submit between the two is a share, answered `true`, counted in `/status` (`shares`,
+  `shareRatio`), never forwarded, and the miner keeps its job. Without it a GPU that finds no
+  block for three minutes is disconnected as silent (Y-F11, seen on testnet-yb-fast with a CPU
+  miner at 20 s per nonce).
+
 ## Unreleased — security CI
 
 - Security CI (SECURITY-CI.md): Semgrep with yolo's own rules (no `yed_*` RPC, stock mining RPCs

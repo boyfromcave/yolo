@@ -154,6 +154,8 @@ yolo [OPTIONS]
   --equihash <EQUIHASH>      auto (regtest → 48,5, else 192,7), 48,5 or 192,7 [default: auto]
   --status-port <PORT>       serve GET /status (JSON) on this port
   --status-bind <BIND>       address to bind the status listener to       [default: 127.0.0.1]
+  --share-ratio <N>          the target sent to miners is N times easier than the block's; a submit
+                             between the two is a share (counted, never forwarded)      [default: 1]
   --max-connections <N>      stratum sockets open at once, authorized or not [default: 1024]
   --max-per-ip <N>           stratum sockets open at once from one IP     [default: 64]
   --log <LOG>                error, warn, info, debug, trace              [default: info]
@@ -169,6 +171,21 @@ A miner connects as it would to any Equihash stratum pool: `stratum+tcp://host:3
 username = a transparent address (or any worker name when `--payout` is set), password =
 `--password` or anything. `mining.extranonce.subscribe` is acknowledged; job ids are a
 per-connection counter.
+
+### Shares (`--share-ratio`)
+
+yolo is a solo pool: by default the target it sends (`mining.set_target`) is the block's, so a
+miner submits only blocks. Once a network's difficulty has caught up with a GPU fleet, each card
+finds a block only every few minutes, and an authorized miner that says nothing for three minutes
+is disconnected (*Exposure*). `--share-ratio N` sends a target N times easier than the block's
+(at most the all-ones target): a submit that meets it but not the block target is a **share**,
+answered `true`, counted in `/status` (`shares`) and never sent to the node; one that meets the
+block target goes to `submitblock` as before. The miner keeps its job after a share. Shares pay
+nothing (the coinbase pays `--payout` or the username whatever the shares say) and their Equihash
+solution is not checked, only their hash against the share target: they show that a miner is
+alive and, as `shares × N` solutions-worth per block interval, roughly how fast the fleet is.
+Pick N so a card submits every few seconds to a minute: about (block interval in seconds × cards
+on the pool) / (seconds between a card's shares), e.g. 64 for a few cards on 75-second blocks.
 
 ### Exposure
 
@@ -293,7 +310,10 @@ from them and `tests/wire.rs` replays them byte for byte). What changed on purpo
 - `mining.submit` is answered `true` only when `submitblock` returned `null`; every
   rejection string is logged, counted and reported to the miner as `false` (the Perl answered
   `true` to `Block decode failed`, `time-too-old`, …).
-- The job time is `max(template.curtime, now)`, not the wall clock alone.
+- The job time is the template's `curtime`, not the wall clock: the node keeps it within
+  median-time-past + 1 and median-time-past + 3 hours, so a chain whose median-time-past runs
+  ahead of the clock (a burst-mined regtest chain) or far behind it (a testnet left idle for more
+  than three hours) still gets a valid header time.
 - `nonce1` is exactly 14 bytes / 28 hex chars, as the Perl actually sent (its comment
   said 16).
 - The port is a flag (`--port`, default 3333), and the payout output is rewritten
