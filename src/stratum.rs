@@ -101,6 +101,21 @@ pub fn msg_notify(w: &Work, clean: bool) -> String {
 pub fn msg_submit_result(id: &Value, ok: bool) -> String {
     format!("{{\"id\":{},\"result\": {}}}\n", id_text(id), ok)
 }
+/// A refused request, with the stratum error triple `[code, message, null]` the miners read
+/// (slush's stratum codes, as NOMP-family Equihash pools send them: 20 other, 21 job not found /
+/// stale, 22 duplicate, 23 low difficulty, 24 unauthorized worker). The Perl
+/// answered a refused submit `{"result": false}` alone, which miniZ logs as "Bad share: unknown"
+/// and cannot tell from a stale one.
+pub fn msg_refused(id: &Value, code: u32, message: &str) -> String {
+    format!("{{\"id\":{},\"result\": false,\"error\": {}}}\n", id_text(id), serde_json::json!([code, message, null]))
+}
+
+/// Stratum error codes (see `msg_refused`).
+pub const ERR_OTHER: u32 = 20;
+pub const ERR_STALE: u32 = 21;
+pub const ERR_DUPLICATE: u32 = 22;
+pub const ERR_LOW_DIFFICULTY: u32 = 23;
+pub const ERR_UNAUTHORIZED: u32 = 24;
 
 /// Audit H-1: the longest line a miner may send. A `mining.submit` at 192,7 is about 1 KB
 /// (806 hex chars of solution); anything near this is not a stratum message.
@@ -231,14 +246,17 @@ enum Action {
 }
 
 /// What a `mining.submit` came to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Submitted {
     /// The node accepted the block.
     Block,
     /// Met the share target only (`--share-ratio`).
     Share,
-    /// Refused by the pool's own checks or by the node.
-    Refused,
+    /// For a job the chain has moved past, or one this connection never had (`ERR_STALE`): the
+    /// miner keeps the job it holds, nothing is counted against it, nothing reaches the node.
+    Stale(&'static str),
+    /// Refused by the pool's own checks or by the node: the stratum code and the verdict.
+    Refused(u32, String),
 }
 
 impl Client {
@@ -416,9 +434,18 @@ impl Client {
                 Action::Continue
             }
             "mining.authorize" => {
-                // Audit H-4: one authorize per connection, a per-IP budget, cached answers.
+                // Audit H-4: one worker per connection, a per-IP budget, cached answers.
+                let password_ok = |password: &str| state.password.as_ref().is_none_or(|expected| bool::from(password.as_bytes().ct_eq(expected.as_bytes())));
                 if self.auth {
-                    warn!("miner {}: second mining.authorize, disconnecting", self.index);
+                    // The same worker again is answered from what the connection already holds (no
+                    // node call); another worker is refused, and the socket closed.
+                    if param(0) == self.worker && password_ok(&param(1)) {
+                        out.push_str(&msg_authorized(&id));
+                        debug!("miner {}: repeated mining.authorize for {}", self.index, shown(&self.worker));
+                        return Action::Continue;
+                    }
+                    out.push_str(&msg_auth_failed(&id, "Auth Failed"));
+                    warn!("miner {}: second mining.authorize for another worker, disconnecting", self.index);
                     return Action::Disconnect;
                 }
                 if !state.authorize_allowed(self.peer.ip()) {
@@ -427,17 +454,16 @@ impl Client {
                     return Action::Disconnect;
                 }
                 self.worker = param(0);
-                let password = param(1);
-                if let Some(expected) = &state.password {
-                    // Audit H-5: constant-time compare.
-                    if !bool::from(password.as_bytes().ct_eq(expected.as_bytes())) {
-                        out.push_str(&msg_auth_failed(&id, "Auth Failed"));
-                        warn!("miner {}: wrong password for {}", self.index, shown(&self.worker));
-                        return Action::Disconnect;
-                    }
+                // Audit H-5: constant-time compare.
+                if !password_ok(&param(1)) {
+                    out.push_str(&msg_auth_failed(&id, "Auth Failed"));
+                    warn!("miner {}: wrong password for {}", self.index, shown(&self.worker));
+                    return Action::Disconnect;
                 }
                 if let Some(fixed) = &state.policy.payout {
                     // --payout: every block pays the fixed address; the username is a worker name.
+                    // No node call: the attempt is given back to the IP's budget.
+                    state.authorize_refund(self.peer.ip());
                     self.authorized(state);
                     out.push_str(&msg_authorized(&id));
                     info!("miner {}: authorized as {}, paying {}", self.index, shown(&self.worker), fixed.address);
@@ -470,7 +496,10 @@ impl Client {
                 };
                 match answer {
                     Ok(Some(spk)) => {
-                        if !was_cached {
+                        if was_cached {
+                            // answered without the node: the attempt is given back
+                            state.authorize_refund(self.peer.ip());
+                        } else {
                             state.cache_address(&self.worker, Some(spk.clone()));
                         }
                         self.script_pubkey = Some(spk);
@@ -501,17 +530,25 @@ impl Client {
             }
             "mining.submit" => {
                 if !self.auth {
+                    out.push_str(&msg_refused(&id, ERR_UNAUTHORIZED, "Unauthorized worker"));
                     warn!("miner {}: submit before authorize, disconnecting", self.index);
                     return Action::Disconnect;
                 }
+                // Every submit is answered here, at once for a stale one: nothing between the
+                // request and its answer waits on the node unless the submit is a block on the tip.
                 let verdict = self.submit(&id, &params, state).await;
-                if verdict != Submitted::Share {
+                if !matches!(verdict, Submitted::Share | Submitted::Stale(_)) {
                     // a block, accepted or not, or a refused submit: the miner starts over on fresh
-                    // work (the Perl's behaviour); a share leaves it on its job
+                    // work (the Perl's behaviour); a share leaves it on its job, and so does a stale
+                    // submit (the miner already holds, or is about to get, the job on the new tip)
                     self.mining = false;
                     self.ready = false;
                 }
-                out.push_str(&msg_submit_result(&id, verdict != Submitted::Refused));
+                out.push_str(&match &verdict {
+                    Submitted::Block | Submitted::Share => msg_submit_result(&id, true),
+                    Submitted::Stale(message) => msg_refused(&id, ERR_STALE, message),
+                    Submitted::Refused(code, verdict) => msg_refused(&id, *code, verdict),
+                });
                 if self.bad_submits >= state.limits.max_bad_submits {
                     warn!("miner {}: {} bad submits, disconnecting", self.index, self.bad_submits);
                     return Action::Disconnect;
@@ -519,6 +556,7 @@ impl Client {
                 Action::Continue
             }
             other => {
+                out.push_str(&msg_refused(&id, ERR_OTHER, "Unknown method"));
                 warn!("miner {}: unknown method {}, disconnecting", self.index, shown(other));
                 Action::Disconnect
             }
@@ -528,27 +566,45 @@ impl Client {
     /// `mining.submit` [worker, job id, ntime, nonce2, solution] → a block the node accepted
     /// (`submitblock` returned null), a share (`--share-ratio`: the hash meets the share target
     /// but not the block's; counted, never forwarded, its Equihash solution unchecked: shares
-    /// only show that a miner is alive and how fast it is), or refused; a refusal's verdict
+    /// only show that a miner is alive and how fast it is), stale, or refused; a refusal's verdict
     /// string is logged and kept for `/status`. A submit that fails the pool's own checks
-    /// (shape, unknown job, an `ntime` other than the job's, a repeat, hash above the share
-    /// target, an Equihash solution that does not verify) never reaches the node (audit H-3,
-    /// H-17).
+    /// (shape, an `ntime` other than the job's, a repeat, hash above the share target, an Equihash
+    /// solution that does not verify) never reaches the node (audit H-3, H-17), and neither does
+    /// a stale one.
+    ///
+    /// Stale: a job id this connection does not hold, or a job on a parent that is no longer the
+    /// tip (the current template is on another parent, or it is on the parent of a block this pool
+    /// just had accepted: `template_stale`). A block on such a job could only be a fork block at a
+    /// height the chain already has (`inconclusive` at best), so it is answered `ERR_STALE` at once
+    /// and never forwarded. The grace is exactly the kept jobs that still extend the tip: a job
+    /// replaced because the template changed at the same height (new transactions, a new
+    /// `curtime`) builds a valid block on the tip and is still taken. A miner that still submits
+    /// solutions for an old job after a clean `mining.notify` (miniZ did, on testnet-yb-fast) only
+    /// gets stale answers, counted in `stale`, never against it.
     async fn submit(&mut self, _id: &Value, params: &[Value], state: &State) -> Submitted {
         let p = |i: usize| params.get(i).and_then(Value::as_str).unwrap_or("");
         let job_id = p(1);
         let Some(slot) = self.jobs.iter().rposition(|j| j.work.job_id == job_id) else {
-            warn!("miner {}: submit for unknown job {}", self.index, shown(job_id));
-            self.record(state, "stale");
-            return Submitted::Refused;
+            info!("miner {}: stale submit for unknown job {}", self.index, shown(job_id));
+            self.record_stale(state);
+            return Submitted::Stale("Job not found");
         };
         let work = self.jobs[slot].work.clone();
+        let on_tip = {
+            let g = state.lock();
+            g.template.as_ref().is_some_and(|t| crate::codec::reverse_hex(&t.previousblockhash) == work.previousblockhash) && !g.template_stale()
+        };
+        if !on_tip {
+            info!("miner {}: stale submit for job {} (height {}): the chain has moved past its parent", self.index, job_id, work.height);
+            self.record_stale(state);
+            return Submitted::Stale("Stale share");
+        }
         let submit = match Submit::check(p(2), p(3), p(4), self.nonce1.len(), state.equihash) {
             Ok(s) => s,
             Err(e) => {
                 warn!("miner {}: bad submit for job {}: {}", self.index, job_id, e);
                 self.bad_submits += 1;
-                self.record(state, "bad-submit");
-                return Submitted::Refused;
+                return self.refuse(state, ERR_OTHER, "bad-submit");
             }
         };
         // The pool offers no ntime rolling: the header time is the job's, which is the node's
@@ -558,8 +614,7 @@ impl Client {
         if submit.ntime != work.time {
             warn!("miner {}: submit for job {} has ntime {} instead of the job's {}", self.index, job_id, shown(&submit.ntime), work.time);
             self.bad_submits += 1;
-            self.record(state, "bad-ntime");
-            return Submitted::Refused;
+            return self.refuse(state, ERR_OTHER, "bad-ntime");
         }
         let header = assemble_header(&work, &self.nonce1, &submit);
         // The header hash identifies the submit; it is also checked against every kept job,
@@ -569,15 +624,13 @@ impl Client {
             Err(e) => {
                 warn!("miner {}: cannot hash submit for job {}: {}", self.index, job_id, e);
                 self.bad_submits += 1;
-                self.record(state, "bad-submit");
-                return Submitted::Refused;
+                return self.refuse(state, ERR_OTHER, "bad-submit");
             }
         };
         if self.jobs.iter().any(|j| j.shares.contains(&key)) {
             warn!("miner {}: duplicate submit for job {}", self.index, job_id);
             self.bad_submits += 1;
-            self.record(state, "duplicate");
-            return Submitted::Refused;
+            return self.refuse(state, ERR_DUPLICATE, "duplicate");
         }
         match if state.limits.check_pow { meets_target(&header, &work.target) } else { Ok(true) } {
             Ok(true) => {}
@@ -586,8 +639,7 @@ impl Client {
                 let shares = &mut self.jobs[slot].shares;
                 if shares.len() >= SHARES_PER_JOB {
                     debug!("miner {}: share for full job {} refused", self.index, job_id);
-                    self.record(state, "job-full");
-                    return Submitted::Refused;
+                    return self.refuse(state, ERR_STALE, "job-full");
                 }
                 shares.insert(key);
                 if shares.len() >= SHARES_PER_JOB {
@@ -606,14 +658,12 @@ impl Client {
             Ok(false) => {
                 warn!("miner {}: submit for job {} is above the target, not forwarded", self.index, job_id);
                 self.bad_submits += 1;
-                self.record(state, "high-hash");
-                return Submitted::Refused;
+                return self.refuse(state, ERR_LOW_DIFFICULTY, "high-hash");
             }
             Err(e) => {
                 warn!("miner {}: cannot hash submit for job {}: {}", self.index, job_id, e);
                 self.bad_submits += 1;
-                self.record(state, "bad-submit");
-                return Submitted::Refused;
+                return self.refuse(state, ERR_OTHER, "bad-submit");
             }
         }
         let block = assemble_block(&work, &self.nonce1, &submit);
@@ -635,13 +685,11 @@ impl Client {
                     warn!("miner {}: submit for job {} meets the target with an invalid Equihash solution ({}), not forwarded", self.index, job_id, e);
                     self.remember(slot, key);
                     self.bad_submits += 1;
-                    self.record(state, "bad-solution");
-                    return Submitted::Refused;
+                    return self.refuse(state, ERR_OTHER, "bad-solution");
                 }
                 Err(e) => {
                     warn!("miner {}: Equihash task: {}", self.index, e);
-                    self.record(state, "task-error");
-                    return Submitted::Refused;
+                    return self.refuse(state, ERR_OTHER, "task-error");
                 }
             }
         }
@@ -662,21 +710,20 @@ impl Client {
                 // counted: a block the node refuses is the miner's, unless it lost a race (an
                 // RPC failure is not counted either)
                 warn!("miner {}: block {} rejected by the node: {}", self.index, work.height, verdict);
-                if !RACE_VERDICTS.contains(&verdict.as_str()) {
-                    self.bad_submits += 1;
+                if RACE_VERDICTS.contains(&verdict.as_str()) {
+                    // the pool had not yet seen the block that beat it: stale to the miner
+                    return self.refuse(state, ERR_STALE, &verdict);
                 }
-                self.record(state, &verdict);
-                Submitted::Refused
+                self.bad_submits += 1;
+                self.refuse(state, ERR_OTHER, &verdict)
             }
             Ok(Err(e)) => {
                 warn!("miner {}: submitblock failed: {}", self.index, e);
-                self.record(state, &format!("rpc-error: {}", e));
-                Submitted::Refused
+                self.refuse(state, ERR_OTHER, &format!("rpc-error: {}", e))
             }
             Err(e) => {
                 warn!("miner {}: submitblock task: {}", self.index, e);
-                self.record(state, "task-error");
-                Submitted::Refused
+                self.refuse(state, ERR_OTHER, "task-error")
             }
         }
     }
@@ -688,10 +735,19 @@ impl Client {
         }
     }
 
-    fn record(&self, state: &State, verdict: &str) {
+    /// Counts a refused submit and returns the answer the miner gets.
+    fn refuse(&self, state: &State, code: u32, verdict: &str) -> Submitted {
         let mut g = state.lock();
         g.rejected += 1;
         g.last_verdict = verdict.to_string();
+        Submitted::Refused(code, verdict.to_string())
+    }
+
+    /// Counts a stale submit (not a refusal: see `Inner::stale`).
+    fn record_stale(&self, state: &State) {
+        let mut g = state.lock();
+        g.stale += 1;
+        g.last_verdict = "stale".into();
     }
 }
 
@@ -757,6 +813,9 @@ mod tests {
         assert_eq!(msg_submit_result(&id, true), "{\"id\":7,\"result\": true}\n");
         assert_eq!(msg_submit_result(&id, false), "{\"id\":7,\"result\": false}\n");
         assert_eq!(msg_submit_result(&serde_json::json!("x"), false), "{\"id\":\"x\",\"result\": false}\n");
+        // refusals carry the stratum error triple (not in the Perl, which sent `false` alone)
+        assert_eq!(msg_refused(&id, ERR_STALE, "Stale share"), "{\"id\":7,\"result\": false,\"error\": [21,\"Stale share\",null]}\n");
+        assert_eq!(msg_refused(&id, ERR_OTHER, "rpc-error: \"x\""), "{\"id\":7,\"result\": false,\"error\": [20,\"rpc-error: \\\"x\\\"\",null]}\n");
         let w = Work {
             job_id: "3".into(),
             height: 105,

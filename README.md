@@ -119,7 +119,7 @@ own byte scan and logs `tag: quote|signal|none` (`signal` is a tag with a zero p
 ```
 {"payout":"username","tagPayoutKey":"node","text":true,"noFlags":false,"equihash":"48,5",
  "nodeUp":true,"height":104,"templateAgeSeconds":0.0,"miners":1,"connections":1,
- "tag":"quote","lastSubmitVerdict":"accepted","accepted":1,"rejected":0,"uptimeSeconds":12}
+ "tag":"quote","lastSubmitVerdict":"accepted","accepted":1,"rejected":0,"stale":0,"uptimeSeconds":12}
 ```
 
 `payout` is the string `"username"` or the fixed `--payout` address; `text` is whether
@@ -129,7 +129,7 @@ returned (`duplicate`, `high-hash`, `time-too-old`, …), or one of the pool's o
 a submit that never reached the node: `bad-submit` (malformed), `bad-ntime` (an `ntime` other
 than the job's), `duplicate` (a header this connection already sent), `high-hash` (the block hash
 is above the target — checked locally before `submitblock`), `bad-solution` (meets the block
-target with an Equihash solution that does not verify), `stale` (unknown job id), `job-full`
+target with an Equihash solution that does not verify), `stale` (see below), `job-full`
 (a share on a job that already holds 128);
 `tag` is the kind found in the last coinbase built. An accepted block also triggers an immediate `getblocktemplate`
 (not the next 1 s poll), and no job is handed out on the old parent in between: a fast solver
@@ -137,6 +137,23 @@ would only re-solve it and be rejected `inconclusive`. To verify a mined block o
 `ycash-cli yed_gettag <height>` and the operator kit's `check-coinbase <height>`
 (`contrib/yellowback/pool/`) decode the stored block the same way and must agree with the
 pool's log line.
+
+Every request gets an answer. A refused submit is answered `"result": false` with the stratum
+error triple the miners read, `[code, message, null]`: 21 for a stale submit, 22 `duplicate`,
+23 `high-hash`, 20 with the verdict for anything else (`bad-ntime`, `bad-solution`, the node's
+verdict, …); a submit before `mining.authorize` gets 24 and an unknown method 20, both before the
+socket is closed. A submit is **stale** when its job id is not one of the connection's last eight
+jobs (`Job not found`) or its job is on a parent that is no longer the tip (`Stale share`: a
+newer block came in, or this pool's own block was just accepted). A stale submit is answered at
+once, never forwarded (its block could only be a fork at a height the chain already has), never
+counted against the miner, counted in `stale` (not in `rejected`), and leaves the miner on the
+job it holds: a GPU miner still submits the solutions it found for the previous job after a
+clean `mining.notify` (miniZ did, on testnet-yb-fast), and each must get its answer rather than
+a new job.
+Kept jobs on the tip's parent stay valid: a job replaced at the same height (new transactions, a
+new `curtime`) still builds a block on the tip and is still forwarded. A block the node refuses
+because it lost a race (`inconclusive`, `duplicate`, `duplicate-inconclusive`, `bad-prevblk`)
+is answered with code 21 and its verdict.
 
 ## Flags
 
@@ -201,8 +218,11 @@ shares it and it crosses the network in clear (the compare on the pool side is
 constant-time, which is all that can be done there). A private pool belongs behind a firewall
 or an allowlist. The pool itself is bounded against misbehaving peers: a line longer than
 8 KiB, a socket that has not authorized within 30 s, a miner silent for three keepalive
-periods (3 min), a second `mining.authorize`, more than ten `mining.authorize` a minute from
-one IP, or ten refused submits since the miner's last accepted block (malformed, an `ntime`
+periods (3 min), a `mining.authorize` for a second worker (the same worker again is answered
+`true` without a node call), more than ten `mining.authorize` a minute from one IP that fail
+or need a `validateaddress` call (a successful one answered from the address cache or under
+`--payout` is not counted, so a miner reconnecting after a stale share re-authorizes freely), or
+ten refused submits since the miner's last accepted block (malformed, an `ntime`
 other than the job's, a duplicate, above the target, an invalid Equihash solution, or a block
 the node rejected other than for a lost race: `inconclusive`, `duplicate`,
 `duplicate-inconclusive`, `bad-prevblk`), less one for every 32 accepted shares, all close the

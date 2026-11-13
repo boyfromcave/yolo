@@ -1,6 +1,27 @@
 # Changelog
 
-## Unreleased — header time after an idle chain, shares
+## Unreleased — header time after an idle chain, shares, stale submits
+
+- A submit for a job on a parent that is no longer the tip (a newer block came in, or the pool's
+  own block was just accepted) or for an unknown job id is **stale**: answered at once with
+  `[21, "Stale share" | "Job not found", null]`, never sent to `submitblock`, never counted against
+  the miner, counted in `/status` `stale` (no longer in `rejected`), and the miner keeps the job it
+  holds. Before, a solution a GPU flushed for the previous job went to `submitblock` as a fork
+  block (its answer waited on the node while it was connecting the new tip, and came back
+  `inconclusive` with no reason), and every such refusal handed the miner one more clean job. On
+  testnet-yb-fast miniZ reconnected after each block, and at a block every 5–10 s its reconnects
+  ran into the authorize limit below. Jobs on the tip's parent replaced at the same height are
+  still taken.
+- Every refused request carries the stratum error triple `[code, message, null]` (20 other, 21
+  stale, 22 duplicate, 23 high-hash, 24 unauthorized; the Perl sent `"result": false` alone, which
+  miniZ logs as "Bad share: unknown"); a submit before `mining.authorize` and an unknown method are
+  answered before the socket is closed.
+- The per-IP `mining.authorize` budget (ten a minute, audit H-4) counts only attempts that fail
+  or need a `validateaddress` call: one answered from the address cache or under `--payout` is
+  refunded, so an honest miner reconnecting several times a minute is never refused `Auth
+  Failed`, while password guessing and floods of new addresses stay capped. A repeated
+  `mining.authorize` for the connection's own worker is answered `true` (no node call); one for
+  another worker is answered `Auth Failed` before the socket is closed (it was closed unanswered).
 
 - The job's nTime is the template's `curtime` (the wall clock only when the node sends none),
   no longer `max(curtime, now)`. A chain idle for more than three hours has its median-time-past

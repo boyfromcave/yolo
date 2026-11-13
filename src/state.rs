@@ -34,7 +34,10 @@ pub struct Limits {
     /// Submits refused since the last accepted block (malformed, wrong ntime, duplicate,
     /// high-hash, bad solution, rejected by the node) before the miner is disconnected.
     pub max_bad_submits: u32,
-    /// `mining.authorize` attempts per IP per minute.
+    /// `mining.authorize` attempts per IP per minute that fail or cost a `validateaddress` call
+    /// (audit H-4). A successful one answered without the node (the address cached, or
+    /// `--payout`) is refunded: a miner that reconnects after a stale share or a dropped link
+    /// re-authorizes for free, while password guessing and address floods stay capped.
     pub authorize_per_minute: u32,
     /// How long a `validateaddress` answer is reused.
     pub address_cache_ttl: Duration,
@@ -84,6 +87,9 @@ pub struct Inner {
     pub last_verdict: String,
     pub accepted: u64,
     pub rejected: u64,
+    /// Submits for a job the chain has moved past (another parent, or an unknown job id): answered
+    /// `[21, …]`, never forwarded, not counted in `rejected` nor against the miner.
+    pub stale: u64,
     /// Submits that met the share target but not the block's (`--share-ratio`); never forwarded.
     pub shares: u64,
     /// The `previousblockhash` (wire order, as `Work` carries it) of the last job the node
@@ -142,6 +148,7 @@ impl Shared {
                 last_verdict: String::new(),
                 accepted: 0,
                 rejected: 0,
+                stale: 0,
                 shares: 0,
                 accepted_parent: None,
             }),
@@ -188,6 +195,8 @@ impl Shared {
     }
 
     /// One `mining.authorize` attempt from `ip`; false once the per-minute budget is spent.
+    /// Charged before the attempt so concurrent sockets from one IP cannot overrun it; a cheap
+    /// success is given back with `authorize_refund`.
     pub fn authorize_allowed(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
         let mut m = self.authorize_rate.lock().unwrap_or_else(|e| e.into_inner());
@@ -203,6 +212,15 @@ impl Shared {
         }
         e.1 += 1;
         true
+    }
+
+    /// Gives back the attempt `authorize_allowed` charged: the authorization succeeded without a
+    /// `validateaddress` call.
+    pub fn authorize_refund(&self, ip: IpAddr) {
+        let mut m = self.authorize_rate.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = m.get_mut(&ip) {
+            e.1 = e.1.saturating_sub(1);
+        }
     }
 
     /// A cached `validateaddress` answer for `address`, if still fresh.
@@ -253,6 +271,7 @@ impl Shared {
             "lastSubmitVerdict": g.last_verdict,
             "accepted": g.accepted,
             "rejected": g.rejected,
+            "stale": g.stale,
             "shares": g.shares,
             "shareRatio": self.limits.share_ratio,
             "uptimeSeconds": self.started.elapsed().as_secs(),
