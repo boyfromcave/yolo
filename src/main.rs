@@ -67,6 +67,11 @@ struct Cli {
     /// (an authorized miner silent for three minutes is disconnected) and shows their speed.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=1_000_000))]
     share_ratio: u32,
+    /// Round the share target down to a power of two (never easier than --share-ratio gives, never
+    /// harder than the block target; at most half the shares), so a miner that turns the target into
+    /// a difficulty and back loses nothing to rounding. No effect at --share-ratio 1.
+    #[arg(long)]
+    share_target_round: bool,
     /// Stratum sockets open at once, authorized or not; further connections are refused.
     #[arg(long, default_value_t = 1024)]
     max_connections: usize,
@@ -139,7 +144,7 @@ fn main() {
         no_flags: cli.no_flags,
         password: cli.password.filter(|p| !p.is_empty()),
         equihash: cli.equihash,
-        limits: yolo::Limits { max_connections: cli.max_connections, max_per_ip: cli.max_per_ip, share_ratio: cli.share_ratio, ..yolo::Limits::default() },
+        limits: yolo::Limits { max_connections: cli.max_connections, max_per_ip: cli.max_per_ip, share_ratio: cli.share_ratio, share_target_round: cli.share_target_round, ..yolo::Limits::default() },
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap_or_else(|e| fail(&e.to_string()));

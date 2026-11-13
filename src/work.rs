@@ -233,6 +233,30 @@ pub fn share_target(block_target_hex: &str, ratio: u32) -> Result<String, String
     Ok(hex::encode(out))
 }
 
+/// `--share-target-round`: the share target rounded down to a power of two, 2^k with k the
+/// position of its highest set bit, so that a miner converting the target to a difficulty and back
+/// loses nothing to rounding. Bounds, with B the block target and S = `share_target(B, ratio)`:
+/// the result R satisfies B ≤ R ≤ S. R ≤ S: never easier than the configured ratio gives (at most
+/// as many shares). R ≥ B: never harder than the block target, so a miner filtering by R still
+/// submits every block (when rounding would go below B, as at ratio 1 or a B that is itself not a
+/// power of two at ratio < 2, R is B). R > S/2 whenever R ≠ B: the share rate drops by less than
+/// half. With S all ones (the ratio overflowed the cap) R is 2^255.
+pub fn round_share_target(share_target_hex: &str, block_target_hex: &str) -> Result<String, String> {
+    let s = hex::decode(share_target_hex).map_err(|e| format!("share target is not hex: {}", e))?;
+    let b = hex::decode(block_target_hex).map_err(|e| format!("block target is not hex: {}", e))?;
+    if s.len() != 32 || b.len() != 32 {
+        return Err(format!("targets are {} and {} bytes, not 32", s.len(), b.len()));
+    }
+    let mut r = [0u8; 32];
+    if let Some(i) = s.iter().position(|&x| x != 0) {
+        r[i] = 1 << (7 - s[i].leading_zeros());
+    }
+    if r.as_slice() < b.as_slice() {
+        return Ok(hex::encode(b));
+    }
+    Ok(hex::encode(r))
+}
+
 /// Audit H-3: the pool's own proof-of-work check before `submitblock`. True when the block
 /// hash is at or below the template's `target` (both big-endian), the same comparison
 /// `CheckProofOfWork` makes; the Equihash solution itself is left to the node.
@@ -472,6 +496,49 @@ mod tests {
         assert!(!meets_target(header, "0046e4b6a90d196f32d29d71df7ab3347ca2450ef991a7e0ece486a4c5a64dd4").unwrap());
         // a quarter of the block target (0032bc80…) is below the hash
         assert!(!meets_target(header, &format!("0032bc80{}", "0".repeat(56))).unwrap());
+    }
+
+    /// The 256-bit target of a compact nBits (test helper; mantissa < 0x800000, exponent ≥ 3).
+    fn target_of_bits(bits: u32) -> String {
+        let (exp, mantissa) = ((bits >> 24) as usize, bits & 0x00ff_ffff);
+        let mut t = [0u8; 32];
+        for (j, byte) in mantissa.to_be_bytes()[1..].iter().enumerate() {
+            t[32 - exp + j] = *byte;
+        }
+        hex::encode(t)
+    }
+
+    #[test]
+    fn share_target_rounds_down_to_a_power_of_two_within_its_bounds() {
+        let zeros = |n: usize| "0".repeat(n);
+        // (nBits seen on the fast testnet on 2026-11-13, ratio, rounded share target)
+        let cases = [
+            (0x2000caf2, 32, format!("10{}", zeros(62))),    // block 510,700: S = 195e40…
+            (0x2000caf2, 2, format!("01{}", zeros(62))),     // S = 0195e4…
+            (0x2000caf2, 1, format!("00caf2{}", zeros(58))), // ratio 1: rounding would go below B, so B
+            (0x2000ced1, 32, format!("10{}", zeros(62))),    // block 510,699: S = 19da20…
+            (0x2003873c, 32, format!("40{}", zeros(62))),    // block 510,621: S = 70e780…
+            (0x2006b851, 32, format!("80{}", zeros(62))),    // block 510,555: S = d70a20…
+            (0x2007ffff, 32, format!("80{}", zeros(62))),    // the powLimit block 510,561: S = ffffe0…
+            (0x200f0f0f, 32, format!("80{}", zeros(62))),    // regtest: S overflows to all ones
+        ];
+        for (bits, ratio, want) in cases {
+            let block = target_of_bits(bits);
+            let share = share_target(&block, ratio).unwrap();
+            let rounded = round_share_target(&share, &block).unwrap();
+            assert_eq!(rounded, want, "nBits {:08x} ratio {}", bits, ratio);
+            // the bounds: B ≤ R ≤ S, and R > S/2 unless R is B
+            assert!(block <= rounded && rounded <= share, "nBits {:08x} ratio {}", bits, ratio);
+            if rounded != block {
+                // 2R ≥ S (2R is capped at all ones when R is 2^255)
+                assert!(share_target(&rounded, 2).unwrap() >= share, "nBits {:08x} ratio {}: R > S/2", bits, ratio);
+            }
+        }
+        assert_eq!(target_of_bits(0x2000caf2), format!("00caf2{}", zeros(58)));
+        // the real header of block 510,700 (hash 0046e4b6…) meets the rounded target as it did S
+        let header = include_str!("../tests/vectors/fast-testnet-header-510700.hex").trim();
+        assert!(meets_target(header, &format!("10{}", zeros(62))).unwrap());
+        assert!(round_share_target("00", &zeros(64)).is_err());
     }
 
     #[test]

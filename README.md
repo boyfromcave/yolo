@@ -119,7 +119,7 @@ own byte scan and logs `tag: quote|signal|none` (`signal` is a tag with a zero p
 ```
 {"payout":"username","tagPayoutKey":"node","text":true,"noFlags":false,"equihash":"48,5",
  "nodeUp":true,"height":104,"templateAgeSeconds":0.0,"miners":1,"connections":1,
- "tag":"quote","lastSubmitVerdict":"accepted","accepted":1,"rejected":0,"stale":0,"highHash":0,"uptimeSeconds":12}
+ "tag":"quote","lastSubmitVerdict":"accepted","accepted":1,"rejected":0,"stale":0,"highHash":0,"shareTargetRound":false,"uptimeSeconds":12}
 ```
 
 `payout` is the string `"username"` or the fixed `--payout` address; `text` is whether
@@ -217,6 +217,13 @@ full job is refused `job-full` without counting against the miner. Shares pay
 nothing (the coinbase pays `--payout` or the username whatever the shares say) and their Equihash
 solution is not checked, only their hash against the share target: they show that a miner is
 alive and, as `shares × N` solutions-worth per block interval, roughly how fast the fleet is.
+`--share-target-round` (off by default) sends and checks the share target rounded down to a power
+of two, 2^k at its highest set bit, for miners that turn the target into a difficulty and back
+and might lose precision on the way. With B the block target and S the target `--share-ratio`
+gives, the sent target R keeps B ≤ R ≤ S: never easier than the ratio (at most as many shares),
+never harder than the block target (a miner filtering by R still submits every block; R is B
+where rounding would go below it, as at ratio 1), and above S/2 otherwise (fewer than half the
+shares lost). `/status` reports it as `shareTargetRound`.
 Pick N so a card submits every few seconds to a minute: about (block interval in seconds × cards
 on the pool) / (seconds between a card's shares), e.g. 64 for a few cards on 75-second blocks.
 

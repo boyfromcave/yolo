@@ -750,6 +750,42 @@ fn submit_line(id: u64, job: &Value, ntime: &str, nonce2: &str, solution: &str) 
     format!("{{\"id\":{},\"method\":\"mining.submit\",\"params\":[\"w\",{},\"{}\",\"{}\",\"{}\"]}}", id, job[0], ntime, nonce2, solution)
 }
 
+/// `--share-target-round`: at the fast testnet's nBits 2000caf2 (block 510,700) and ratio 32 the
+/// share target 195e40… is sent as 2^252 (10000…), and shares are checked against that: a hash
+/// between the two is `high-hash`, one at or below 2^252 is a share; status reports the flag.
+#[tokio::test]
+async fn share_target_round_sends_and_checks_a_power_of_two() {
+    let mut t: Value = serde_json::from_str(TEMPLATE).unwrap();
+    let block = format!("00caf2{}", "0".repeat(58));
+    t["target"] = json!(block);
+    let (node, submitted) = fake_node(t).await;
+    let limits = yolo::Limits { share_ratio: 32, share_target_round: true, ..yolo::Limits::default() };
+    let (addr, status_addr, _) = start_hardened(limits, node).await;
+    let sol = format!("24{}", "ab".repeat(36));
+    let mut m = Miner::connect(addr).await;
+    let nonce1 = m.subscribe_and_authorize(FIXTURE_ADDRESS).await;
+    let set = m.next(5).await.expect("set_target");
+    assert_eq!(set["method"], json!("mining.set_target"));
+    let rounded = format!("10{}", "0".repeat(62));
+    assert_eq!(set["params"][0], json!(rounded));
+    let job = m.notify().await;
+    let ntime = job[5].as_str().unwrap().to_string();
+    let unrounded = format!("195e40{}", "0".repeat(58));
+    let meets = |n2: &String, t: &str| yolo::work::meets_target(&header_for(&job, &nonce1, n2, &sol), t).unwrap();
+    let nonces = || (0..200_000u64).map(|i| format!("{:036x}", i));
+    // between 2^252 and the unrounded share target: refused high-hash
+    let between = nonces().find(|n2| meets(n2, &unrounded) && !meets(n2, &rounded)).expect("a nonce2 between the targets");
+    m.send(&submit_line(1, &job, &ntime, &between, &sol)).await;
+    assert_eq!(m.response(5).await.unwrap()["error"], json!([23, "high-hash", null]));
+    // at or below 2^252 but above the block target: a share
+    let share = nonces().find(|n2| meets(n2, &rounded) && !meets(n2, &block)).expect("a nonce2 under 2^252");
+    m.send(&submit_line(2, &job, &ntime, &share, &sol)).await;
+    assert_eq!(m.response(5).await.unwrap()["result"], json!(true));
+    let st = status(status_addr).await;
+    assert_eq!((st["shares"].clone(), st["highHash"].clone(), st["shareTargetRound"].clone()), (json!(1), json!(1), json!(true)), "{}", st);
+    assert!(submitted.lock().unwrap().is_empty());
+}
+
 /// Nits 1-3 of the PR 11 review: with `--share-ratio` a share keeps the job and answers true, a
 /// repeat is refused `duplicate`, an ntime other than the job's is refused `bad-ntime`, shares
 /// never reset the bad-submit count (the share target here is the all-ones cap, where any
