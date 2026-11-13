@@ -37,8 +37,8 @@ const JOBS_KEPT: usize = 8;
 /// `JOBS_KEPT × SHARES_PER_JOB × 32` = 32 KiB of them (about 64 KiB with the set's overhead),
 /// and the pool at the default 1,024 connections at most 32 MiB (about 64 MiB). The share that
 /// fills the set is accepted and the miner is moved to a fresh job (`clean_jobs`); a later share
-/// on the full job is refused `job-full`, without counting as a bad submit, since an honest
-/// miner may still have shares for it in flight. At a share every few seconds a job would need
+/// on the full job is refused `job-full`, without counting as a bad submit nor handing out
+/// another job, since an honest miner may still have shares for it in flight. At a share every few seconds a job would need
 /// several minutes to fill, longer than a 75-second block interval.
 const SHARES_PER_JOB: usize = 128;
 /// Accepted shares that forgive one refused submit (`bad_submits` − 1). An honest card whose
@@ -257,6 +257,25 @@ enum Submitted {
     Stale(&'static str),
     /// Refused by the pool's own checks or by the node: the stratum code and the verdict.
     Refused(u32, String),
+}
+
+impl Submitted {
+    /// Whether the miner starts over on fresh work (`set_target` and a clean `mining.notify`): after
+    /// a block, accepted or not, and after a malformed or invalid submit (the Perl's behaviour). A
+    /// share leaves it on its job, and so does a stale submit (the miner already holds, or is about
+    /// to get, the job on the new tip). So do the share-level refusals: a hash above the share
+    /// target (`high-hash`), a repeat (`duplicate`) and a share on a full job (`job-full`, whose
+    /// filling share already moved the miner). Each is a well-formed solution for a job that still
+    /// extends the tip, and a fresh job for each one evicts the kept jobs that a GPU miner is still
+    /// solving, so its next solutions come back `Job not found` (testnet-yb-fast, 2026-11-13: miniZ
+    /// sent about one `high-hash` per five shares, and each one cost a clean job).
+    fn restarts_miner(&self) -> bool {
+        match self {
+            Submitted::Block => true,
+            Submitted::Share | Submitted::Stale(_) => false,
+            Submitted::Refused(code, verdict) => !(*code == ERR_LOW_DIFFICULTY || *code == ERR_DUPLICATE || verdict == "job-full"),
+        }
+    }
 }
 
 impl Client {
@@ -537,10 +556,7 @@ impl Client {
                 // Every submit is answered here, at once for a stale one: nothing between the
                 // request and its answer waits on the node unless the submit is a block on the tip.
                 let verdict = self.submit(&id, &params, state).await;
-                if !matches!(verdict, Submitted::Share | Submitted::Stale(_)) {
-                    // a block, accepted or not, or a refused submit: the miner starts over on fresh
-                    // work (the Perl's behaviour); a share leaves it on its job, and so does a stale
-                    // submit (the miner already holds, or is about to get, the job on the new tip)
+                if verdict.restarts_miner() {
                     self.mining = false;
                     self.ready = false;
                 }
@@ -754,6 +770,31 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn share_level_refusals_leave_the_miner_on_its_job() {
+        let refused = |code, verdict: &str| Submitted::Refused(code, verdict.to_string()).restarts_miner();
+        // a block, and every malformed or invalid submit, start the miner over
+        assert!(Submitted::Block.restarts_miner());
+        for (code, verdict) in [
+            (ERR_OTHER, "bad-submit"),
+            (ERR_OTHER, "bad-ntime"),
+            (ERR_OTHER, "bad-solution"),
+            (ERR_OTHER, "bad-txns"),
+            (ERR_STALE, "inconclusive"),
+            (ERR_STALE, "duplicate"),
+            (ERR_STALE, "bad-prevblk"),
+        ] {
+            assert!(refused(code, verdict), "{} {}", code, verdict);
+        }
+        // shares, stale submits and the share-level refusals do not (the node's own `duplicate`
+        // verdict is a race, code 21, and still does)
+        assert!(!Submitted::Share.restarts_miner());
+        assert!(!Submitted::Stale("Job not found").restarts_miner());
+        assert!(!refused(ERR_LOW_DIFFICULTY, "high-hash"));
+        assert!(!refused(ERR_DUPLICATE, "duplicate"));
+        assert!(!refused(ERR_STALE, "job-full"));
+    }
 
     #[test]
     fn nonce1_is_client_index_plus_random() {

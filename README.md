@@ -149,7 +149,11 @@ once, never forwarded (its block could only be a fork at a height the chain alre
 counted against the miner, counted in `stale` (not in `rejected`), and leaves the miner on the
 job it holds: a GPU miner still submits the solutions it found for the previous job after a
 clean `mining.notify` (miniZ did, on testnet-yb-fast), and each must get its answer rather than
-a new job.
+a new job. The share-level refusals leave the miner on its job too (`high-hash`, the pool's
+`duplicate`, `job-full`): they are counted in `rejected` (and, but for `job-full`, against the
+miner) but hand out no new job, which would evict the kept jobs a GPU is still solving and turn
+its next solutions into `Job not found`. A block (accepted or not) and a malformed or invalid
+submit (`bad-submit`, `bad-ntime`, `bad-solution`) still start the miner over on fresh work.
 Kept jobs on the tip's parent stay valid: a job replaced at the same height (new transactions, a
 new `curtime`) still builds a block on the tip and is still forwarded. A block the node refuses
 because it lost a race (`inconclusive`, `duplicate`, `duplicate-inconclusive`, `bad-prevblk`)

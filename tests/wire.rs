@@ -643,7 +643,7 @@ async fn bad_submits_stay_local_and_get_the_miner_disconnected() {
     let (addr, status_addr, _) = start_hardened(limits, node).await;
     let mut m = Miner::connect(addr).await;
     m.subscribe_and_authorize(FIXTURE_ADDRESS).await;
-    let mut job = m.notify().await;
+    let job = m.notify().await;
     let sol = format!("24{}", "ab".repeat(36));
     // unknown job: answered stale (21), not counted as a bad submit nor as a refusal
     m.send(&format!("{{\"id\":9,\"method\":\"mining.submit\",\"params\":[\"w\",\"999\",\"b61cba6a\",\"{}\",\"{}\"]}}", "0".repeat(36), sol)).await;
@@ -652,13 +652,12 @@ async fn bad_submits_stay_local_and_get_the_miner_disconnected() {
     assert_eq!(v["error"], json!([21, "Job not found", null]));
     assert_eq!(status(status_addr).await["lastSubmitVerdict"], json!("stale"));
     // three submits that hash above the regtest target: rejected locally, then disconnected
-    // (a stale answer leaves the miner on its job; each refusal after it hands out a new one)
+    // (a stale answer leaves the miner on its job, and so does a high-hash refusal: no
+    // set_target or notify comes between the answers)
     for i in 0..3 {
-        if i > 0 {
-            job = m.notify().await;
-        }
         m.send(&format!("{{\"id\":{},\"method\":\"mining.submit\",\"params\":[\"w\",{},{},\"{}{:02x}\",\"{}\"]}}", 10 + i, job[0], job[5], "f".repeat(34), i, sol)).await;
-        let v = m.response(5).await.unwrap();
+        let v = m.next(5).await.unwrap();
+        assert_eq!(v["id"], json!(10 + i), "no new job after a high-hash refusal: {}", v);
         assert_eq!(v["result"], json!(false), "submit {}", i);
         assert_eq!(v["error"], json!([23, "high-hash", null]), "submit {}", i);
     }
@@ -772,12 +771,14 @@ async fn shares_duplicates_and_ntime() {
     }
     assert_eq!(state.lock().shares, 20);
     assert!(submitted.lock().unwrap().is_empty(), "shares never reach the node");
-    // the same share again: refused, counted bad
+    // the same share again: refused, counted bad, and the miner stays on its job (no new job
+    // comes before the answer to the next request)
     m.send(&submit_line(40, &job, &ntime, first_share.as_ref().unwrap(), &sol)).await;
     assert_eq!(m.response(5).await.unwrap()["result"], json!(false));
     assert_eq!(status(status_addr).await["lastSubmitVerdict"], json!("duplicate"));
-    // an ntime the job did not carry: refused before hashing, counted bad
-    let job = m.notify().await;
+    m.send("{\"id\":44,\"method\":\"mining.extranonce.subscribe\",\"params\":[]}").await;
+    assert_eq!(m.next(5).await.expect("connected")["id"], json!(44), "a duplicate hands out no new job");
+    // an ntime the job did not carry: refused before hashing, counted bad (a new job follows)
     let rolled = format!("{:08x}", u32::from_str_radix(job[5].as_str().unwrap(), 16).unwrap().wrapping_add(1));
     let n2 = grind(&job, &nonce1, &sol, &target, false, from);
     m.send(&submit_line(41, &job, &rolled, &n2, &sol)).await;
