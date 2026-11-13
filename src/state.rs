@@ -31,14 +31,16 @@ pub struct Limits {
     pub idle_keepalives: u32,
     /// `submitblock` calls in flight across all miners; one per miner by construction.
     pub submits_in_flight: usize,
-    /// Submits rejected locally (malformed, high-hash) before the miner is disconnected.
+    /// Submits refused since the last accepted block (malformed, wrong ntime, duplicate,
+    /// high-hash, bad solution, rejected by the node) before the miner is disconnected.
     pub max_bad_submits: u32,
     /// `mining.authorize` attempts per IP per minute.
     pub authorize_per_minute: u32,
     /// How long a `validateaddress` answer is reused.
     pub address_cache_ttl: Duration,
-    /// Compare each submit's block hash with the target before `submitblock` (audit H-3).
-    /// Off only in the wire-replay tests, whose recorded submits belong to another coinbase.
+    /// Compare each submit's block hash with the target and verify the Equihash solution of
+    /// one that meets it before `submitblock` (audit H-3). Off only in the wire-replay tests,
+    /// whose recorded submits belong to another coinbase.
     pub check_pow: bool,
     /// `--share-ratio`: the target sent to miners is this many times easier than the block's
     /// (capped at the all-ones target). 1 = the block target, as the Perl did.

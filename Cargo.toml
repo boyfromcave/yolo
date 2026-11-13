@@ -22,6 +22,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
 getrandom = "0.3"
 subtle = "2"
+equihash = { version = "0.2", default-features = false }
 
 [features]
 # `cargo test --features regtest` runs the end-to-end tests that need YCASHD (Y3).
@@ -31,4 +32,5 @@ regtest = []
 opt-level = 2
 
 [dev-dependencies]
+blake2b_simd = "1"
 tokio = { version = "1", features = ["full"] }
