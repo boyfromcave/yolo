@@ -21,12 +21,17 @@ pub fn now_unix() -> u32 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0)
 }
 
-/// The job's nTime: the Perl sends wall-clock `time` (`stratumsolo:434`), which a
-/// burst-generated regtest chain rejects as `time-too-old` (its median-time-past runs ahead of
-/// the clock), so take the later of the template's `curtime` and now (Y-F5).
+/// The job's nTime: the template's `curtime`, which the node already keeps inside both header
+/// time rules (ycash6 `src/miner.cpp` `UpdateTime`, ycash-dd the same): at least
+/// median-time-past + 1, so a burst-generated regtest chain whose median-time-past runs ahead of
+/// the clock is not `time-too-old` (Y-F5), and at most median-time-past + 3 hours
+/// (`MAX_FUTURE_BLOCK_TIME_MTP`), so a chain that has been idle for longer than that is not
+/// `time-too-far-ahead-of-mtp` (Y-F10). The Perl sent wall-clock `time` (`stratumsolo:434`)
+/// and the earlier `max(curtime, now)` broke the second rule. The bits the node serves are the
+/// ones for `curtime` (on a testnet, the minimum-difficulty rule depends on it), so the header
+/// time must be that one. Wall-clock time only when the node sends no `curtime`.
 pub fn job_time(t: &BlockTemplate) -> u32 {
-    let curtime = t.curtime.and_then(|c| u32::try_from(c).ok()).unwrap_or(0);
-    curtime.max(now_unix())
+    t.curtime.and_then(|c| u32::try_from(c).ok()).unwrap_or_else(now_unix)
 }
 
 /// Applies a freshly fetched template; returns true when miners need new work.
@@ -142,5 +147,40 @@ pub async fn run(state: State) {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn template(curtime: Option<i64>) -> BlockTemplate {
+        let mut t: BlockTemplate = serde_json::from_str(include_str!("../tests/vectors/regtest-template-105.json")).unwrap();
+        t.curtime = curtime;
+        t
+    }
+
+    /// testnet-yb-fast block 510,432 (2026-11-13): the chain had been idle for two days, so the
+    /// node served `curtime` = median-time-past + 3 h, well before the wall clock. The header must
+    /// carry that time; the wall clock is `time-too-far-ahead-of-mtp` (Y-F10).
+    #[test]
+    fn job_time_is_the_node_curtime_even_far_behind_the_clock() {
+        let curtime = 1_794_402_051;
+        assert!(now_unix() > curtime + 3 * 3600);
+        assert_eq!(job_time(&template(Some(curtime as i64))), curtime);
+    }
+
+    /// Y-F5: a regtest chain whose median-time-past runs ahead of the clock: `curtime` is ahead too.
+    #[test]
+    fn job_time_ahead_of_the_clock_is_kept() {
+        let ahead = now_unix() + 3600;
+        assert_eq!(job_time(&template(Some(ahead as i64))), ahead);
+    }
+
+    #[test]
+    fn job_time_without_curtime_is_the_clock() {
+        let before = now_unix();
+        let t = job_time(&template(None));
+        assert!(t >= before && t <= now_unix());
     }
 }

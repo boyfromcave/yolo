@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased — header time after an idle chain, shares
+
+- The job's nTime is the template's `curtime` (the wall clock only when the node sends none),
+  no longer `max(curtime, now)`. A chain idle for more than three hours has its median-time-past
+  that far behind the clock, the node caps `curtime` at median-time-past + 3 hours
+  (`MAX_FUTURE_BLOCK_TIME_MTP`), and every block yolo built on the wall clock was rejected
+  `time-too-far-ahead-of-mtp` (Y-F10, found mining testnet-yb-fast block 510,432 after a two-day
+  pause). The node's `curtime` is also never below median-time-past + 1, which Y-F5 needed.
+- `--share-ratio N` (default 1, unchanged behaviour): the miners' target is N times easier than the
+  block's; a submit between the two is a share, answered `true`, counted in `/status` (`shares`,
+  `shareRatio`), never forwarded, and the miner keeps its job. Without it a GPU that finds no
+  block for three minutes is disconnected as silent (Y-F11, seen on testnet-yb-fast with a CPU
+  miner at 20 s per nonce).
+- A submit must carry the job's `ntime` (the pool offers no ntime rolling; ZIP 301 lets a server
+  enforce it, and Equihash miners echo it): any other is refused `bad-ntime`, so a miner cannot move
+  the header off the node's `curtime`.
+- Duplicate submits are refused `duplicate`: each job remembers the SHA256d of up to 128 counted
+  headers (at most 32 KiB per connection, 32 MiB at 1,024 connections, before the set's overhead), checked across the connection's last eight jobs; the share that fills a job moves the
+  miner to a fresh one, and a later share on it is refused `job-full` (not counted against it).
+- The Equihash solution of a submit that meets the block target is verified in the pool, off the
+  reactor and under the submit-slot limit, before `submitblock`; an invalid one is refused
+  `bad-solution` and never reaches the node (a peer could grind a garbage solution to the target
+  with SHA256d alone and make the node verify it).
+- The bad-submit count runs from the miner's last accepted block: duplicates, wrong `ntime`, bad
+  solutions and blocks the node rejects count, except the race verdicts (`inconclusive`,
+  `duplicate`, `duplicate-inconclusive`, `bad-prevblk`); every 32 accepted shares forgive one, so
+  an honest card's occasional invalid solution never adds up to a disconnect, while a flood with
+  fewer shares between refusals still does. A block is remembered as a duplicate only once the
+  node has answered, so a retry after an RPC error goes through.
+
 ## Unreleased — security CI
 
 - Security CI (SECURITY-CI.md): Semgrep with yolo's own rules (no `yed_*` RPC, stock mining RPCs

@@ -213,6 +213,26 @@ pub fn header_hash_display(header_hex: &str) -> Result<String, String> {
     Ok(hex::encode(h))
 }
 
+/// The share target for `--share-ratio`: the block target (64 hex, big-endian) times `ratio`,
+/// capped at the all-ones target. Ratio 1 is the block target itself.
+pub fn share_target(block_target_hex: &str, ratio: u32) -> Result<String, String> {
+    let t = hex::decode(block_target_hex).map_err(|e| format!("target is not hex: {}", e))?;
+    if t.len() != 32 {
+        return Err(format!("target is {} bytes, not 32", t.len()));
+    }
+    let mut out = [0u8; 32];
+    let mut carry: u64 = 0;
+    for i in (0..32).rev() {
+        let v = t[i] as u64 * ratio as u64 + carry;
+        out[i] = (v & 0xff) as u8;
+        carry = v >> 8;
+    }
+    if carry != 0 {
+        out = [0xff; 32];
+    }
+    Ok(hex::encode(out))
+}
+
 /// Audit H-3: the pool's own proof-of-work check before `submitblock`. True when the block
 /// hash is at or below the template's `target` (both big-endian), the same comparison
 /// `CheckProofOfWork` makes; the Equihash solution itself is left to the node.
@@ -430,6 +450,38 @@ mod tests {
     fn payout_label_for_status() {
         assert_eq!(policy(None, None).payout_label(), "username");
         assert_eq!(policy(fixed(NODE_SPK), None).payout_label(), "fixed");
+    }
+
+    #[test]
+    fn share_target_scales_and_caps() {
+        let block = "0007ffff00000000000000000000000000000000000000000000000000000000";
+        assert_eq!(share_target(block, 1).unwrap(), block);
+        assert_eq!(share_target(block, 2).unwrap(), "000ffffe00000000000000000000000000000000000000000000000000000000");
+        assert_eq!(share_target(block, 32).unwrap(), "00ffffe000000000000000000000000000000000000000000000000000000000");
+        // at testnet's PoW limit, ratio 32 admits almost every solution and 64 overflows to all of them
+        let limit = "07ffff0000000000000000000000000000000000000000000000000000000000";
+        assert_eq!(share_target(limit, 32).unwrap(), format!("ffffe0{}", "0".repeat(58)));
+        assert_eq!(share_target(limit, 64).unwrap(), "f".repeat(64));
+        assert!(share_target("07ff", 2).is_err());
+        // a header that misses the block target but meets the share target
+        let t: BlockTemplate = serde_json::from_str(include_str!("../tests/vectors/regtest-template-105.json")).unwrap();
+        let raw = include_str!("../tests/vectors/regtest-block-105.hex").trim();
+        let header = &raw[..280 + 74];
+        assert!(meets_target(header, &t.target).unwrap());
+        let hash = header_hash_display(header).unwrap();
+        let just_below = format!("{:0>64}", "0"); // nothing meets the zero target
+        assert!(!meets_target(header, &just_below).unwrap());
+        let mut hard = hex::decode(&hash).unwrap();
+        // a block target one below the hash: missed; the share target at ratio 2 admits it
+        let mut i = 31;
+        while hard[i] == 0 {
+            hard[i] = 0xff;
+            i -= 1;
+        }
+        hard[i] -= 1;
+        let hard = hex::encode(hard);
+        assert!(!meets_target(header, &hard).unwrap());
+        assert!(meets_target(header, &share_target(&hard, 2).unwrap()).unwrap());
     }
 
     #[test]

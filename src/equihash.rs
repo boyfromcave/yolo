@@ -49,6 +49,23 @@ impl Equihash {
     }
 }
 
+impl Equihash {
+    /// Verifies the Equihash solution of a serialized block header (140 bytes, then the
+    /// compact size and the solution), as the node's `CheckEquihashSolution` does: the input is
+    /// the first 108 bytes (version to bits), the nonce the next 32, the personalization
+    /// `ZcashPoW` ‖ n ‖ k (`ref/ycash/src/crypto/equihash.cpp:162-165`).
+    pub fn verify_header(&self, header: &[u8]) -> Result<(), String> {
+        const INPUT: usize = 108;
+        const NONCE: usize = 32;
+        let prefix = crate::codec::compact_size(self.solution_len() as u64);
+        let start = INPUT + NONCE + prefix.len();
+        if header.len() != start + self.solution_len() || header[INPUT + NONCE..start] != prefix[..] {
+            return Err(format!("header is {} bytes, not {} for {}", header.len(), start + self.solution_len(), self));
+        }
+        equihash::is_valid_solution(self.n, self.k, &header[..INPUT], &header[INPUT..INPUT + NONCE], &header[start..]).map_err(|e| format!("invalid solution: {}", e))
+    }
+}
+
 impl fmt::Display for Equihash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{},{}", self.n, self.k)
@@ -104,6 +121,22 @@ mod tests {
         // the regtest block 105 solution, as the miner would send it
         let raw = include_str!("../tests/vectors/regtest-block-105.hex").trim();
         assert!(Equihash::REGTEST.check_solution_hex(&raw[280..280 + 74]).is_ok());
+    }
+
+    #[test]
+    fn verifies_the_regtest_block_105_solution() {
+        let raw = include_str!("../tests/vectors/regtest-block-105.hex").trim();
+        let header = hex::decode(&raw[..2 * (140 + 37)]).unwrap();
+        assert_eq!(Equihash::REGTEST.verify_header(&header), Ok(()));
+        // one bit of the solution, the nonce or the input flipped: invalid
+        for at in [140 + 1, 140 + 36, 108, 4, 100] {
+            let mut bad = header.clone();
+            bad[at] ^= 1;
+            assert!(Equihash::REGTEST.verify_header(&bad).is_err(), "byte {}", at);
+        }
+        // the wrong parameters or length
+        assert!(Equihash::MAINNET.verify_header(&header).is_err());
+        assert!(Equihash::REGTEST.verify_header(&header[..170]).is_err());
     }
 
     #[test]

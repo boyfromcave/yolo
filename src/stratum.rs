@@ -6,7 +6,7 @@
 //! (`ref/yolo/stratumsolo`, `stratumpool`; plan §3.2.2). Nothing here knows about Yellowback
 //! beyond logging the tag of the job it hands out.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -18,9 +18,10 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+use crate::codec::dsha256;
 use crate::poller::job_time;
 use crate::state::State;
-use crate::work::{assemble_block, assemble_header, build_work, meets_target, BuildParams, Submit, Work};
+use crate::work::{assemble_block, assemble_header, build_work, meets_target, share_target, BuildParams, Submit, Work};
 
 /// Bytes of nonce the pool fixes per client: the Perl's `nonce1_size` is 16 but
 /// `sprintf("%04x", id) . newkey(16 - 4)` yields 4 + 24 = 28 hex chars, i.e. 14 bytes
@@ -31,6 +32,32 @@ pub const NONCE1_SIZE: usize = 14;
 pub const NONCE1_HEX_LEN: usize = NONCE1_SIZE * 2;
 pub const MINER_TIMEOUT: Duration = Duration::from_secs(60);
 const JOBS_KEPT: usize = 8;
+/// Headers remembered per job for the duplicate check (`--share-ratio`). A job's set holds at
+/// most this many 32-byte header hashes and dies with the job, so one connection holds at most
+/// `JOBS_KEPT × SHARES_PER_JOB × 32` = 32 KiB of them (about 64 KiB with the set's overhead),
+/// and the pool at the default 1,024 connections at most 32 MiB (about 64 MiB). The share that
+/// fills the set is accepted and the miner is moved to a fresh job (`clean_jobs`); a later share
+/// on the full job is refused `job-full`, without counting as a bad submit, since an honest
+/// miner may still have shares for it in flight. At a share every few seconds a job would need
+/// several minutes to fill, longer than a 75-second block interval.
+const SHARES_PER_JOB: usize = 128;
+/// Accepted shares that forgive one refused submit (`bad_submits` − 1). An honest card whose
+/// refused submits stay under one in this many shares (about 3 %, far above a healthy GPU's
+/// invalid-solution rate) never accumulates to a disconnect. A peer must send this many shares
+/// for each refused submit it wants forgiven: at the all-ones share target those shares are
+/// free, so it can keep at most one refused submit (one Equihash check, ~14 µs at 192,7) per
+/// thirty-three lines, and a flood with fewer shares between refusals still reaches the limit.
+pub const SHARES_PER_FORGIVEN: u32 = 32;
+/// The node's `submitblock` verdicts for a block that lost a race (another block at the height,
+/// or a tip that moved on): not the miner's fault, never counted as bad submits.
+const RACE_VERDICTS: [&str; 4] = ["inconclusive", "duplicate", "duplicate-inconclusive", "bad-prevblk"];
+
+/// A job handed out and the shares already counted on it.
+struct Job {
+    work: Work,
+    /// SHA256d of each counted share's header (nonce2 and solution included).
+    shares: HashSet<[u8; 32]>,
+}
 
 pub fn make_nonce1(client_index: u64) -> String {
     let mut random = [0u8; NONCE1_SIZE - 2];
@@ -183,19 +210,35 @@ struct Client {
     worker: String,
     script_pubkey: Option<Vec<u8>>,
     work_number: u64,
-    jobs: VecDeque<Work>,
+    jobs: VecDeque<Job>,
     last_write: Instant,
     /// When the socket was accepted (the `mining.authorize` deadline counts from here).
     connected_at: Instant,
     /// When the miner last sent a line (the idle deadline counts from here).
     last_read: Instant,
-    /// Submits rejected locally since the last good one (audit H-3).
+    /// Submits refused (by the pool's own checks or by the node, race verdicts aside) less those
+    /// forgiven by shares (`SHARES_PER_FORGIVEN`); cleared by a block the node accepts (audit
+    /// H-3). A share never clears it: at the all-ones share target any well-formed submit is a
+    /// share, and a share's solution is not checked.
     bad_submits: u32,
+    /// Shares since a refused submit was last forgiven.
+    share_credit: u32,
 }
 
 enum Action {
     Continue,
     Disconnect,
+}
+
+/// What a `mining.submit` came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Submitted {
+    /// The node accepted the block.
+    Block,
+    /// Met the share target only (`--share-ratio`).
+    Share,
+    /// Refused by the pool's own checks or by the node.
+    Refused,
 }
 
 impl Client {
@@ -218,6 +261,7 @@ impl Client {
             connected_at: now,
             last_read: now,
             bad_submits: 0,
+            share_credit: 0,
         }
     }
 
@@ -261,7 +305,7 @@ impl Client {
                 _ = keepalive => {
                     // Never re-notify a job the node has already built past.
                     if self.mining && !state.lock().template_stale() {
-                        if let Some(w) = self.jobs.back() {
+                        if let Some(Job { work: w, .. }) = self.jobs.back() {
                             out.push_str(&msg_notify(w, false));
                             debug!("miner {}: keepalive re-notify job {}", self.index, w.job_id);
                         }
@@ -311,7 +355,9 @@ impl Client {
             return;
         }
         if !self.ready {
-            out.push_str(&msg_set_target(&template.target));
+            // --share-ratio: an easier target than the block's keeps a miner talking between blocks
+            let target = share_target(&template.target, state.limits.share_ratio).unwrap_or_else(|_| template.target.clone());
+            out.push_str(&msg_set_target(&target));
             self.ready = true;
         }
         if !self.mining {
@@ -330,7 +376,7 @@ impl Client {
             if let Some(w) = work {
                 out.push_str(&msg_notify(&w, true));
                 debug!("miner {}: job {} height {} tag {}", self.index, w.job_id, w.height, w.tag_kind());
-                self.jobs.push_back(w);
+                self.jobs.push_back(Job { work: w, shares: HashSet::new() });
                 while self.jobs.len() > JOBS_KEPT {
                     self.jobs.pop_front();
                 }
@@ -458,10 +504,14 @@ impl Client {
                     warn!("miner {}: submit before authorize, disconnecting", self.index);
                     return Action::Disconnect;
                 }
-                self.mining = false;
-                self.ready = false;
-                let ok = self.submit(&id, &params, state).await;
-                out.push_str(&msg_submit_result(&id, ok));
+                let verdict = self.submit(&id, &params, state).await;
+                if verdict != Submitted::Share {
+                    // a block, accepted or not, or a refused submit: the miner starts over on fresh
+                    // work (the Perl's behaviour); a share leaves it on its job
+                    self.mining = false;
+                    self.ready = false;
+                }
+                out.push_str(&msg_submit_result(&id, verdict != Submitted::Refused));
                 if self.bad_submits >= state.limits.max_bad_submits {
                     warn!("miner {}: {} bad submits, disconnecting", self.index, self.bad_submits);
                     return Action::Disconnect;
@@ -475,70 +525,166 @@ impl Client {
         }
     }
 
-    /// `mining.submit` [worker, job id, ntime, nonce2, solution] → true only when the node
-    /// returns null; the verdict string is logged and kept for `/status`. A submit that fails
-    /// the pool's own checks (shape, unknown job, hash above target) never reaches the node
-    /// (audit H-3, H-17).
-    async fn submit(&mut self, _id: &Value, params: &[Value], state: &State) -> bool {
+    /// `mining.submit` [worker, job id, ntime, nonce2, solution] → a block the node accepted
+    /// (`submitblock` returned null), a share (`--share-ratio`: the hash meets the share target
+    /// but not the block's; counted, never forwarded, its Equihash solution unchecked: shares
+    /// only show that a miner is alive and how fast it is), or refused; a refusal's verdict
+    /// string is logged and kept for `/status`. A submit that fails the pool's own checks
+    /// (shape, unknown job, an `ntime` other than the job's, a repeat, hash above the share
+    /// target, an Equihash solution that does not verify) never reaches the node (audit H-3,
+    /// H-17).
+    async fn submit(&mut self, _id: &Value, params: &[Value], state: &State) -> Submitted {
         let p = |i: usize| params.get(i).and_then(Value::as_str).unwrap_or("");
         let job_id = p(1);
-        let Some(work) = self.jobs.iter().rev().find(|w| w.job_id == job_id).cloned() else {
+        let Some(slot) = self.jobs.iter().rposition(|j| j.work.job_id == job_id) else {
             warn!("miner {}: submit for unknown job {}", self.index, shown(job_id));
             self.record(state, "stale");
-            return false;
+            return Submitted::Refused;
         };
+        let work = self.jobs[slot].work.clone();
         let submit = match Submit::check(p(2), p(3), p(4), self.nonce1.len(), state.equihash) {
             Ok(s) => s,
             Err(e) => {
                 warn!("miner {}: bad submit for job {}: {}", self.index, job_id, e);
                 self.bad_submits += 1;
                 self.record(state, "bad-submit");
-                return false;
+                return Submitted::Refused;
             }
         };
+        // The pool offers no ntime rolling: the header time is the job's, which is the node's
+        // `curtime` (Y-F10). ZIP 301 lets a server enforce TIME unchanged, and the Equihash
+        // miners (lolMiner, GMiner, miniZ, nheqminer, the devnet `stratum-miner`) echo the
+        // job's nTime in `mining.submit`.
+        if submit.ntime != work.time {
+            warn!("miner {}: submit for job {} has ntime {} instead of the job's {}", self.index, job_id, shown(&submit.ntime), work.time);
+            self.bad_submits += 1;
+            self.record(state, "bad-ntime");
+            return Submitted::Refused;
+        }
         let header = assemble_header(&work, &self.nonce1, &submit);
+        // The header hash identifies the submit; it is also checked against every kept job,
+        // since jobs re-issued from an unchanged template have the same header fields.
+        let key = match hex::decode(&header) {
+            Ok(bytes) => dsha256(&bytes),
+            Err(e) => {
+                warn!("miner {}: cannot hash submit for job {}: {}", self.index, job_id, e);
+                self.bad_submits += 1;
+                self.record(state, "bad-submit");
+                return Submitted::Refused;
+            }
+        };
+        if self.jobs.iter().any(|j| j.shares.contains(&key)) {
+            warn!("miner {}: duplicate submit for job {}", self.index, job_id);
+            self.bad_submits += 1;
+            self.record(state, "duplicate");
+            return Submitted::Refused;
+        }
         match if state.limits.check_pow { meets_target(&header, &work.target) } else { Ok(true) } {
             Ok(true) => {}
+            Ok(false) if state.limits.share_ratio > 1 && share_target(&work.target, state.limits.share_ratio).and_then(|t| meets_target(&header, &t)).unwrap_or(false) => {
+                // A share neither counts as a bad submit nor clears the count (see `bad_submits`).
+                let shares = &mut self.jobs[slot].shares;
+                if shares.len() >= SHARES_PER_JOB {
+                    debug!("miner {}: share for full job {} refused", self.index, job_id);
+                    self.record(state, "job-full");
+                    return Submitted::Refused;
+                }
+                shares.insert(key);
+                if shares.len() >= SHARES_PER_JOB {
+                    // the set is full: move the miner to a fresh job (`clean_jobs`)
+                    self.mining = false;
+                }
+                self.share_credit += 1;
+                if self.share_credit >= SHARES_PER_FORGIVEN {
+                    self.share_credit = 0;
+                    self.bad_submits = self.bad_submits.saturating_sub(1);
+                }
+                state.lock().shares += 1;
+                debug!("miner {}: share for job {}", self.index, job_id);
+                return Submitted::Share;
+            }
             Ok(false) => {
                 warn!("miner {}: submit for job {} is above the target, not forwarded", self.index, job_id);
                 self.bad_submits += 1;
                 self.record(state, "high-hash");
-                return false;
+                return Submitted::Refused;
             }
             Err(e) => {
                 warn!("miner {}: cannot hash submit for job {}: {}", self.index, job_id, e);
                 self.bad_submits += 1;
                 self.record(state, "bad-submit");
-                return false;
+                return Submitted::Refused;
             }
         }
-        self.bad_submits = 0;
         let block = assemble_block(&work, &self.nonce1, &submit);
         let rpc = state.rpc.clone();
-        // Audit H-3: at most `submits_in_flight` submitblock calls at once, pool-wide.
+        // Audit H-3: at most `submits_in_flight` verifications and submitblock calls at once,
+        // pool-wide.
         let _permit = state.submit_permits.acquire().await;
+        if state.limits.check_pow {
+            // The Equihash solution is checked here, off the reactor, and only for a header that
+            // already meets the block target (the SHA256d check above is the cheap filter): a
+            // peer can grind a garbage solution to the target with SHA256d alone, and the node
+            // must not be made to verify it.
+            let equihash = state.equihash;
+            let header_hex = header.clone();
+            let checked = tokio::task::spawn_blocking(move || hex::decode(&header_hex).map_err(|e| e.to_string()).and_then(|h| equihash.verify_header(&h))).await;
+            match checked {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!("miner {}: submit for job {} meets the target with an invalid Equihash solution ({}), not forwarded", self.index, job_id, e);
+                    self.remember(slot, key);
+                    self.bad_submits += 1;
+                    self.record(state, "bad-solution");
+                    return Submitted::Refused;
+                }
+                Err(e) => {
+                    warn!("miner {}: Equihash task: {}", self.index, e);
+                    self.record(state, "task-error");
+                    return Submitted::Refused;
+                }
+            }
+        }
         let verdict = tokio::task::spawn_blocking(move || rpc.submitblock(&block)).await;
+        if let Ok(Ok(_)) = verdict {
+            // the node has answered: a repeat is refused `duplicate`; after an RPC or task error
+            // the miner's retry still goes through
+            self.remember(slot, key);
+        }
         match verdict {
             Ok(Ok(None)) => {
                 info!("miner {}: block {} accepted by the node (job {}, tag {})", self.index, work.height, job_id, work.tag_kind());
+                self.bad_submits = 0;
                 state.block_accepted(&work.previousblockhash);
-                true
+                Submitted::Block
             }
             Ok(Ok(Some(verdict))) => {
+                // counted: a block the node refuses is the miner's, unless it lost a race (an
+                // RPC failure is not counted either)
                 warn!("miner {}: block {} rejected by the node: {}", self.index, work.height, verdict);
+                if !RACE_VERDICTS.contains(&verdict.as_str()) {
+                    self.bad_submits += 1;
+                }
                 self.record(state, &verdict);
-                false
+                Submitted::Refused
             }
             Ok(Err(e)) => {
                 warn!("miner {}: submitblock failed: {}", self.index, e);
                 self.record(state, &format!("rpc-error: {}", e));
-                false
+                Submitted::Refused
             }
             Err(e) => {
                 warn!("miner {}: submitblock task: {}", self.index, e);
                 self.record(state, "task-error");
-                false
+                Submitted::Refused
             }
+        }
+    }
+
+    /// Remembers a block's header for the duplicate check (bounded like the shares).
+    fn remember(&mut self, slot: usize, key: [u8; 32]) {
+        if self.jobs[slot].shares.len() < SHARES_PER_JOB {
+            self.jobs[slot].shares.insert(key);
         }
     }
 
