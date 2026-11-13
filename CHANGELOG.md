@@ -16,16 +16,19 @@
 - A submit must carry the job's `ntime` (the pool offers no ntime rolling; ZIP 301 lets a server
   enforce it, and Equihash miners echo it): any other is refused `bad-ntime`, so a miner cannot move
   the header off the node's `curtime`.
-- Duplicate submits are refused `duplicate`: each job remembers the SHA256d of up to 1,024 counted
-  headers, checked across the connection's last eight jobs; the share that fills a job moves the
+- Duplicate submits are refused `duplicate`: each job remembers the SHA256d of up to 128 counted
+  headers (at most 32 KiB per connection, 32 MiB at 1,024 connections, before the set's overhead), checked across the connection's last eight jobs; the share that fills a job moves the
   miner to a fresh one, and a later share on it is refused `job-full` (not counted against it).
 - The Equihash solution of a submit that meets the block target is verified in the pool, off the
   reactor and under the submit-slot limit, before `submitblock`; an invalid one is refused
   `bad-solution` and never reaches the node (a peer could grind a garbage solution to the target
   with SHA256d alone and make the node verify it).
 - The bad-submit count runs from the miner's last accepted block: duplicates, wrong `ntime`, bad
-  solutions and blocks the node rejects count; a share neither counts nor clears it (at the
-  all-ones share target any well-formed submit is a share).
+  solutions and blocks the node rejects count, except the race verdicts (`inconclusive`,
+  `duplicate`, `duplicate-inconclusive`, `bad-prevblk`); every 32 accepted shares forgive one, so
+  an honest card's occasional invalid solution never adds up to a disconnect, while a flood with
+  fewer shares between refusals still does. A block is remembered as a duplicate only once the
+  node has answered, so a retry after an RPC error goes through.
 
 ## Unreleased — security CI
 

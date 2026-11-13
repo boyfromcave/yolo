@@ -151,6 +151,7 @@ async fn fake_node_advancing(template: Value, advance: bool) -> (SocketAddr, std
                             let body: Value = serde_json::from_slice(&buf[body_start..body_start + len]).unwrap();
                             let method = body["method"].as_str().unwrap_or("");
                             let params = body["params"].as_array().cloned().unwrap_or_default();
+                            let mut error = Value::Null;
                             let result = match method {
                                 "getblockchaininfo" => json!({ "chain": "regtest", "blocks": 104 }),
                                 "getblocktemplate" => chain.lock().unwrap().clone(),
@@ -158,6 +159,10 @@ async fn fake_node_advancing(template: Value, advance: bool) -> (SocketAddr, std
                                     let block = params[0].as_str().unwrap().to_string();
                                     // test-only template key: the node rejects every block with this verdict
                                     let reject = chain.lock().unwrap().get("_reject").cloned();
+                                    // test-only template key: the next submitblock fails with an RPC error
+                                    if let Some(e) = chain.lock().unwrap().as_object_mut().unwrap().remove("_error_once") {
+                                        error = json!({ "code": -1, "message": e });
+                                    }
                                     if advance {
                                         let mut t = chain.lock().unwrap();
                                         let height = t["height"].as_u64().unwrap() + 1;
@@ -177,7 +182,7 @@ async fn fake_node_advancing(template: Value, advance: bool) -> (SocketAddr, std
                                 }
                                 _ => json!(null),
                             };
-                            let reply = json!({ "result": result, "error": null, "id": body["id"] }).to_string();
+                            let reply = json!({ "result": result, "error": error, "id": body["id"] }).to_string();
                             let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.len(), reply);
                             let _ = socket.write_all(response.as_bytes()).await;
                             let _ = socket.shutdown().await;
@@ -932,5 +937,93 @@ async fn node_rejections_count_as_bad_submits() {
     }
     assert!(m.closed(5).await, "two node rejections disconnect at max_bad_submits 2");
     assert_eq!(status(status_addr).await["lastSubmitVerdict"], json!("bad-txns-test"));
+    assert_eq!(submitted.lock().unwrap().len(), 2);
+}
+
+/// Re-review finding 1: the node's race verdicts (another miner won the height) are not the
+/// miner's fault and never count; accepted shares slowly forgive refused submits.
+#[tokio::test]
+async fn race_verdicts_and_forgiven_bad_submits_keep_an_honest_miner() {
+    let mut t: Value = serde_json::from_str(TEMPLATE).unwrap();
+    t["target"] = json!("f".repeat(64));
+    let (node, submitted, chain) = fake_node_advancing(t, false).await;
+    let limits = yolo::Limits { max_bad_submits: 2, ..yolo::Limits::default() };
+    let (addr, status_addr, _) = start_hardened(limits, node).await;
+    let mut m = Miner::connect(addr).await;
+    let nonce1 = m.subscribe_and_authorize(FIXTURE_ADDRESS).await;
+    for (k, verdict) in ["inconclusive", "duplicate", "duplicate-inconclusive", "bad-prevblk"].iter().enumerate() {
+        let job = m.notify().await;
+        let (n2, solution) = solved(&job, &nonce1, k as u64 * 1_000_000);
+        chain.lock().unwrap()["_reject"] = json!(verdict);
+        m.send(&submit_line(80 + k as u64, &job, job[5].as_str().unwrap(), &n2, &solution)).await;
+        assert_eq!(m.response(5).await.unwrap()["result"], json!(false));
+    }
+    assert_eq!(status(status_addr).await["lastSubmitVerdict"], json!("bad-prevblk"));
+    assert_eq!(submitted.lock().unwrap().len(), 4);
+    // still connected: a fifth request is answered
+    m.send("{\"id\":90,\"method\":\"mining.extranonce.subscribe\",\"params\":[]}").await;
+    assert_eq!(m.response(5).await.unwrap()["result"], json!(true));
+
+    // decay: at max_bad_submits 2, a wrong ntime every SHARES_PER_FORGIVEN shares never
+    // disconnects; two without shares between them do
+    let t: Value = serde_json::from_str(TEMPLATE).unwrap();
+    let target = t["target"].as_str().unwrap().to_string();
+    let (node, _) = fake_node(t).await;
+    let limits = yolo::Limits { share_ratio: 32, max_bad_submits: 2, ..yolo::Limits::default() };
+    let (addr, _, _) = start_hardened(limits, node).await;
+    let mut m = Miner::connect(addr).await;
+    let nonce1 = m.subscribe_and_authorize(FIXTURE_ADDRESS).await;
+    let sol = format!("24{}", "ab".repeat(36));
+    let mut from = 0;
+    let mut id = 100;
+    let mut job = m.notify().await;
+    for _ in 0..4 {
+        // one refused submit (an ntime the job did not carry); the miner gets a fresh job
+        m.send(&submit_line(id, &job, "00000000", &"0".repeat(36), &sol)).await;
+        id += 1;
+        assert_eq!(m.response(5).await.expect("still connected")["result"], json!(false));
+        job = m.notify().await;
+        for _ in 0..yolo::stratum::SHARES_PER_FORGIVEN {
+            let n2 = grind(&job, &nonce1, &sol, &target, false, from);
+            from = u64::from_str_radix(&n2, 16).unwrap() + 1;
+            m.send(&submit_line(id, &job, job[5].as_str().unwrap(), &n2, &sol)).await;
+            id += 1;
+            assert_eq!(m.response(5).await.expect("still connected")["result"], json!(true));
+        }
+    }
+    m.send(&submit_line(id, &job, "00000000", &"0".repeat(36), &sol)).await;
+    id += 1;
+    assert_eq!(m.response(5).await.unwrap()["result"], json!(false));
+    job = m.notify().await;
+    m.send(&submit_line(id, &job, "00000000", &"0".repeat(36), &sol)).await;
+    assert!(m.closed(5).await, "refused submits without shares between them still disconnect");
+}
+
+/// Re-review finding 2: a block whose submitblock failed (RPC or task error) is not remembered,
+/// so the miner's retry reaches the node instead of being refused `duplicate`.
+#[tokio::test]
+async fn a_block_retried_after_an_rpc_error_is_not_a_duplicate() {
+    let mut t: Value = serde_json::from_str(TEMPLATE).unwrap();
+    t["target"] = json!("f".repeat(64));
+    t["_error_once"] = json!("node busy");
+    let (node, submitted) = fake_node(t).await;
+    let (addr, status_addr, _) = start_hardened(yolo::Limits::default(), node).await;
+    let mut m = Miner::connect(addr).await;
+    let nonce1 = m.subscribe_and_authorize(FIXTURE_ADDRESS).await;
+    let job = m.notify().await;
+    let (n2, solution) = solved(&job, &nonce1, 0);
+    let line = submit_line(110, &job, job[5].as_str().unwrap(), &n2, &solution);
+    m.send(&line).await;
+    assert_eq!(m.response(5).await.unwrap()["result"], json!(false));
+    assert!(status(status_addr).await["lastSubmitVerdict"].as_str().unwrap().starts_with("rpc-error"));
+    // the retry on the same (still kept) job reaches the node and is accepted
+    m.send(&line).await;
+    assert_eq!(m.response(5).await.unwrap()["result"], json!(true));
+    assert_eq!(status(status_addr).await["lastSubmitVerdict"], json!("accepted"));
+    assert_eq!(submitted.lock().unwrap().len(), 2);
+    // a third time: the node gave a verdict, so now it is a duplicate
+    m.send(&line).await;
+    assert_eq!(m.response(5).await.unwrap()["result"], json!(false));
+    assert_eq!(status(status_addr).await["lastSubmitVerdict"], json!("duplicate"));
     assert_eq!(submitted.lock().unwrap().len(), 2);
 }

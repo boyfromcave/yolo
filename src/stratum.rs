@@ -32,14 +32,25 @@ pub const NONCE1_SIZE: usize = 14;
 pub const NONCE1_HEX_LEN: usize = NONCE1_SIZE * 2;
 pub const MINER_TIMEOUT: Duration = Duration::from_secs(60);
 const JOBS_KEPT: usize = 8;
-/// Shares remembered per job for the duplicate check (`--share-ratio`). A job's set holds at
+/// Headers remembered per job for the duplicate check (`--share-ratio`). A job's set holds at
 /// most this many 32-byte header hashes and dies with the job, so one connection holds at most
-/// `JOBS_KEPT × SHARES_PER_JOB × 32` bytes of them (256 KiB, plus the set's overhead). The share
-/// that fills the set is accepted and the miner is moved to a fresh job (`clean_jobs`); a later
-/// share on the full job is refused `job-full`, without counting as a bad submit, since an honest
+/// `JOBS_KEPT × SHARES_PER_JOB × 32` = 32 KiB of them (about 64 KiB with the set's overhead),
+/// and the pool at the default 1,024 connections at most 32 MiB (about 64 MiB). The share that
+/// fills the set is accepted and the miner is moved to a fresh job (`clean_jobs`); a later share
+/// on the full job is refused `job-full`, without counting as a bad submit, since an honest
 /// miner may still have shares for it in flight. At a share every few seconds a job would need
-/// about an hour to fill.
-const SHARES_PER_JOB: usize = 1024;
+/// several minutes to fill, longer than a 75-second block interval.
+const SHARES_PER_JOB: usize = 128;
+/// Accepted shares that forgive one refused submit (`bad_submits` − 1). An honest card whose
+/// refused submits stay under one in this many shares (about 3 %, far above a healthy GPU's
+/// invalid-solution rate) never accumulates to a disconnect. A peer must send this many shares
+/// for each refused submit it wants forgiven: at the all-ones share target those shares are
+/// free, so it can keep at most one refused submit (one Equihash check, ~14 µs at 192,7) per
+/// thirty-three lines, and a flood with fewer shares between refusals still reaches the limit.
+pub const SHARES_PER_FORGIVEN: u32 = 32;
+/// The node's `submitblock` verdicts for a block that lost a race (another block at the height,
+/// or a tip that moved on): not the miner's fault, never counted as bad submits.
+const RACE_VERDICTS: [&str; 4] = ["inconclusive", "duplicate", "duplicate-inconclusive", "bad-prevblk"];
 
 /// A job handed out and the shares already counted on it.
 struct Job {
@@ -205,10 +216,13 @@ struct Client {
     connected_at: Instant,
     /// When the miner last sent a line (the idle deadline counts from here).
     last_read: Instant,
-    /// Submits refused (by the pool's own checks or by the node) since the last block the node
-    /// accepted (audit H-3). A share does not reset it: at the all-ones share target any
-    /// well-formed submit is a share, and a share's solution is not checked.
+    /// Submits refused (by the pool's own checks or by the node, race verdicts aside) less those
+    /// forgiven by shares (`SHARES_PER_FORGIVEN`); cleared by a block the node accepts (audit
+    /// H-3). A share never clears it: at the all-ones share target any well-formed submit is a
+    /// share, and a share's solution is not checked.
     bad_submits: u32,
+    /// Shares since a refused submit was last forgiven.
+    share_credit: u32,
 }
 
 enum Action {
@@ -247,6 +261,7 @@ impl Client {
             connected_at: now,
             last_read: now,
             bad_submits: 0,
+            share_credit: 0,
         }
     }
 
@@ -579,6 +594,11 @@ impl Client {
                     // the set is full: move the miner to a fresh job (`clean_jobs`)
                     self.mining = false;
                 }
+                self.share_credit += 1;
+                if self.share_credit >= SHARES_PER_FORGIVEN {
+                    self.share_credit = 0;
+                    self.bad_submits = self.bad_submits.saturating_sub(1);
+                }
                 state.lock().shares += 1;
                 debug!("miner {}: share for job {}", self.index, job_id);
                 return Submitted::Share;
@@ -595,10 +615,6 @@ impl Client {
                 self.record(state, "bad-submit");
                 return Submitted::Refused;
             }
-        }
-        // remembered so a repeat is refused `duplicate` rather than verified or sent again
-        if self.jobs[slot].shares.len() < SHARES_PER_JOB {
-            self.jobs[slot].shares.insert(key);
         }
         let block = assemble_block(&work, &self.nonce1, &submit);
         let rpc = state.rpc.clone();
@@ -617,6 +633,7 @@ impl Client {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     warn!("miner {}: submit for job {} meets the target with an invalid Equihash solution ({}), not forwarded", self.index, job_id, e);
+                    self.remember(slot, key);
                     self.bad_submits += 1;
                     self.record(state, "bad-solution");
                     return Submitted::Refused;
@@ -629,6 +646,11 @@ impl Client {
             }
         }
         let verdict = tokio::task::spawn_blocking(move || rpc.submitblock(&block)).await;
+        if let Ok(Ok(_)) = verdict {
+            // the node has answered: a repeat is refused `duplicate`; after an RPC or task error
+            // the miner's retry still goes through
+            self.remember(slot, key);
+        }
         match verdict {
             Ok(Ok(None)) => {
                 info!("miner {}: block {} accepted by the node (job {}, tag {})", self.index, work.height, job_id, work.tag_kind());
@@ -637,9 +659,12 @@ impl Client {
                 Submitted::Block
             }
             Ok(Ok(Some(verdict))) => {
-                // counted: a block the node refuses is the miner's (an RPC failure is not)
+                // counted: a block the node refuses is the miner's, unless it lost a race (an
+                // RPC failure is not counted either)
                 warn!("miner {}: block {} rejected by the node: {}", self.index, work.height, verdict);
-                self.bad_submits += 1;
+                if !RACE_VERDICTS.contains(&verdict.as_str()) {
+                    self.bad_submits += 1;
+                }
                 self.record(state, &verdict);
                 Submitted::Refused
             }
@@ -653,6 +678,13 @@ impl Client {
                 self.record(state, "task-error");
                 Submitted::Refused
             }
+        }
+    }
+
+    /// Remembers a block's header for the duplicate check (bounded like the shares).
+    fn remember(&mut self, slot: usize, key: [u8; 32]) {
+        if self.jobs[slot].shares.len() < SHARES_PER_JOB {
+            self.jobs[slot].shares.insert(key);
         }
     }
 
