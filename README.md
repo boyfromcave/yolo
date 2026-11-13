@@ -119,7 +119,7 @@ own byte scan and logs `tag: quote|signal|none` (`signal` is a tag with a zero p
 ```
 {"payout":"username","tagPayoutKey":"node","text":true,"noFlags":false,"equihash":"48,5",
  "nodeUp":true,"height":104,"templateAgeSeconds":0.0,"miners":1,"connections":1,
- "tag":"quote","lastSubmitVerdict":"accepted","accepted":1,"rejected":0,"stale":0,"uptimeSeconds":12}
+ "tag":"quote","lastSubmitVerdict":"accepted","accepted":1,"rejected":0,"stale":0,"highHash":0,"uptimeSeconds":12}
 ```
 
 `payout` is the string `"username"` or the fixed `--payout` address; `text` is whether
@@ -149,7 +149,16 @@ once, never forwarded (its block could only be a fork at a height the chain alre
 counted against the miner, counted in `stale` (not in `rejected`), and leaves the miner on the
 job it holds: a GPU miner still submits the solutions it found for the previous job after a
 clean `mining.notify` (miniZ did, on testnet-yb-fast), and each must get its answer rather than
-a new job.
+a new job. The share-level refusals leave the miner on its job too (`high-hash`, the pool's
+`duplicate`, `job-full`): they hand out no new job, which would evict the kept jobs a GPU is still solving and turn
+its next solutions into `Job not found`. A block (accepted or not) and a malformed or invalid
+submit (`bad-submit`, `bad-ntime`, `bad-solution`) still start the miner over on fresh work.
+A `high-hash` submit is counted in `highHash`, like a stale one neither in `rejected` nor
+against the miner: miniZ sends about one per five or six shares, and in a long block gap they
+would add up to a disconnect. It costs the pool one SHA256d, the same as a share, so a flood of
+them is bounded the way shares are (the connection caps and the line limit). `duplicate` and
+`job-full` are counted in `rejected`; `duplicate`, a malformed submit and `bad-solution` (a block
+hash with an Equihash solution that does not verify) count against the miner.
 Kept jobs on the tip's parent stay valid: a job replaced at the same height (new transactions, a
 new `curtime`) still builds a block on the tip and is still forwarded. A block the node refuses
 because it lost a race (`inconclusive`, `duplicate`, `duplicate-inconclusive`, `bad-prevblk`)

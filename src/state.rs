@@ -32,7 +32,7 @@ pub struct Limits {
     /// `submitblock` calls in flight across all miners; one per miner by construction.
     pub submits_in_flight: usize,
     /// Submits refused since the last accepted block (malformed, wrong ntime, duplicate,
-    /// high-hash, bad solution, rejected by the node) before the miner is disconnected.
+    /// bad solution, rejected by the node; not stale or high-hash) before the miner is disconnected.
     pub max_bad_submits: u32,
     /// `mining.authorize` attempts per IP per minute that fail or cost a `validateaddress` call
     /// (audit H-4). A successful one answered without the node (the address cached, or
@@ -90,6 +90,11 @@ pub struct Inner {
     /// Submits for a job the chain has moved past (another parent, or an unknown job id): answered
     /// `[21, …]`, never forwarded, not counted in `rejected` nor against the miner.
     pub stale: u64,
+    /// Submits whose hash is above the share target (`high-hash`, answered `[23, …]`): a GPU
+    /// miner sends some (miniZ about one per five or six shares, testnet-yb-fast 2026-11-13),
+    /// so like a stale submit it is counted here, not in `rejected` nor against the miner. It
+    /// costs the pool one SHA256d, the same as a share; never forwarded.
+    pub high_hash: u64,
     /// Submits that met the share target but not the block's (`--share-ratio`); never forwarded.
     pub shares: u64,
     /// The `previousblockhash` (wire order, as `Work` carries it) of the last job the node
@@ -149,6 +154,7 @@ impl Shared {
                 accepted: 0,
                 rejected: 0,
                 stale: 0,
+                high_hash: 0,
                 shares: 0,
                 accepted_parent: None,
             }),
@@ -272,6 +278,7 @@ impl Shared {
             "accepted": g.accepted,
             "rejected": g.rejected,
             "stale": g.stale,
+            "highHash": g.high_hash,
             "shares": g.shares,
             "shareRatio": self.limits.share_ratio,
             "uptimeSeconds": self.started.elapsed().as_secs(),

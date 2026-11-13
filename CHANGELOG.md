@@ -12,6 +12,17 @@
   testnet-yb-fast miniZ reconnected after each block, and at a block every 5–10 s its reconnects
   ran into the authorize limit below. Jobs on the tip's parent replaced at the same height are
   still taken.
+- A share-level refusal (`high-hash`, the pool's `duplicate`, `job-full`) leaves the miner on its
+  job: no `set_target` and clean `mining.notify` follow it. On
+  testnet-yb-fast (2026-11-13, `--share-ratio 32`) miniZ sent about one `high-hash` for every
+  five shares, and each handed it a fresh job: the connection's eight kept jobs rolled over in a
+  few seconds, and solutions miniZ was still finishing for jobs on the tip came back `Job not
+  found`. A block and a malformed or invalid submit still start the miner over.
+- A `high-hash` submit is counted in the new `/status` field `highHash`, no longer in `rejected`
+  nor against the miner (`max_bad_submits`): at miniZ's rate a long block gap would add up to a
+  disconnect. It costs one SHA256d, like a share. `bad-solution`, `duplicate` and malformed
+  submits still count. The share target is sent and compared as before, checked against a real
+  fast-testnet header (block 510,700): big-endian, 64 hex digits, as the node and the Perl give it.
 - Every refused request carries the stratum error triple `[code, message, null]` (20 other, 21
   stale, 22 duplicate, 23 high-hash, 24 unauthorized; the Perl sent `"result": false` alone, which
   miniZ logs as "Bad share: unknown"); a submit before `mining.authorize` and an unknown method are
