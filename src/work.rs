@@ -452,6 +452,28 @@ mod tests {
         assert_eq!(policy(fixed(NODE_SPK), None).payout_label(), "fixed");
     }
 
+    /// A real fast-testnet header (block 510,700, mined through the pool by miniZ on 2026-11-13,
+    /// `getblockheader <hash> false`) against targets near its hash: the hash is compared big-endian
+    /// as the node displays it (0046e4b6…), the same number `mining.set_target` sends (the target
+    /// as 64 hex digits, leading zeros included, as the node's `getblocktemplate` gives it and as
+    /// the Perl sent it). A byte-reversed comparison (d54da6c5…) would refuse it at every target here.
+    #[test]
+    fn real_fast_testnet_header_against_known_targets() {
+        let header = include_str!("../tests/vectors/fast-testnet-header-510700.hex").trim();
+        assert_eq!(header.len(), 543 * 2, "140 bytes, the compact size fd9001, a 400-byte 192,7 solution");
+        assert_eq!(header_hash_display(header).unwrap(), "0046e4b6a90d196f32d29d71df7ab3347ca2450ef991a7e0ece486a4c5a64dd5");
+        // nBits 2000caf2: the block target, and the share target at ratio 32 (block × 32)
+        let block = format!("00caf2{}", "0".repeat(58));
+        assert!(meets_target(header, &block).unwrap());
+        assert_eq!(share_target(&block, 32).unwrap(), format!("195e40{}", "0".repeat(58)));
+        assert!(meets_target(header, &share_target(&block, 32).unwrap()).unwrap());
+        // the hash itself is the tightest target it meets
+        assert!(meets_target(header, "0046e4b6a90d196f32d29d71df7ab3347ca2450ef991a7e0ece486a4c5a64dd5").unwrap());
+        assert!(!meets_target(header, "0046e4b6a90d196f32d29d71df7ab3347ca2450ef991a7e0ece486a4c5a64dd4").unwrap());
+        // a quarter of the block target (0032bc80…) is below the hash
+        assert!(!meets_target(header, &format!("0032bc80{}", "0".repeat(56))).unwrap());
+    }
+
     #[test]
     fn share_target_scales_and_caps() {
         let block = "0007ffff00000000000000000000000000000000000000000000000000000000";

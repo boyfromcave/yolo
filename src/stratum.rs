@@ -672,9 +672,15 @@ impl Client {
                 return Submitted::Share;
             }
             Ok(false) => {
-                warn!("miner {}: submit for job {} is above the target, not forwarded", self.index, job_id);
-                self.bad_submits += 1;
-                return self.refuse(state, ERR_LOW_DIFFICULTY, "high-hash");
+                // Not counted against the miner nor in `rejected` (see `Inner::high_hash`): an
+                // honest GPU miner sends these, and in a long block gap they would add up to a
+                // disconnect. A flood of them costs a SHA256d each, like shares, and stays
+                // bounded by the connection caps and the line limit.
+                info!("miner {}: submit for job {} is above the target, not forwarded", self.index, job_id);
+                let mut g = state.lock();
+                g.high_hash += 1;
+                g.last_verdict = "high-hash".into();
+                return Submitted::Refused(ERR_LOW_DIFFICULTY, "high-hash".into());
             }
             Err(e) => {
                 warn!("miner {}: cannot hash submit for job {}: {}", self.index, job_id, e);

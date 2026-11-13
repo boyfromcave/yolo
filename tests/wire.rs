@@ -630,8 +630,10 @@ async fn connection_caps_and_authorize_deadline() {
     assert_eq!(state.connection_permits.available_permits(), 3);
 }
 
-/// Audit H-3, H-17: a submit above the target or for an unknown job never reaches the node,
-/// and a miner that keeps sending bad submits is disconnected.
+/// Audit H-3, H-17: a submit above the target or for an unknown job never reaches the node.
+/// Neither counts against the miner (an honest GPU miner sends both: more of them than
+/// `max_bad_submits` leave it connected, on its job); a miner that keeps sending malformed
+/// submits is disconnected.
 #[tokio::test]
 async fn bad_submits_stay_local_and_get_the_miner_disconnected() {
     let mut t: Value = serde_json::from_str(TEMPLATE).unwrap();
@@ -651,21 +653,31 @@ async fn bad_submits_stay_local_and_get_the_miner_disconnected() {
     assert_eq!(v["result"], json!(false));
     assert_eq!(v["error"], json!([21, "Job not found", null]));
     assert_eq!(status(status_addr).await["lastSubmitVerdict"], json!("stale"));
-    // three submits that hash above the regtest target: rejected locally, then disconnected
-    // (a stale answer leaves the miner on its job, and so does a high-hash refusal: no
+    // five submits that hash above the target (more than max_bad_submits): each answered 23,
+    // counted in highHash (not rejected), and the miner stays connected on its job (no
     // set_target or notify comes between the answers)
-    for i in 0..3 {
+    for i in 0..5 {
         m.send(&format!("{{\"id\":{},\"method\":\"mining.submit\",\"params\":[\"w\",{},{},\"{}{:02x}\",\"{}\"]}}", 10 + i, job[0], job[5], "f".repeat(34), i, sol)).await;
-        let v = m.next(5).await.unwrap();
+        let v = m.next(5).await.expect("a high-hash submit never disconnects");
         assert_eq!(v["id"], json!(10 + i), "no new job after a high-hash refusal: {}", v);
         assert_eq!(v["result"], json!(false), "submit {}", i);
         assert_eq!(v["error"], json!([23, "high-hash", null]), "submit {}", i);
     }
-    assert!(m.closed(5).await, "the miner must be disconnected after max_bad_submits");
     let st = status(status_addr).await;
     assert_eq!(st["lastSubmitVerdict"], json!("high-hash"));
-    assert_eq!(st["rejected"], json!(3));
-    assert_eq!(st["stale"], json!(1));
+    assert_eq!((st["highHash"].clone(), st["rejected"].clone(), st["stale"].clone()), (json!(5), json!(0), json!(1)), "{}", st);
+    // three malformed submits (a wrong ntime) do count: the third disconnects
+    let mut job = job;
+    for i in 0..3 {
+        if i > 0 {
+            job = m.notify().await; // a malformed submit starts the miner over
+        }
+        m.send(&submit_line(20 + i, &job, "00000000", &"0".repeat(36), &sol)).await;
+        assert_eq!(m.response(5).await.unwrap()["error"], json!([20, "bad-ntime", null]), "submit {}", i);
+    }
+    assert!(m.closed(5).await, "the miner must be disconnected after max_bad_submits");
+    let st = status(status_addr).await;
+    assert_eq!((st["highHash"].clone(), st["rejected"].clone()), (json!(5), json!(3)), "{}", st);
     assert!(submitted.lock().unwrap().is_empty(), "nothing may reach submitblock: {:?}", submitted.lock().unwrap());
 }
 
