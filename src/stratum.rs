@@ -601,7 +601,7 @@ impl Client {
         let p = |i: usize| params.get(i).and_then(Value::as_str).unwrap_or("");
         let job_id = p(1);
         let Some(slot) = self.jobs.iter().rposition(|j| j.work.job_id == job_id) else {
-            info!("miner {}: stale submit for unknown job {}", self.index, shown(job_id));
+            debug!("miner {}: stale submit for unknown job {}", self.index, shown(job_id));
             self.record_stale(state);
             return Submitted::Stale("Job not found");
         };
@@ -611,7 +611,7 @@ impl Client {
             g.template.as_ref().is_some_and(|t| crate::codec::reverse_hex(&t.previousblockhash) == work.previousblockhash) && !g.template_stale()
         };
         if !on_tip {
-            info!("miner {}: stale submit for job {} (height {}): the chain has moved past its parent", self.index, job_id, work.height);
+            debug!("miner {}: stale submit for job {} (height {}): the chain has moved past its parent", self.index, job_id, work.height);
             self.record_stale(state);
             return Submitted::Stale("Stale share");
         }
@@ -675,8 +675,9 @@ impl Client {
                 // Not counted against the miner nor in `rejected` (see `Inner::high_hash`): an
                 // honest GPU miner sends these, and in a long block gap they would add up to a
                 // disconnect. A flood of them costs a SHA256d each, like shares, and stays
-                // bounded by the connection caps and the line limit.
-                info!("miner {}: submit for job {} is above the target, not forwarded", self.index, job_id);
+                // bounded by the connection caps and the line limit; logged at debug, like shares
+                // and stale submits, so a flood cannot fill the log (`/status` counts them).
+                debug!("miner {}: submit for job {} is above the target, not forwarded", self.index, job_id);
                 let mut g = state.lock();
                 g.high_hash += 1;
                 g.last_verdict = "high-hash".into();
