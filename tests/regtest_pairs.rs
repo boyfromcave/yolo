@@ -20,6 +20,16 @@
 //! 3. `-ydf=5` on P (and W): the three kinds again; each block pays 95 % of the subsidy plus all
 //!    fees, and its fund output equals the stock coinbase's.
 //!
+//! Before phase 1, phase 0 binds yolo without a test source (the production path) and checks its
+//! startup probe against the binary: a node with the call is reported and a Sapling username
+//! accepted; one without it (6.22.0-beta2) refused with the clear message. After phase 3, with the
+//! node's call only, phase 4 proves what the stub cannot: the answer's exact keys and every §8.3
+//! check on it for each kind, a Sapling coinbase built per request, the error codes and strings
+//! yolo matches on, `flags` from the node's current quote tag (an attestor set and `yed_setquote`;
+//! a paired block carries the tag), six Sapling addresses renewing under the cap of 2 with
+//! `-rpcthreads=4` while the template poll, `getblockcount` and `submitblock` are timed, and
+//! `coinbase-does-not-fit` for named transactions over the sigop limit.
+//!
 //! **Where the paired coinbases come from** (`YOLO_REGTEST_COINBASE`):
 //! - `node`: the pool node's `getcoinbasetemplatefor` (a ycashd that has it, lane 3n);
 //! - `stub`: the test-only stub of note §8.4 (W, started `-mineraddress=<the Sapling address>
@@ -40,7 +50,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use yolo::equihash::{Equihash, EquihashArg};
+use yolo::pairs::classify_address;
 use yolo::rpc::{CoinbaseFor, CoinbaseSource, RpcAuth, RpcClient, RpcError};
+use yolo::template::BlockTemplate;
 use yolo::tx::Coinbase;
 use yolo::Config;
 
@@ -281,7 +293,6 @@ impl Ctx {
         ids
     }
 
-    /// The fees of a block's transactions, from P's wallet (it sent all of them).
     /// The block subsidy at `height`, from the node's `getblocksubsidy` (`miner` plus `founders`:
     /// both lines answer both keys), not from any coinbase the code under test handled.
     fn subsidy_at(&self, height: u64) -> u64 {
@@ -289,6 +300,7 @@ impl Ctx {
         zat(&s["miner"]) + zat(&s["founders"])
     }
 
+    /// The fees of a block's transactions, from P's wallet (it sent all of them).
     fn block_fees(&self, block: &Value) -> u64 {
         block["tx"].as_array().unwrap()[1..].iter().map(|tx| zat(&json!(-self.p.call("gettransaction", json!([tx["txid"]]))["fee"].as_f64().unwrap()))).sum()
     }
@@ -356,6 +368,12 @@ fn finish(child: std::process::Child, user: &str) {
 }
 
 async fn serve(ctx: &Ctx, source: Arc<Counting>) -> (std::net::SocketAddr, std::net::SocketAddr, tokio::task::JoinHandle<()>, yolo::state::State) {
+    serve_with(ctx, Some(source as Arc<dyn CoinbaseSource>), yolo::Limits::default()).await
+}
+
+/// `source` None: the production path, the node's own `getcoinbasetemplatefor` after yolo's
+/// startup probe.
+async fn serve_with(ctx: &Ctx, source: Option<Arc<dyn CoinbaseSource>>, limits: yolo::Limits) -> (std::net::SocketAddr, std::net::SocketAddr, tokio::task::JoinHandle<()>, yolo::state::State) {
     let config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         status_bind: Some("127.0.0.1:0".parse().unwrap()),
@@ -364,8 +382,8 @@ async fn serve(ctx: &Ctx, source: Arc<Counting>) -> (std::net::SocketAddr, std::
         no_flags: false,
         password: None,
         equihash: EquihashArg::Fixed(Equihash::REGTEST),
-        limits: yolo::Limits::default(),
-        test_coinbase_source: Some(source as Arc<dyn CoinbaseSource>),
+        limits,
+        test_coinbase_source: source,
     };
     let bound = yolo::bind(ctx.p.rpc.clone(), config).await.unwrap();
     let (addr, status, state) = (bound.addr, bound.status_addr.unwrap(), bound.state());
@@ -500,6 +518,26 @@ async fn paired_jobs_pay_each_miner_in_full() {
     let next = ctx.p.height() + 1;
     log(&format!("subsidy {} zat at height {} (getblocksubsidy)", ctx.subsidy_at(next), next));
 
+    // 0. yolo's own startup probe against this binary (no test source: the production path)
+    match ctx.p.rpc.call("getcoinbasetemplatefor", json!([])) {
+        Err(RpcError::Node { code, message }) => log(&format!("probe: getcoinbasetemplatefor without arguments answers code {} \"{}\"", code, message.lines().next().unwrap_or(""))),
+        other => panic!("probe: unexpected {:?}", other),
+    }
+    {
+        let (pool, status, server, _) = serve_with(&ctx, None, yolo::Limits::default()).await;
+        let st = status_json(status).await;
+        assert_eq!(st["coinbaseCall"], json!(has_call), "/status coinbaseCall follows the probe: {}", st["coinbaseCall"]);
+        let answer = stratum_authorize(pool, &z_addr).await;
+        if has_call {
+            assert_eq!(answer["result"], json!(true), "a Sapling username is accepted: {}", answer);
+        } else {
+            assert_eq!(answer["error"], json!("Invalid address: this pool cannot pay sapling addresses now (its node does not serve getcoinbasetemplatefor)"), "{}", answer);
+        }
+        assert_eq!(stratum_authorize(pool, &t_addr).await["result"], json!(true), "a transparent username is accepted either way");
+        server.abort();
+        log(&format!("phase 0 (startup probe): the node {} the call; /status coinbaseCall {}; Sapling authorize {}", if has_call { "serves" } else { "does not serve" }, st["coinbaseCall"], answer));
+    }
+
     let miners = vec![
         Miner { user: t_addr.clone(), address: t_addr.clone(), kind: "p2pkh", script: script(&t_addr) },
         Miner { user: format!("{}.rig-1", z_addr), address: z_addr.clone(), kind: "sapling", script: None },
@@ -581,8 +619,234 @@ async fn paired_jobs_pay_each_miner_in_full() {
     start(&mut ctx.p, &mut ctx.w, 5);
     sequential(&ctx, &miners[..3], 5, make_source(&ctx.p, &ctx.w, 5)).await;
     log("phase 3 (-ydf=5): ok");
+
+    if use_node {
+        real_call_facts(&mut ctx, &ycashd, &base, &miners, &z_addr).await;
+    }
     ctx.p.stop();
     ctx.w.stop();
+}
+
+/// Phase 4, against a node that serves the call (the facts the stub could not prove): the answer's
+/// exact shape and the §8.3 checks on it for every kind, a Sapling coinbase built per request, the
+/// error codes and strings yolo matches on, `flags` from the node's current quote tag, the
+/// request cap against the node's `-rpcthreads`, and `coinbase-does-not-fit`. P runs at `-ydf=5`.
+async fn real_call_facts(ctx: &mut Ctx, ycashd: &Path, base: &[String], miners: &[Miner], z_addr: &str) {
+    const KEYS: [&str; 13] = ["data", "hash", "height", "previousblockhash", "addresstype", "subsidy", "fund", "fundrule", "fees", "amount", "txcount", "flags", "sigops"];
+    let call = |p: &Node, address: &str, prev: &str, txids: &[String]| p.rpc.call("getcoinbasetemplatefor", json!([address, {"previousblockhash": prev, "txids": txids}]));
+    ctx.send_fees(2);
+    let tv = ctx.p.call("getblocktemplate", json!([]));
+    let t: BlockTemplate = serde_json::from_value(tv.clone()).unwrap();
+    let (prev, ids) = (t.previousblockhash.clone(), t.txids());
+    assert!(!ids.is_empty());
+
+    // (1) the shape, and every check of §8.3, for each kind
+    for m in miners {
+        let raw = call(&ctx.p, &m.address, &prev, &ids).unwrap_or_else(|e| panic!("{}: {}", m.user, e));
+        let keys: BTreeSet<&str> = raw.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, KEYS.iter().copied().collect::<BTreeSet<_>>(), "{}: the answer's keys", m.user);
+        let a: CoinbaseFor = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!((a.addresstype.as_str(), a.fundrule.as_str()), (m.kind, "optional"), "{}", m.user);
+        assert_eq!(a.amount, a.subsidy - a.fund + a.fees);
+        let kind = classify_address(&ctx.p.rpc, &m.address).unwrap().unwrap();
+        yolo::pairs::check_answer(&t, &kind, &ids, &a).unwrap_or_else(|e| panic!("{}: yolo refuses the node's answer: {}", m.user, e));
+        let mut shown = raw.clone();
+        shown["data"] = json!(format!("<{} bytes>", a.data.len() / 2));
+        log(&format!("answer for {} ({}): {}", m.user, m.kind, shown));
+    }
+    // (3) a Sapling coinbase built per request: two requests for one address, and one for another
+    // address, give three different valid coinbases
+    let z2 = ctx.w.call("z_getnewaddress", json!(["sapling"])).as_str().unwrap().to_string();
+    let mut seen = BTreeSet::new();
+    for z in [z_addr, z_addr, z2.as_str()] {
+        let a: CoinbaseFor = serde_json::from_value(call(&ctx.p, z, &prev, &ids).unwrap()).unwrap();
+        yolo::pairs::check_answer(&t, &yolo::pairs::PayoutKind::Sapling, &ids, &a).unwrap();
+        let cb = Coinbase::parse(&hex::decode(&a.data).unwrap()).unwrap();
+        assert_eq!(cb.sapling_outputs, 1);
+        assert!(seen.insert(a.data.clone()), "each request builds a new Sapling output");
+    }
+    log("per-request Sapling coinbases: three requests, three different valid coinbases (one output each)");
+
+    // (1) the errors yolo matches on, with their codes
+    let err = |r: Result<Value, RpcError>| match r {
+        Err(RpcError::Node { code, message }) => (code, message),
+        other => panic!("expected a node error, got {:?}", other),
+    };
+    let (code, msg) = err(call(&ctx.p, z_addr, &"11".repeat(32), &ids));
+    assert_eq!((code, msg.as_str()), (-1, "template-stale: previousblockhash is not the tip"));
+    assert!(RpcError::Node { code, message: msg.clone() }.is_template_stale());
+    let ghost = "ab".repeat(32);
+    let (code, msg) = err(call(&ctx.p, z_addr, &prev, std::slice::from_ref(&ghost)));
+    assert_eq!((code, msg.clone()), (-1, format!("template-stale: transaction is not in the mempool: {}", ghost)));
+    assert!(RpcError::Node { code, message: msg }.is_template_stale());
+    let (code, msg) = err(call(&ctx.p, z_addr, &prev, &[ids[0].clone(), ids[0].clone()]));
+    assert_eq!((code, msg.clone()), (-8, format!("txids names a transaction twice: {}", ids[0])));
+    // the node checks the mempool before duplicates: an absent id named twice is template-stale
+    let (code, msg) = err(call(&ctx.p, z_addr, &prev, &[ghost.clone(), ghost.clone()]));
+    assert_eq!((code, msg.clone()), (-1, format!("template-stale: transaction is not in the mempool: {}", ghost)));
+    let (code, msg) = err(ctx.p.rpc.call("getcoinbasetemplatefor", json!([z_addr, {"previousblockhash": prev, "txids": ids, "amount": 1}])));
+    assert_eq!((code, msg.as_str()), (-8, "template must be an object with exactly the keys previousblockhash and txids"));
+    log("errors: template-stale (tip, mempool; code -1), duplicate (-8, after the mempool check), an extra key (-8): as yolo matches them");
+
+    // (4) and (6): the YED attestor set and a quote; P restarted with -rpcthreads=4 (the cap 2 plus 2)
+    let created = ctx.p.call("set_create", json!([{"seats": 15, "unlockthreshold": 1, "cancelthreshold": 1, "slashthreshold": 1, "open": true, "maturity": 2}]));
+    let setid = created["setid"].as_str().unwrap().to_string();
+    wait_for("set_create in the mempool", Duration::from_secs(30), || !ctx.p.call("getrawmempool", json!([])).as_array().unwrap().is_empty());
+    ctx.p.call("generate", json!([1]));
+    let h = ctx.p.height();
+    wait_for("W at the set's height", Duration::from_secs(30), || ctx.w.height() == h);
+    ctx.p.stop();
+    ctx.w.stop();
+    let quote_args = ["-experimentalfeatures".to_string(), "-yellowbacksigmaref=0".to_string(), format!("-yellowbackattestorset={}", setid)];
+    ctx.p.args.extend(quote_args.iter().cloned());
+    ctx.p.args.push("-rpcthreads=4".into());
+    ctx.w.args.extend(quote_args.iter().cloned());
+    ctx.p.start(ycashd, base, &[]);
+    ctx.w.start(ycashd, base, &[]);
+    wait_for("W synced to P", Duration::from_secs(60), || ctx.w.height() == ctx.p.height());
+    ctx.p.call("yed_setquote", json!([50_000, 1]));
+    let mut flags = String::new();
+    wait_for("a 37-byte quote tag in the template", Duration::from_secs(30), || {
+        flags = ctx.p.call("getblocktemplate", json!([]))["coinbaseaux"]["flags"].as_str().unwrap_or("").to_string();
+        flags.len() == 74
+    });
+    let tv = ctx.p.call("getblocktemplate", json!([]));
+    let t: BlockTemplate = serde_json::from_value(tv).unwrap();
+    let a: CoinbaseFor = serde_json::from_value(call(&ctx.p, z_addr, &t.previousblockhash, &t.txids()).unwrap()).unwrap();
+    let next_flags = ctx.p.call("getblocktemplate", json!([]))["coinbaseaux"]["flags"].as_str().unwrap().to_string();
+    assert_eq!(a.flags, next_flags, "flags is the node's current quote tag");
+    let cb = Coinbase::parse(&hex::decode(&a.data).unwrap()).unwrap();
+    let push = yolo::tag::height_push(t.height);
+    assert!(cb.script_sig.starts_with(&push) && cb.script_sig[push.len()..].windows(37).any(|w| w == hex::decode(&a.flags).unwrap().as_slice()), "the scriptSig carries the tag after the height push");
+    // a paired (Sapling) block with the quote: the chain reads the tag back
+    sequential(ctx, &miners[1..2], 5, Arc::new(Counting { inner: Arc::new(ctx.p.rpc.clone()), asked: Mutex::new(HashMap::new()) })).await;
+    let tag = ctx.p.call("yed_gettag", json!([ctx.p.height().to_string()]));
+    assert_eq!((tag["found"].clone(), tag["kind"].clone()), (json!(true), json!("quote")), "the paired block's tag: {}", tag);
+    log(&format!("quote: flags {} from the node's current tag; a paired Sapling block at {} carries it (yed_gettag {})", a.flags, ctx.p.height(), tag["kind"]));
+
+    // (6) the request cap against -rpcthreads=4: six Sapling addresses renewing at once while the
+    // template poll, getblockcount and submitblock are timed on their own connections
+    let timed = Arc::new(Timed { inner: Arc::new(ctx.p.rpc.clone()), in_flight: Mutex::new((0, 0)), durations: Mutex::new(Vec::new()) });
+    let limits = yolo::Limits { coinbase_concurrency: 2, ..yolo::Limits::default() };
+    let (_, _, server, state) = serve_with(ctx, Some(timed.clone() as Arc<dyn CoinbaseSource>), limits).await;
+    let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let zs: Vec<String> = (0..6).map(|_| ctx.w.call("z_getnewaddress", json!(["sapling"])).as_str().unwrap().to_string()).collect();
+    for z in &zs {
+        state.pairs.subscribe(z, yolo::pairs::PayoutKind::Sapling, ip).unwrap();
+    }
+    let all_paired = |state: &yolo::state::State, tip: &str| zs.iter().all(|z| state.pairs.current(z).is_some_and(|(_, p)| p.reference.previousblockhash == tip));
+    let tip = ctx.p.call("getbestblockhash", json!([])).as_str().unwrap().to_string();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !all_paired(&state, &tip) {
+        assert!(Instant::now() < deadline, "six pairs on the first tip");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    timed.durations.lock().unwrap().clear();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let prober = {
+        let (rpc, stop) = (ctx.p.rpc.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut worst = [Duration::ZERO; 3];
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                for (i, (m, params)) in [("getblocktemplate", json!([])), ("getblockcount", json!([])), ("submitblock", json!(["00"]))].into_iter().enumerate() {
+                    let at = Instant::now();
+                    let _ = rpc.call(m, params);
+                    worst[i] = worst[i].max(at.elapsed());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            worst
+        })
+    };
+    ctx.p.call("generate", json!([1]));
+    let tip = ctx.p.call("getbestblockhash", json!([])).as_str().unwrap().to_string();
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(120);
+    while !all_paired(&state, &tip) {
+        assert!(Instant::now() < deadline, "six pairs on the new tip");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let renewed = started.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let worst = prober.join().unwrap();
+    server.abort();
+    let peak = timed.in_flight.lock().unwrap().1;
+    let durations = timed.durations.lock().unwrap().clone();
+    assert!(peak <= 2, "at most --coinbase-concurrency requests in flight: {}", peak);
+    log(&format!(
+        "rpcthreads=4, cap 2: six Sapling pairs renewed in {:?}; peak in flight {}; request times {:?}; worst getblocktemplate {:?}, getblockcount {:?}, submitblock {:?}",
+        renewed, peak, durations, worst[0], worst[1], worst[2]
+    ));
+    assert!(worst.iter().all(|d| *d < Duration::from_secs(2)), "no mining call waited behind the proofs: {:?}", worst);
+
+    // (5) coinbase-does-not-fit: six transactions of 3,980 sigops each (each under the per-transaction
+    // policy limit of 4,000) named together exceed the block's 20,000
+    let to = ctx.p.call("getnewaddress", json!([]));
+    let spk = ctx.p.call("validateaddress", json!([to]))["scriptPubKey"].as_str().unwrap().to_string();
+    // distinct, confirmed, non-coinbase coins of P's wallet (the fee-paying sends' outputs): a
+    // wallet-funded transaction may pick a coin an earlier one of these spends
+    let coins: Vec<Value> = ctx.p.call("listunspent", json!([1])).as_array().unwrap().iter().filter(|u| u["generated"] != json!(true) && zat(&u["amount"]) >= 1_000_000).take(6).cloned().collect();
+    assert_eq!(coins.len(), 6, "six spendable non-coinbase coins");
+    let mut heavy = Vec::new();
+    for u in &coins {
+        let value = (zat(&u["amount"]) - 10_000) as f64 / 1e8;
+        let raw = ctx.p.call("createrawtransaction", json!([[{"txid": u["txid"], "vout": u["vout"]}], {to.as_str().unwrap(): value}]));
+        let raw = raw.as_str().unwrap().replacen(&format!("19{}", spk), &format!("c7{}", "ae".repeat(199)), 1);
+        let signed = ctx.p.call("signrawtransaction", json!([raw]));
+        assert_eq!(signed["complete"], json!(true));
+        heavy.push(ctx.p.call("sendrawtransaction", json!([signed["hex"]])).as_str().unwrap().to_string());
+    }
+    let prev = ctx.p.call("getbestblockhash", json!([])).as_str().unwrap().to_string();
+    let (code, msg) = err(call(&ctx.p, z_addr, &prev, &heavy));
+    assert_eq!(code, -1);
+    assert!(msg.starts_with("coinbase-does-not-fit: sigops ") && msg.ends_with(" exceed 20000"), "{}", msg);
+    let t = ctx.p.call("getblocktemplate", json!([]));
+    let in_template = heavy.iter().filter(|id| t["transactions"].as_array().unwrap().iter().any(|x| x["hash"] == **id)).count();
+    let template_sigops: u64 = t["transactions"].as_array().unwrap().iter().map(|x| x["sigops"].as_u64().unwrap()).sum();
+    log(&format!(
+        "coinbase-does-not-fit: \"{}\" (code -1) for the six named together; the node's template at that moment carries {} of them ({} sigops of {})",
+        msg, in_template, template_sigops, t["sigoplimit"]
+    ));
+    let a: CoinbaseFor = serde_json::from_value(call(&ctx.p, z_addr, &prev, &serde_json::from_value::<BlockTemplate>(t).unwrap().txids()).unwrap()).unwrap();
+    log(&format!("the same template's own transaction set still gets a coinbase ({} sigops)", a.sigops));
+}
+
+/// Times each request and records the peak number in flight.
+struct Timed {
+    inner: Arc<dyn CoinbaseSource>,
+    in_flight: Mutex<(usize, usize)>,
+    durations: Mutex<Vec<u128>>,
+}
+
+impl CoinbaseSource for Timed {
+    fn coinbase_for(&self, address: &str, prev: &str, txids: &[String]) -> Result<CoinbaseFor, RpcError> {
+        {
+            let mut f = self.in_flight.lock().unwrap();
+            f.0 += 1;
+            f.1 = f.1.max(f.0);
+        }
+        let at = Instant::now();
+        let r = self.inner.coinbase_for(address, prev, txids);
+        self.durations.lock().unwrap().push(at.elapsed().as_millis());
+        self.in_flight.lock().unwrap().0 -= 1;
+        r
+    }
+}
+
+/// `mining.subscribe` then `mining.authorize` as `user`; the authorize answer.
+async fn stratum_authorize(pool: std::net::SocketAddr, user: &str) -> Value {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (rd, mut wr) = tokio::net::TcpStream::connect(pool).await.unwrap().into_split();
+    let mut lines = BufReader::new(rd).lines();
+    wr.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"t\",null,\"h\",\"p\"]}\n").await.unwrap();
+    wr.write_all(format!("{{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"{}\",\"x\"]}}\n", user).as_bytes()).await.unwrap();
+    loop {
+        let line = tokio::time::timeout(Duration::from_secs(20), lines.next_line()).await.expect("an answer").unwrap().expect("a line");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        if v["id"] == json!(2) {
+            return v;
+        }
+    }
 }
 
 async fn status_json(addr: std::net::SocketAddr) -> Value {

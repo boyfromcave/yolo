@@ -124,6 +124,8 @@ enum Mode {
     WrongFees,
     /// "Method not found", as a node without the call answers.
     NoMethod,
+    /// The node's `coinbase-does-not-fit` refusal (code -1, the string both C++ lines return).
+    DoesNotFit,
 }
 
 struct FakeSource {
@@ -206,6 +208,7 @@ impl CoinbaseSource for FakeSource {
             }
             Mode::WrongFees => answer(&t, address, previousblockhash, txids).map(|a| CoinbaseFor { fees: a.fees - 1, ..a }),
             Mode::NoMethod => Err(RpcError::Node { code: -32601, message: "Method not found".into() }),
+            Mode::DoesNotFit => Err(RpcError::Node { code: -1, message: "coinbase-does-not-fit: block size 2000377 exceeds 2000000".into() }),
             Mode::Good => answer(&t, address, previousblockhash, txids),
         };
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -648,4 +651,36 @@ async fn keepalive_does_not_renotify_a_void_paired_job() {
     *source.mode.lock().unwrap() = Mode::Good;
     let next = pm.notify(10_000).await.expect("the new pair");
     assert_eq!(next[2], json!(yolo::codec::reverse_hex(&new_prev)));
+}
+
+/// `coinbase-does-not-fit` (decision D-3): the miner keeps its previous pair; its job stays
+/// valid, is not replaced, and a block found on it is submitted with that pair's coinbase and
+/// transactions.
+#[tokio::test]
+async fn coinbase_does_not_fit_keeps_the_previous_pair() {
+    let pool = start(None, true, Duration::ZERO, 2).await;
+    let source = pool.source.clone().unwrap();
+    let mut pm = Miner::connect(pool.addr).await;
+    pm.authorize(PQ_ADDR).await;
+    let first = pm.notify(5000).await.unwrap();
+    // the transaction set changes, and the node refuses the new set's coinbase
+    *source.mode.lock().unwrap() = Mode::DoesNotFit;
+    {
+        let mut t = pool.template.lock().unwrap();
+        let fee = t["transactions"][1]["fee"].as_u64().unwrap();
+        t["transactions"].as_array_mut().unwrap().pop();
+        let mut cb = Coinbase::parse(&hex::decode(t["coinbasetxn"]["data"].as_str().unwrap()).unwrap()).unwrap();
+        cb.vout[0].value -= fee;
+        t["coinbasetxn"]["data"] = json!(hex::encode(cb.serialize()));
+    }
+    let calls = source.calls().len();
+    assert!(pm.notify(8000).await.is_none(), "no new job: the miner keeps its pair");
+    assert!(source.calls().len() > calls, "the new set was asked for (and refused)");
+    let st = status(pool.status).await;
+    assert!(st["pairs"]["failures"].as_u64().unwrap() >= 1, "{}", st);
+    assert_eq!(st["pairs"]["waiting"], json!(0), "the pair is still on the tip: {}", st["pairs"]);
+    assert_eq!(pm.submit(40, &first).await["result"], json!(true), "the previous pair's job is still good");
+    let block = pool.submitted.lock().unwrap()[0].clone();
+    let (_, _, count) = split_block(&block, 0);
+    assert_eq!(count, 3, "the block carries the pair's coinbase and both of its transactions");
 }
