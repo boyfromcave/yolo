@@ -74,6 +74,16 @@ node (see *Regtest quick start*).
 The label is 1 to 32 characters of `A-Z a-z 0-9 _ -`, everything after the first `.`; it is shown
 in the log and on `/status` only, and never changes who is paid.
 
+**Post-quantum miners: mine to an address from ycashd or yewd.** A block reward paid to a
+post-quantum address is a coinbase, and the network lets a coinbase move only to shielded
+recipients, with no change. Today only the ycashd wallet (Ycash 6.22.0-beta3 or later, either node
+line) and yewd (the wallet beside koganyd, in the [yew](https://github.com/boyfromcave/yew)
+repository) can do that: `z_sendmany` from the address to a Sapling address, once the reward has
+101 confirmations, sending the exact amount the wallet names when it refuses a send that would
+leave change. The YEW phone app and the web wallet cannot yet: they do not know that a coin is a
+coinbase, so a reward paid to one of their addresses shows as spendable and their sends are
+refused.
+
 **How each miner is paid in full.** A miner who finds a block gets the block subsidy plus every
 fee of the transactions in that block. The only thing that can come out of it is the
 development-fund share, and only the node applies it: where consensus requires it, or where the
