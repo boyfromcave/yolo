@@ -35,13 +35,19 @@ pub fn job_time(t: &BlockTemplate) -> u32 {
 }
 
 /// Applies a freshly fetched template; returns true when miners need new work.
-pub fn apply_template(state: &State, template: BlockTemplate) -> bool {
+pub fn apply_template(state: &State, mut template: BlockTemplate) -> bool {
     let key = template.change_key();
     let mut g = state.lock();
+    // A transaction the previous poll already carried, unchanged, is kept as that one
+    // allocation: pairs pin their templates, and without this every 1-second poll of a full
+    // block would pin a fresh copy of megabytes per paired address.
+    if let Some(previous) = g.template.as_ref() {
+        template.share_transactions(previous);
+    }
     let was_down = !g.node_up;
     g.node_up = true;
     if g.template.is_some() && g.key == key && !was_down {
-        g.template = Some(template);
+        g.template = Some(std::sync::Arc::new(template));
         g.template_at = Some(Instant::now());
         return false;
     }
@@ -57,7 +63,7 @@ pub fn apply_template(state: &State, template: BlockTemplate) -> bool {
         "light-client root changed"
     };
     g.key = key;
-    g.template = Some(template);
+    g.template = Some(std::sync::Arc::new(template));
     g.template_at = Some(Instant::now());
     g.generation += 1;
     let generation = g.generation;
@@ -121,6 +127,8 @@ pub async fn run(state: State) {
                     if !apply_template(&state, t) {
                         debug!("template unchanged");
                     }
+                    // Paired miners follow the transaction set too, not only the change key.
+                    state.pairs.wake.notify_one();
                     // A template at the height the node has just accepted is stale: the node
                     // has not rolled its template yet, so ask again soon instead of in 1 s.
                     let wait = if state.lock().template_stale() { Duration::from_millis(100) } else { Duration::from_secs(1) };

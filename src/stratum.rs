@@ -19,9 +19,10 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::codec::dsha256;
+use crate::pairs::{classify_address, split_username, PayoutKind};
 use crate::poller::job_time;
-use crate::state::State;
-use crate::work::{assemble_block, assemble_header, build_work, meets_target, share_target, BuildParams, Submit, Work};
+use crate::state::{MinerInfo, State};
+use crate::work::{assemble_block, assemble_header, build_paired_work, build_work, meets_target, share_target, BuildParams, Submit, Work};
 
 /// Bytes of nonce the pool fixes per client: the Perl's `nonce1_size` is 16 but
 /// `sprintf("%04x", id) . newkey(16 - 4)` yields 4 + 24 = 28 hex chars, i.e. 14 bytes
@@ -190,8 +191,9 @@ pub async fn serve(state: State, listener: TcpListener, generation_rx: watch::Re
                 info!("miner {} connected from {}", index, peer);
                 let st = state.clone();
                 let rx = generation_rx.clone();
+                let pairs_rx = state.pairs.subscribe_versions();
                 tokio::spawn(async move {
-                    let client = Client::new(index, peer, rx);
+                    let client = Client::new(index, peer, rx, pairs_rx);
                     let authorized = client.run(socket, st.clone()).await;
                     {
                         let mut g = st.lock();
@@ -218,12 +220,24 @@ struct Client {
     peer: SocketAddr,
     nonce1: String,
     generation_rx: watch::Receiver<u64>,
+    /// Ticks whenever a pair is replaced (paired miners only listen).
+    pairs_rx: watch::Receiver<u64>,
     auth: bool,
     ready: bool,
     mining: bool,
     software: String,
     worker: String,
-    script_pubkey: Option<Vec<u8>>,
+    /// The username's payout address (the part before the first `.`) and its kind, without
+    /// `--payout`.
+    address: String,
+    payout: Option<PayoutKind>,
+    /// The pair version this miner's current job was built from (paired miners).
+    pair_sent: u64,
+    /// The last target sent to a paired miner (its jobs carry their own template's target).
+    sent_target: Option<String>,
+    /// The parent (`previousblockhash`, lower case) of the pair this paired miner's job was built
+    /// from: a keepalive never re-sends a job whose parent is no longer the tip.
+    pair_parent: Option<String>,
     work_number: u64,
     jobs: VecDeque<Job>,
     last_write: Instant,
@@ -279,19 +293,24 @@ impl Submitted {
 }
 
 impl Client {
-    fn new(index: u64, peer: SocketAddr, generation_rx: watch::Receiver<u64>) -> Client {
+    fn new(index: u64, peer: SocketAddr, generation_rx: watch::Receiver<u64>, pairs_rx: watch::Receiver<u64>) -> Client {
         let now = Instant::now();
         Client {
             index,
             peer,
             nonce1: make_nonce1(index),
             generation_rx,
+            pairs_rx,
             auth: false,
             ready: false,
             mining: false,
             software: String::new(),
             worker: String::new(),
-            script_pubkey: None,
+            address: String::new(),
+            payout: None,
+            pair_sent: 0,
+            sent_target: None,
+            pair_parent: None,
             work_number: 0,
             jobs: VecDeque::new(),
             last_write: now,
@@ -302,12 +321,17 @@ impl Client {
         }
     }
 
+    /// A Sapling or post-quantum miner: its jobs are pairs (`crate::pairs`).
+    fn is_paired(&self) -> bool {
+        self.payout.as_ref().is_some_and(PayoutKind::is_paired)
+    }
+
     /// The moment this socket is closed for silence: an unauthorized one must authorize
     /// within `auth_timeout`; an authorized one must say something within
     /// `idle_keepalives` keepalive periods (audit H-2).
     fn silence_deadline(&self, state: &State) -> Instant {
         if self.auth {
-            self.last_read + MINER_TIMEOUT * state.limits.idle_keepalives
+            self.last_read + state.limits.keepalive * state.limits.idle_keepalives
         } else {
             self.connected_at + state.limits.auth_timeout
         }
@@ -320,8 +344,9 @@ impl Client {
         let mut line_buf = Vec::with_capacity(1024);
         let mut out = String::new();
         loop {
-            let keepalive = tokio::time::sleep_until(self.last_write + MINER_TIMEOUT);
+            let keepalive = tokio::time::sleep_until(self.last_write + state.limits.keepalive);
             let silence = tokio::time::sleep_until(self.silence_deadline(&state));
+            let paired = self.is_paired();
             let action = tokio::select! {
                 line = read_line_capped(&mut reader, &mut line_buf) => match line {
                     Ok(Some(line)) => {
@@ -333,15 +358,36 @@ impl Client {
                 },
                 changed = self.generation_rx.changed() => {
                     if changed.is_err() { Action::Disconnect } else {
-                        // New block, target, root or flags: every miner starts over (`flag_newblock`).
-                        self.mining = false;
-                        self.ready = false;
+                        // New block, target, root or flags: every swap-path miner starts over
+                        // (`flag_newblock`). A paired miner keeps its job until its next pair
+                        // arrives (on a new block that job is void, and it is told nothing until then).
+                        if !paired {
+                            self.mining = false;
+                            self.ready = false;
+                        }
+                        Action::Continue
+                    }
+                }
+                changed = self.pairs_rx.changed(), if paired => {
+                    if changed.is_err() {
+                        Action::Disconnect
+                    } else if !state.pairs.available() {
+                        // The node has stopped serving getcoinbasetemplatefor: this miner would
+                        // get no work; it is told so when it authorizes again.
+                        warn!("miner {}: the node does not serve getcoinbasetemplatefor; disconnecting a {} miner", self.index, self.payout.as_ref().map_or("paired", PayoutKind::name));
+                        Action::Disconnect
+                    } else {
                         Action::Continue
                     }
                 }
                 _ = keepalive => {
-                    // Never re-notify a job the node has already built past.
-                    if self.mining && !state.lock().template_stale() {
+                    // Never re-notify a job the node has already built past, nor a paired job
+                    // whose parent is no longer the tip (it is void until its next pair).
+                    let live = {
+                        let g = state.lock();
+                        !g.template_stale() && (!paired || g.template.as_ref().is_some_and(|t| self.pair_parent.as_deref() == Some(t.previousblockhash.to_ascii_lowercase().as_str())))
+                    };
+                    if self.mining && live {
                         if let Some(Job { work: w, .. }) = self.jobs.back() {
                             out.push_str(&msg_notify(w, false));
                             debug!("miner {}: keepalive re-notify job {}", self.index, w.job_id);
@@ -374,6 +420,10 @@ impl Client {
                 break;
             }
         }
+        if self.is_paired() {
+            state.pairs.unsubscribe(&self.address, self.peer.ip());
+        }
+        state.miner_gone(self.index);
         self.auth
     }
 
@@ -382,6 +432,9 @@ impl Client {
     fn pump(&mut self, state: &State, out: &mut String) {
         if !self.auth {
             return;
+        }
+        if self.is_paired() {
+            return self.pump_paired(state, out);
         }
         let g = state.lock();
         let Some(template) = g.template.as_ref() else { return };
@@ -401,7 +454,7 @@ impl Client {
             // One job per client, numbered by a per-client counter (`stratumpool`'s
             // `$client->{'worknumber'}`; the `stratumsolo` global job is gone with the modes, Y7).
             self.work_number += 1;
-            let params = BuildParams { job_id: self.work_number.to_string(), miner_script_pubkey: self.script_pubkey.as_deref(), now: job_time(template) };
+            let params = BuildParams { job_id: self.work_number.to_string(), miner_script_pubkey: self.payout.as_ref().and_then(PayoutKind::swap_script), now: job_time(template) };
             let work = match build_work(template, &state.policy, state.equihash, &params) {
                 Ok(w) => Some(w),
                 Err(e) => {
@@ -422,11 +475,52 @@ impl Client {
         }
     }
 
-    /// Marks the miner authorized (once; the gauge counts authorized miners only).
-    fn authorized(&mut self, state: &State) {
+    /// A paired miner's job: the current pair for its address, once the pair is for the tip and
+    /// differs from the one its job was built from (or it needs a fresh job). Header fields,
+    /// transactions and target all come from the pair's own template (note §8.2 step 4).
+    fn pump_paired(&mut self, state: &State, out: &mut String) {
+        let current = {
+            let g = state.lock();
+            let Some(template) = g.template.as_ref() else { return };
+            if g.template_stale() {
+                return;
+            }
+            let tip = template.previousblockhash.to_ascii_lowercase();
+            state.pairs.current(&self.address).filter(|(_, p)| p.reference.previousblockhash == tip)
+        };
+        let Some((version, pair)) = current else { return };
+        if self.mining && version == self.pair_sent {
+            return;
+        }
+        self.work_number += 1;
+        let params = BuildParams { job_id: self.work_number.to_string(), miner_script_pubkey: None, now: job_time(&pair.template) };
+        self.pair_sent = version;
+        self.pair_parent = Some(pair.reference.previousblockhash.clone());
+        match build_paired_work(&pair.template, &pair.coinbase, &pair.flags, &state.policy, state.equihash, &params) {
+            Ok(w) => {
+                let target = share_target(&pair.template.target, state.limits.share_ratio).unwrap_or_else(|_| pair.template.target.clone());
+                if self.sent_target.as_deref() != Some(target.as_str()) {
+                    out.push_str(&msg_set_target(&target));
+                    self.sent_target = Some(target);
+                }
+                out.push_str(&msg_notify(&w, true));
+                debug!("miner {}: paired job {} height {} ({} txs, {} zat) tag {}", self.index, w.job_id, w.height, w.transaction_count, pair.amount, w.tag_kind());
+                self.jobs.push_back(Job { work: w, shares: HashSet::new() });
+                while self.jobs.len() > JOBS_KEPT {
+                    self.jobs.pop_front();
+                }
+                self.mining = true;
+            }
+            Err(e) => warn!("miner {}: cannot build a paired job: {}", self.index, e),
+        }
+    }
+
+    /// Marks the miner authorized (once; the gauge counts authorized miners only) and lists it.
+    fn authorized(&mut self, state: &State, info: MinerInfo) {
         if !self.auth {
             self.auth = true;
             state.lock().miners += 1;
+            state.miner_authorized(self.index, info);
         }
     }
 
@@ -483,54 +577,73 @@ impl Client {
                     // --payout: every block pays the fixed address; the username is a worker name.
                     // No node call: the attempt is given back to the IP's budget.
                     state.authorize_refund(self.peer.ip());
-                    self.authorized(state);
+                    let mut end = self.worker.len().min(crate::pairs::MAX_LABEL);
+                    while !self.worker.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let info = MinerInfo { address: fixed.address.clone(), label: Some(self.worker[..end].to_string()), kind: "fixed" };
+                    self.authorized(state, info);
                     out.push_str(&msg_authorized(&id));
                     info!("miner {}: authorized as {}, paying {}", self.index, shown(&self.worker), fixed.address);
                     return Action::Continue;
                 }
-                // no --payout: the username is the payout address
-                let cached = state.cached_address(&self.worker);
+                // no --payout: the username is the payout address, optionally `<address>.<label>`
+                let (address, label) = match split_username(&self.worker) {
+                    Ok((a, l)) => (a.to_string(), l.map(String::from)),
+                    Err(why) => {
+                        out.push_str(&msg_auth_failed(&id, "Invalid address"));
+                        warn!("miner {}: {}: {}", self.index, shown(&self.worker), why);
+                        return Action::Disconnect;
+                    }
+                };
+                let cached = state.cached_address(&address);
                 let was_cached = cached.is_some();
                 let answer = match cached {
-                    Some(spk) => Ok(spk),
+                    Some(kind) => Ok(kind),
                     None => {
                         let rpc = state.rpc.clone();
-                        let address = self.worker.clone();
-                        match tokio::task::spawn_blocking(move || rpc.validateaddress(&address)).await {
-                            Ok(Ok(v)) if v.isvalid => match v.script_pubkey.as_deref().map(hex::decode) {
-                                Some(Ok(spk)) => Ok(Some(spk)),
-                                _ => {
-                                    warn!("miner {}: {} validates but has no scriptPubKey (shielded?)", self.index, shown(&self.worker));
-                                    Ok(None)
-                                }
-                            },
-                            Ok(Ok(_)) => {
-                                warn!("miner {}: invalid payout address {}", self.index, shown(&self.worker));
-                                Ok(None)
-                            }
+                        let a = address.clone();
+                        match tokio::task::spawn_blocking(move || classify_address(&rpc, &a)).await {
+                            Ok(Ok(kind)) => Ok(kind),
                             Ok(Err(e)) => Err(format!("validateaddress failed: {}", e)),
                             Err(e) => Err(format!("validateaddress task: {}", e)),
                         }
                     }
                 };
                 match answer {
-                    Ok(Some(spk)) => {
+                    Ok(Some(kind)) => {
                         if was_cached {
                             // answered without the node: the attempt is given back
                             state.authorize_refund(self.peer.ip());
                         } else {
-                            state.cache_address(&self.worker, Some(spk.clone()));
+                            state.cache_address(&address, Some(kind.clone()));
                         }
-                        self.script_pubkey = Some(spk);
-                        self.authorized(state);
+                        if kind.is_paired() && (state.coinbase.is_none() || !state.pairs.available()) {
+                            let why = format!("Invalid address: this pool cannot pay {} addresses now (its node does not serve getcoinbasetemplatefor)", kind.name());
+                            out.push_str(&msg_auth_failed(&id, &why));
+                            warn!("miner {}: {} is a {} address, and the node does not serve getcoinbasetemplatefor", self.index, shown(&address), kind.name());
+                            return Action::Disconnect;
+                        }
+                        if kind.is_paired() {
+                            if let Err(why) = state.pairs.subscribe(&address, kind.clone(), self.peer.ip()) {
+                                out.push_str(&msg_auth_failed(&id, &why));
+                                warn!("miner {}: {} refused: {}", self.index, shown(&address), why);
+                                return Action::Disconnect;
+                            }
+                        }
+                        let info = MinerInfo { address: address.clone(), label: label.clone(), kind: kind.name() };
+                        info!("miner {}: authorized, paying {} ({}{})", self.index, shown(&address), kind.name(), label.as_deref().map(|l| format!(", worker {}", l)).unwrap_or_default());
+                        self.address = address;
+                        self.payout = Some(kind);
+                        self.authorized(state, info);
                         out.push_str(&msg_authorized(&id));
-                        info!("miner {}: authorized, paying {}", self.index, shown(&self.worker));
                         Action::Continue
                     }
                     Ok(None) => {
                         if !was_cached {
-                            state.cache_address(&self.worker, None);
+                            state.cache_address(&address, None);
                         }
+                        warn!("miner {}: {} is not a payout address this pool can pay", self.index, shown(&address));
                         out.push_str(&msg_auth_failed(&id, "Invalid address"));
                         Action::Disconnect
                     }

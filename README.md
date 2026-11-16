@@ -60,20 +60,67 @@ node (see *Regtest quick start*).
 
 ## Which address gets paid
 
-The block reward is the coinbase's `vout[0]`; `yolo` always rewrites that output's
-`scriptPubKey` structurally (a v4 transaction parser, not a regex over the hex) and leaves every
-other output — the founders/YDF share — exactly as the node built it. `--payout` decides whose
-script goes in:
+`--payout` decides whose address the block pays:
 
 | `--payout` | Who is paid | The stratum username | Perl original |
 |---|---|---|---|
-| unset (default) | each miner, at its **stratum username**, which must be a transparent (`s1…`) address | checked with `validateaddress` on `mining.authorize`; anything else is refused with `Invalid address` | `stratumpool`, `cenote` |
+| unset (default) | each miner, at its **stratum username**: a transparent (`s1…`, `s3…`), Sapling (`ys1…`) or post-quantum (`sqf…`, `sqs…`) address, optionally followed by a worker label, `<address>.<label>` | checked with `validateaddress` (and `z_validateaddress` for a Sapling address) on `mining.authorize`; anything else is refused with `Invalid address` | `stratumpool`, `cenote` |
 | `--payout <s1…>` | **this address**, every block, whoever found it | any worker name; not checked | `stratumsolo`, `cenote --scrooge` |
+
+The label is 1 to 32 characters of `A-Z a-z 0-9 _ -`, everything after the first `.`; it is shown
+in the log and on `/status` only, and never changes who is paid.
+
+**How each miner is paid in full.** A miner who finds a block gets the block subsidy plus every
+fee of the transactions in that block (less the development-fund share, if the pool node carries
+one: see below). `yolo` never chooses or asks for an amount: the node derives it. There are two
+ways the coinbase is made, by the kind of the username's address:
+
+- **Transparent (P2PKH, P2SH): the swap path.** The node's own coinbase (`coinbasetxn`) already
+  claims the exact amount for the template's transactions. `yolo` rewrites the `scriptPubKey` of
+  its `vout[0]`, the miner's reward, structurally (a v4 transaction parser, not a regex over the
+  hex), and leaves every other output exactly as the node built it.
+- **Sapling and post-quantum: paired jobs.** A Sapling payout has no script to swap in (it is a
+  Sapling output with a proof and a binding signature, which only the node can build). For the
+  template it holds, `yolo` asks the node for that miner's coinbase,
+  `getcoinbasetemplatefor <address> {"previousblockhash": …, "txids": […]}`, and issues the
+  **pair** (that template's transactions, all of them, and that coinbase) as one job. It checks
+  every answer against the stock template before using it: the height and parent; the fee total;
+  the coinbase's total equal to the node's own coinbase's; the fund output identical; the
+  coinbase's sigops with the template's within its `sigoplimit` (and, when the job is built, the
+  block within its size limit); for a post-quantum payout, an output of exactly the amount to the
+  miner's script. **For a Sapling payout `yolo` checks the shape and the value, not the
+  recipient:** exactly one Sapling output, a `valueBalance` of minus the amount, and no
+  transparent output besides the fund's. That the Sapling output is addressed to the miner is the
+  node's responsibility: `yolo` does not decrypt it (it could, with the all-zero outgoing viewing
+  key of ZIP 213, but that needs a Sapling crate it does not carry). It never pairs a coinbase
+  with any transaction set other than the one it was built for. One request serves every
+  connection of one address. Under load the address whose pair is the oldest is served first.
+  One source IP may hold at most `--max-paired-per-ip` (default 8) Sapling and post-quantum
+  payout addresses at once; further ones from it are refused at `mining.authorize`, transparent
+  ones are not. The pair is renewed at once
+  on a new block (the miner gets no work until its pair arrives, a fraction of a second, a few
+  seconds for a Sapling proof on a small host) and on a new Yellowback quote, and on a changed
+  transaction set no more often than every 5 seconds (the miner keeps its valid job meanwhile).
+  At most `--coinbase-concurrency` requests (default 2) are in flight, on their own threads:
+  the template poll and `submitblock` never wait behind them. Give the node `-rpcthreads` of at
+  least that plus 2. `--text` rewrites only the scriptSig of a paired coinbase; its outputs are
+  never touched. Post-quantum addresses take this path too (decision D-6 of the design note),
+  although their payout is a script: only P2PKH and P2SH are swapped.
+
+The design is `docs/plans/beta3/getcoinbasetemplatefor.md` in the workspace.
+
+**The development-fund share is not always there.** Consensus requires a fund output (5 % of the
+subsidy) only below the fund's mandate end height (mainnet: ended at 2,275,000; the testnets and
+regtest have their own). Past it the share is optional and comes from the pool node's
+`-ydf=<0..5>`, whose default is **0** since beta3: the coinbase then has one output and the miner
+gets the whole subsidy plus fees. A node with `-ydf=5` adds the share to its own coinbase and to
+every coinbase `getcoinbasetemplatefor` builds, so both paths pay a miner the same; a pool that
+does this donates 5 % of every miner's subsidy and should say so.
 
 The address given to `--payout` is validated once at startup (`validateaddress`; a shielded or
 invalid address is a startup error). There is no "leave the coinbase as the node built it"
 case any more: the old solo behaviour is exactly `--payout <the node's own mineraddress>`,
-and the block it produces is byte for byte the node's.
+and the block it produces is byte for byte the node's. Under `--payout` every job is a swap job.
 
 The node's **`mineraddress=` is still required** in both cases: without it there is no
 template to serve (the node builds the coinbase, `yolo` only edits it), and the Yellowback
@@ -118,12 +165,20 @@ own byte scan and logs `tag: quote|signal|none` (`signal` is a tag with a zero p
 
 ```
 {"payout":"username","tagPayoutKey":"node","text":true,"noFlags":false,"equihash":"48,5",
- "nodeUp":true,"height":104,"templateAgeSeconds":0.0,"miners":1,"connections":1,
+ "nodeUp":true,"height":104,"templateAgeSeconds":0.0,"miners":2,
+ "minersByKind":{"p2pkh":1,"p2sh":0,"pq":0,"sapling":1,"fixed":0},
+ "minerList":[{"id":0,"kind":"p2pkh","address":"s1…","label":null},{"id":1,"kind":"sapling","address":"ys1…","label":"rig1"}],
+ "coinbaseCall":true,"pairs":{"addresses":1,"waiting":0,"inFlight":0,"concurrency":2,"requests":3,"failures":0,"lastRoundTripMs":180},
+ "connections":2,
  "tag":"quote","lastSubmitVerdict":"accepted","accepted":1,"rejected":0,"stale":0,"highHash":0,"uptimeSeconds":12}
 ```
 
 `payout` is the string `"username"` or the fixed `--payout` address; `text` is whether
 `--text` is set. `miners` counts authorized miners, `connections` every open stratum socket.
+`minersByKind` and `minerList` show each authorized miner by payout kind (`p2pkh`, `p2sh`, `pq`,
+`sapling`, or `fixed` under `--payout`, where the label is the username); `coinbaseCall` says
+whether paired jobs are available; `pairs` counts the paired addresses, those `waiting` for a
+coinbase for the current tip, the requests in flight and the last round trip.
 `lastSubmitVerdict` is the string `"accepted"` on success, the exact string `submitblock`
 returned (`duplicate`, `high-hash`, `time-too-old`, …), or one of the pool's own verdicts for
 a submit that never reached the node: `bad-submit` (malformed), `bad-ntime` (an `ntime` other
@@ -169,7 +224,8 @@ is answered with code 21 and its verdict.
 ```
 yolo [OPTIONS]
 
-  --payout <ADDRESS>         pay every block to this transparent address (unset: the miner's username is paid)
+  --payout <ADDRESS>         pay every block to this transparent address (unset: the miner's username is paid,
+                             transparent, Sapling or post-quantum, optionally <address>.<label>)
   --text <TEXT>              rebuild the coinbase scriptSig with this text after the node's coinbaseaux.flags
                              (unset: the node's scriptSig untouched); truncated to fit 100 bytes, with a warning
   --port <PORT>              stratum listen port                          [default: 3333]
@@ -185,6 +241,8 @@ yolo [OPTIONS]
   --status-bind <BIND>       address to bind the status listener to       [default: 127.0.0.1]
   --share-ratio <N>          the target sent to miners is N times easier than the block's; a submit
                              between the two is a share (counted, never forwarded)      [default: 1]
+  --coinbase-concurrency <N> getcoinbasetemplatefor requests in flight at once (paired jobs) [default: 2]
+  --max-paired-per-ip <N>    Sapling and post-quantum payout addresses one IP may mine to at once [default: 8]
   --max-connections <N>      stratum sockets open at once, authorized or not [default: 1024]
   --max-per-ip <N>           stratum sockets open at once from one IP     [default: 64]
   --log <LOG>                error, warn, info, debug, trace              [default: info]
@@ -197,7 +255,8 @@ mainnet start is `yolo --conf ~/.ycash/ycash.conf` (miners are paid at their use
 `yolo --conf ~/.ycash/ycash.conf --payout s1…` (one address for the whole pool).
 
 A miner connects as it would to any Equihash stratum pool: `stratum+tcp://host:3333`,
-username = a transparent address (or any worker name when `--payout` is set), password =
+username = its payout address, transparent, Sapling or post-quantum, optionally with a worker
+label (`<address>.<label>`), or any worker name when `--payout` is set; password =
 `--password` or anything. `mining.extranonce.subscribe` is acknowledged; job ids are a
 per-connection counter.
 
@@ -256,7 +315,18 @@ listen address.
 
 - `server=1` and RPC credentials in `ycash.conf`; the node fully synced with at least one
   peer (`getblocktemplate` refuses to serve work otherwise).
-- **`mineraddress=s1…`**: a transparent address **of the node wallet** (`ycash-cli getnewaddress`).
+- **For Sapling and post-quantum usernames: a ycashd with `getcoinbasetemplatefor`** (Ycash
+  6.22.0-beta3 or later, either node line). `yolo` asks the node at startup; a node without it
+  still serves transparent miners exactly as before, and Sapling and post-quantum usernames are
+  refused with `Invalid address: this pool cannot pay <kind> addresses now (its node does not
+  serve getcoinbasetemplatefor)`, logged once. A "Method not found" answer to any later request
+  (a startup check that could not reach the node, a downgraded node) does the same and lets the
+  paired miners go; `yolo` asks the node again every minute and accepts them again once it
+  serves the call. `-rpcthreads` at least `--coinbase-concurrency` plus 2.
+- `-ydf=0` (the default since beta3) pays miners the whole subsidy past the fund's mandate; see
+  *Which address gets paid*.
+- **`mineraddress=s1…`**: a transparent address **of the node wallet** (`ycash-cli getnewaddress`),
+  never a Sapling one (the swap path needs the node's coinbase to pay a transparent `vout[0]`).
   Always needed — without it the node builds no template — and the tag's payout key defaults
   to it. It receives the rewards only under `--payout <that address>`. A mined reward matures
   after 100 blocks and, on Ycash, must first be sent in full to a shielded address before it
@@ -317,6 +387,18 @@ per case: the four cells of the payout × text grid (username / `--payout`, with
 `--text`), `--text --no-flags` (the hidden test switch that reproduces the Perl: the block is
 accepted and `yed_gettag` says `found: false`) and a 90-byte `--text` (scriptSig exactly
 100 bytes, tag intact). It skips when `YCASHD` is unset.
+
+`tests/regtest_pairs.rs` (`cargo test --features regtest --test regtest_pairs`) is the paired-job
+acceptance test: one pool, a transparent, a Sapling (with a worker label) and two post-quantum
+miners, one at a time and then three at once, every block with fee-paying transactions and
+checked on chain to pay its finder exactly the subsidy plus every fee; then the pool node at
+`-ydf=5`, where each pays 95 % of the subsidy plus every fee and its fund output is the stock
+coinbase's. `YOLO_REGTEST_COINBASE=node` uses the node's `getcoinbasetemplatefor` (and fails if
+`YCASHD` lacks it); `stub` the test-only stand-in for nodes without it (a helper node mining to the
+Sapling address, and the pool node's coinbase with the post-quantum script swapped in); unset,
+`node` when the call exists, else `stub`. `tests/paired.rs` drives the same flow in-process against
+a fake node and source: refused and stale answers, template changes in the middle of a job, the
+request cap.
 
 The nodes start with the vault upgrade active at height 110: yolo first mines blocks 102
 through 111 with no Yellowback state (case `across-vault-activation`: every block accepted, the

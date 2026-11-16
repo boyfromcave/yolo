@@ -9,12 +9,22 @@
 //! 6.20.0; the same bytes before NU5) is read from whichever key the node serves; see
 //! [`BlockTemplate::header_root`].
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TemplateTx {
     pub data: String,
     pub hash: String,
+    /// The transaction's fee in zatoshi, as the node's mempool entry states it (what the
+    /// coinbase may claim for it). Checked against `getcoinbasetemplatefor`'s `fees`.
+    #[serde(default)]
+    pub fee: Option<i64>,
+    /// The transaction's signature operations, as the node counts them toward `sigoplimit`.
+    #[serde(default)]
+    pub sigops: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -53,8 +63,11 @@ pub struct BlockTemplate {
     /// Absent before 6.20.0.
     #[serde(default)]
     pub defaultroots: Option<DefaultRoots>,
+    /// Each transaction behind its own `Arc`, so templates polled one after another share the
+    /// transactions they have in common ([`BlockTemplate::share_transactions`]): a pair pins its
+    /// template (`crate::pairs::Pair`), and a full block's hex is megabytes.
     #[serde(default)]
-    pub transactions: Vec<TemplateTx>,
+    pub transactions: Vec<Arc<TemplateTx>>,
     pub coinbasetxn: CoinbaseTxn,
     /// Absent on a node without `-yellowback` when `coinbasetxn` is served: treated as empty.
     #[serde(default)]
@@ -64,6 +77,9 @@ pub struct BlockTemplate {
     pub height: u32,
     pub curtime: Option<i64>,
     pub sizelimit: Option<usize>,
+    /// The block's signature-operation limit (`MAX_BLOCK_SIGOPS`); the coinbase counts toward it.
+    #[serde(default)]
+    pub sigoplimit: Option<u64>,
 }
 
 /// What must change for miners to receive new work.
@@ -118,6 +134,48 @@ impl BlockTemplate {
         ChangeKey { height: self.height, target: self.target.clone(), light_client_root: self.header_root().unwrap_or("").to_string(), flags: self.coinbaseaux.flags.clone() }
     }
 
+    /// The template's transaction ids in its order: the reference `getcoinbasetemplatefor` names
+    /// the template by, with `previousblockhash`.
+    pub fn txids(&self) -> Vec<String> {
+        self.transactions.iter().map(|t| t.hash.to_ascii_lowercase()).collect()
+    }
+
+    /// The sum of `transactions[].fee`; an error when a fee is missing or negative.
+    pub fn fee_total(&self) -> Result<u64, String> {
+        self.transactions.iter().try_fold(0u64, |sum, t| match t.fee {
+            Some(f) if f >= 0 => sum.checked_add(f as u64).ok_or_else(|| "fee total overflows".to_string()),
+            Some(f) => Err(format!("transaction {} has a negative fee {}", t.hash, f)),
+            None => Err(format!("transaction {} has no fee in the template", t.hash)),
+        })
+    }
+
+    /// The sum of `transactions[].sigops`; an error when one is missing or negative.
+    pub fn sigop_total(&self) -> Result<u64, String> {
+        self.transactions.iter().try_fold(0u64, |sum, t| match t.sigops {
+            Some(n) if n >= 0 => sum.checked_add(n as u64).ok_or_else(|| "sigop total overflows".to_string()),
+            Some(n) => Err(format!("transaction {} has a negative sigop count {}", t.hash, n)),
+            None => Err(format!("transaction {} has no sigop count in the template", t.hash)),
+        })
+    }
+
+    /// Makes every transaction of this template that `previous` carries too, byte for byte (the
+    /// same id, data, fee and sigop count), the very allocation `previous` holds, so a template
+    /// polled again with an unchanged transaction set costs no new copy of it. Only identical
+    /// values are shared: nothing a job reads from this template changes.
+    pub fn share_transactions(&mut self, previous: &BlockTemplate) {
+        if previous.transactions.is_empty() {
+            return;
+        }
+        let known: HashMap<&str, &Arc<TemplateTx>> = previous.transactions.iter().map(|t| (t.hash.as_str(), t)).collect();
+        for tx in self.transactions.iter_mut() {
+            if let Some(old) = known.get(tx.hash.as_str()) {
+                if !Arc::ptr_eq(old, tx) && ***old == **tx {
+                    *tx = Arc::clone(old);
+                }
+            }
+        }
+    }
+
     pub fn flags_bytes(&self) -> Result<Vec<u8>, String> {
         hex::decode(&self.coinbaseaux.flags).map_err(|e| format!("coinbaseaux.flags is not hex: {}", e))
     }
@@ -134,6 +192,23 @@ mod tests {
         assert_eq!(t.transactions.len(), 2);
         assert_eq!(t.flags_bytes().unwrap().len(), 37);
         assert_eq!(t.header_root().unwrap(), "b95a1b9634a9157950252feeb9885ed1c9764e1741da98a6202abae39c454753");
+        assert_eq!(t.fee_total().unwrap(), 490);
+        assert_eq!(t.txids(), vec!["a80555562c7669ae53157f380e77e40a0a60e6b5066c3c84122ecf3d3f44f331", "fb9d25619e7c33e39b6201184641cb411bda65bba9ea05e4da114278dd5fbe40"]);
+        let mut no_fee = t.clone();
+        Arc::make_mut(&mut no_fee.transactions[1]).fee = None;
+        assert!(no_fee.fee_total().is_err());
+        // a re-polled template shares the transactions that are byte-for-byte the same
+        let mut again = t.clone();
+        again.transactions = again.transactions.iter().map(|x| Arc::new((**x).clone())).collect();
+        let mut changed = (*again.transactions[1]).clone();
+        changed.fee = Some(changed.fee.unwrap() + 1);
+        again.transactions[1] = Arc::new(changed);
+        again.share_transactions(&t);
+        assert!(Arc::ptr_eq(&again.transactions[0], &t.transactions[0]));
+        assert!(!Arc::ptr_eq(&again.transactions[1], &t.transactions[1]), "a different fee is not the same transaction entry");
+        assert_eq!(again.transactions[1].fee, Some(t.transactions[1].fee.unwrap() + 1));
+        assert_eq!(t.sigop_total().unwrap(), 4);
+        assert_eq!(t.sigoplimit, Some(20000));
         let k = t.change_key();
         let t4: BlockTemplate = serde_json::from_str(include_str!("../tests/vectors/regtest-template-4-noflags.json")).unwrap();
         assert_eq!(t4.flags_bytes().unwrap(), Vec::<u8>::new());

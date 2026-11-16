@@ -3,8 +3,9 @@
 // file LICENSE or https://www.opensource.org/licenses/mit-license.php .
 
 //! JSON-RPC 1.0 over HTTP to `ycashd`. The Perl shells out to `ycash-cli` (`stratumsolo:294`);
-//! this talks to the node directly. Only four methods are used: `getblockchaininfo`,
-//! `getblocktemplate`, `submitblock`, `validateaddress`.
+//! this talks to the node directly. The methods used: `getblockchaininfo`, `getblocktemplate`,
+//! `submitblock`, `validateaddress`, `z_validateaddress` (a Sapling username) and
+//! `getcoinbasetemplatefor` (the coinbase of a paired job, `docs/plans/beta3/getcoinbasetemplatefor.md`).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -204,6 +205,21 @@ impl RpcClient {
         let v = self.call("validateaddress", json!([address]))?;
         serde_json::from_value(v).map_err(|e| RpcError::Protocol(e.to_string()))
     }
+
+    pub fn z_validateaddress(&self, address: &str) -> Result<ZValidateAddress, RpcError> {
+        let v = self.call("z_validateaddress", json!([address]))?;
+        serde_json::from_value(v).map_err(|e| RpcError::Protocol(e.to_string()))
+    }
+
+    /// Whether the node serves `getcoinbasetemplatefor`: called without arguments, a node that
+    /// has it answers with its usage error, one that has not with "Method not found".
+    pub fn has_coinbase_call(&self) -> Result<bool, RpcError> {
+        match self.call("getcoinbasetemplatefor", json!([])) {
+            Err(RpcError::Node { code: RPC_METHOD_NOT_FOUND, .. }) => Ok(false),
+            Err(RpcError::Node { .. }) | Ok(_) => Ok(true),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -212,6 +228,93 @@ pub struct ValidateAddress {
     #[serde(rename = "scriptPubKey")]
     pub script_pubkey: Option<String>,
     pub ismine: Option<bool>,
+    /// Present for a post-quantum address only (1 = SLH-DSA-SHA2-128s, 2 = FN-DSA-512).
+    pub pqscheme: Option<i64>,
+}
+
+/// `z_validateaddress`, as far as yolo reads it: whether the address is valid and its kind.
+/// ycash6 names the kind `address_type` (and `type` while that deprecation is allowed); ycash-dd
+/// names it `type`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ZValidateAddress {
+    pub isvalid: bool,
+    pub address_type: Option<String>,
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+}
+
+impl ZValidateAddress {
+    pub fn address_type(&self) -> Option<&str> {
+        self.address_type.as_deref().or(self.kind.as_deref())
+    }
+}
+
+/// One answer of `getcoinbasetemplatefor` (design note §3.2, frozen interface §8.4). Amounts in
+/// zatoshi. Unknown keys are ignored (`defaultroots` may appear later).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CoinbaseFor {
+    pub data: String,
+    pub hash: String,
+    pub height: u32,
+    pub previousblockhash: String,
+    pub addresstype: String,
+    pub subsidy: u64,
+    pub fund: u64,
+    /// Why the fund output is there: `mandated`, `optional` (the node's `-ydf` past the mandate)
+    /// or `none` (no fund output, `fund` is 0).
+    pub fundrule: String,
+    pub fees: u64,
+    pub amount: u64,
+    pub txcount: usize,
+    pub flags: String,
+    pub sigops: u32,
+}
+
+/// Where paired coinbases come from: the node (`RpcClient`) in production, a stub in tests.
+pub trait CoinbaseSource: Send + Sync {
+    fn coinbase_for(&self, address: &str, previousblockhash: &str, txids: &[String]) -> Result<CoinbaseFor, RpcError>;
+
+    /// Whether the call exists, asked again while a "Method not found" answer has switched paired
+    /// jobs off. A source that always serves it (a test fixture) need not say.
+    fn has_call(&self) -> Result<bool, RpcError> {
+        Ok(true)
+    }
+}
+
+impl std::fmt::Debug for dyn CoinbaseSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CoinbaseSource")
+    }
+}
+
+/// JSON-RPC "Method not found".
+pub const RPC_METHOD_NOT_FOUND: i64 = -32601;
+
+impl CoinbaseSource for RpcClient {
+    fn coinbase_for(&self, address: &str, previousblockhash: &str, txids: &[String]) -> Result<CoinbaseFor, RpcError> {
+        let v = self.call("getcoinbasetemplatefor", json!([address, {"previousblockhash": previousblockhash, "txids": txids}]))?;
+        serde_json::from_value(v).map_err(|e| RpcError::Protocol(format!("getcoinbasetemplatefor: {}", e)))
+    }
+
+    fn has_call(&self) -> Result<bool, RpcError> {
+        self.has_coinbase_call()
+    }
+}
+
+impl RpcError {
+    /// The node's error code, for a JSON-RPC error object.
+    pub fn code(&self) -> Option<i64> {
+        match self {
+            RpcError::Node { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// A `template-stale` refusal of `getcoinbasetemplatefor` (note §7 rows 10, 11): the caller's
+    /// template is void and a fresh one is needed.
+    pub fn is_template_stale(&self) -> bool {
+        matches!(self, RpcError::Node { code: -1, message } if message.starts_with("template-stale"))
+    }
 }
 
 fn parse_response(status: u16, text: &str) -> Result<Value, RpcError> {
@@ -287,6 +390,11 @@ mod tests {
             other => panic!("{:?}", other),
         }
         assert!(matches!(parse_response(401, ""), Err(RpcError::Transport(_))));
+        let stale = parse_response(500, r#"{"result":null,"error":{"code":-1,"message":"template-stale: previousblockhash is not the tip"}}"#).unwrap_err();
+        assert!(stale.is_template_stale());
+        let other = parse_response(500, r#"{"result":null,"error":{"code":-1,"message":"coinbase-does-not-fit: block size 2000100 exceeds 2000000"}}"#).unwrap_err();
+        assert!(!other.is_template_stale());
+        assert_eq!(other.code(), Some(-1));
         assert!(matches!(parse_response(200, "<html>"), Err(RpcError::Protocol(_))));
     }
 }

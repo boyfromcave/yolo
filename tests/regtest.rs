@@ -358,6 +358,7 @@ async fn run_case(case: &Case, a: &dyn Rpc, b: &dyn Rpc, facts: &dyn Rpc, python
         password: None,
         equihash: EquihashArg::Fixed(Equihash::REGTEST),
         limits: yolo::Limits::default(),
+        test_coinbase_source: None,
     };
     let bound = yolo::bind(a.client().clone(), config).await.unwrap();
     let addr = bound.addr;
@@ -422,6 +423,7 @@ async fn run_plain(name: &str, a: &dyn Rpc, b: &dyn Rpc, python: &Path, miner: &
         password: None,
         equihash: EquihashArg::Fixed(Equihash::REGTEST),
         limits: yolo::Limits::default(),
+        test_coinbase_source: None,
     };
     let bound = yolo::bind(a.client().clone(), config).await.unwrap();
     let addr = bound.addr;

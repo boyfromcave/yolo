@@ -27,10 +27,12 @@ rules:
       - pattern: $CLIENT.call($METHOD, ...)
       - metavariable-regex:
           metavariable: $METHOD
-          regex: ^"(?!(getblocktemplate|submitblock|validateaddress|getblockchaininfo)").*"$
+          regex: ^"(?!(getblocktemplate|submitblock|validateaddress|getblockchaininfo|z_validateaddress|getcoinbasetemplatefor)").*"$
     message: >-
-      The pool calls an RPC outside the stock mining set (getblocktemplate, submitblock, validateaddress,
-      getblockchaininfo). Adding one widens the node interface the pool depends on; it needs the plan
+      The pool calls an RPC outside its node interface: the stock mining set (getblocktemplate, submitblock,
+      validateaddress, getblockchaininfo) and, for paired jobs, z_validateaddress (a Sapling username) and
+      getcoinbasetemplatefor (beta3 item 3, docs/plans/beta3/getcoinbasetemplatefor.md §8). Adding one
+      widens the node interface the pool depends on; it needs the plan
       (docs/plans/role-pool-regtest-plan.md §6) changed first.
     severity: WARNING
     metadata:
