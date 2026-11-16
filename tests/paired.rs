@@ -156,30 +156,42 @@ impl FakeSource {
     }
 }
 
+/// A malformed fixture, as an error of the fake call (the fakes return `Result`, so they do not panic).
+fn fixture(what: impl std::fmt::Display) -> RpcError {
+    RpcError::Protocol(format!("test fixture: {}", what))
+}
+
 fn answer(t: &Value, address: &str, prev: &str, txids: &[String]) -> Result<CoinbaseFor, RpcError> {
     let stale = |m: &str| Err(RpcError::Node { code: -1, message: format!("template-stale: {}", m) });
-    if t["previousblockhash"].as_str().unwrap() != prev {
+    if t["previousblockhash"].as_str() != Some(prev) {
         return stale("previousblockhash is not the tip");
     }
-    let fees: u64 = t["transactions"].as_array().unwrap().iter().filter(|x| txids.iter().any(|id| id == x["hash"].as_str().unwrap())).map(|x| x["fee"].as_u64().unwrap()).sum();
+    let mut fees = 0u64;
+    for x in t["transactions"].as_array().ok_or_else(|| fixture("no transactions"))? {
+        if txids.iter().any(|id| x["hash"].as_str() == Some(id.as_str())) {
+            fees += x["fee"].as_u64().ok_or_else(|| fixture("a transaction without a fee"))?;
+        }
+    }
+    let coinbase_of = |v: &Value| -> Result<Vec<u8>, RpcError> { hex::decode(v["coinbasetxn"]["data"].as_str().ok_or_else(|| fixture("no coinbasetxn"))?).map_err(fixture) };
     let (data, kind) = if address.starts_with("yregtestsapling1") {
         // the helper node's coinbase: valid only for the vector's transactions
-        let h: Value = serde_json::from_str(HELPER_TEMPLATE).unwrap();
+        let h: Value = serde_json::from_str(HELPER_TEMPLATE).map_err(fixture)?;
         if fees != 489 {
             return stale("transaction is not in the mempool");
         }
-        (hex::decode(h["coinbasetxn"]["data"].as_str().unwrap()).unwrap(), "sapling")
+        (coinbase_of(&h)?, "sapling")
     } else {
-        let mut cb = Coinbase::parse(&hex::decode(t["coinbasetxn"]["data"].as_str().unwrap()).unwrap()).unwrap();
-        cb.vout[0].script_pubkey = pq_spk(address);
+        let mut cb = Coinbase::parse(&coinbase_of(t)?).map_err(fixture)?;
+        cb.vout.first_mut().ok_or_else(|| fixture("a coinbase without outputs"))?.script_pubkey = pq_spk(address);
         (cb.serialize(), "pq")
     };
     let mut h = dsha256(&data);
     h.reverse();
+    let height = t["height"].as_u64().and_then(|v| u32::try_from(v).ok()).ok_or_else(|| fixture("no height"))?;
     Ok(CoinbaseFor {
         data: hex::encode(&data),
         hash: hex::encode(h),
-        height: t["height"].as_u64().unwrap() as u32,
+        height,
         previousblockhash: prev.to_string(),
         addresstype: kind.into(),
         subsidy: 625_000_000,
@@ -198,15 +210,15 @@ impl CoinbaseSource for FakeSource {
         let n = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_in_flight.fetch_max(n, Ordering::SeqCst);
         std::thread::sleep(self.delay);
-        self.calls.lock().unwrap().push((address.to_string(), previousblockhash.to_string(), txids.to_vec()));
-        let mode = *self.mode.lock().unwrap();
-        let t = self.template.lock().unwrap().clone();
+        self.calls.lock().unwrap_or_else(|e| e.into_inner()).push((address.to_string(), previousblockhash.to_string(), txids.to_vec()));
+        let mode = *self.mode.lock().unwrap_or_else(|e| e.into_inner());
+        let t = self.template.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let r = match mode {
             Mode::StaleOnce => {
-                *self.mode.lock().unwrap() = Mode::Good;
+                *self.mode.lock().unwrap_or_else(|e| e.into_inner()) = Mode::Good;
                 Err(RpcError::Node { code: -1, message: "template-stale: previousblockhash is not the tip".into() })
             }
-            Mode::WrongFees => answer(&t, address, previousblockhash, txids).map(|a| CoinbaseFor { fees: a.fees - 1, ..a }),
+            Mode::WrongFees => answer(&t, address, previousblockhash, txids).map(|a| CoinbaseFor { fees: a.fees.wrapping_sub(1), ..a }),
             Mode::NoMethod => Err(RpcError::Node { code: -32601, message: "Method not found".into() }),
             Mode::DoesNotFit => Err(RpcError::Node { code: -1, message: "coinbase-does-not-fit: block size 2000377 exceeds 2000000".into() }),
             Mode::Good => answer(&t, address, previousblockhash, txids),

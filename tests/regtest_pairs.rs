@@ -173,8 +173,7 @@ impl Stub {
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             let t = rpc.call("getblocktemplate", json!([]))?;
-            let have: BTreeSet<String> = t["transactions"].as_array().unwrap().iter().map(|x| x["hash"].as_str().unwrap().to_string()).collect();
-            let have: BTreeSet<&str> = have.iter().map(String::as_str).collect();
+            let have: BTreeSet<&str> = t["transactions"].as_array().ok_or_else(|| fixture("no transactions"))?.iter().filter_map(|x| x["hash"].as_str()).collect();
             if t["previousblockhash"].as_str() == Some(prev) && have == want {
                 return Ok(t);
             }
@@ -186,11 +185,17 @@ impl Stub {
     }
 }
 
+/// A malformed node answer, as an error of the stub (it returns `Result`, so it does not panic).
+fn fixture(what: impl std::fmt::Display) -> RpcError {
+    RpcError::Protocol(format!("stub: {}", what))
+}
+
 impl CoinbaseSource for Stub {
     fn coinbase_for(&self, address: &str, prev: &str, txids: &[String]) -> Result<CoinbaseFor, RpcError> {
+        let coinbase_of = |t: &Value| -> Result<Vec<u8>, RpcError> { hex::decode(t["coinbasetxn"]["data"].as_str().ok_or_else(|| fixture("no coinbasetxn"))?).map_err(fixture) };
         let (t, data, addresstype) = if address == self.sapling {
             let t = Stub::template_for(&self.helper, prev, txids)?;
-            let data = hex::decode(t["coinbasetxn"]["data"].as_str().unwrap()).unwrap();
+            let data = coinbase_of(&t)?;
             (t, data, "sapling")
         } else {
             let t = Stub::template_for(&self.pool, prev, txids)?;
@@ -198,15 +203,19 @@ impl CoinbaseSource for Stub {
             if v.pqscheme.is_none() {
                 return Err(RpcError::Node { code: -5, message: "Address type cannot receive a coinbase: stub".into() });
             }
-            let mut cb = Coinbase::parse(&hex::decode(t["coinbasetxn"]["data"].as_str().unwrap()).unwrap()).unwrap();
-            cb.vout[0].script_pubkey = hex::decode(v.script_pubkey.unwrap()).unwrap();
+            let mut cb = Coinbase::parse(&coinbase_of(&t)?).map_err(fixture)?;
+            let spk = hex::decode(v.script_pubkey.ok_or_else(|| fixture("no scriptPubKey"))?).map_err(fixture)?;
+            cb.vout.first_mut().ok_or_else(|| fixture("a coinbase without outputs"))?.script_pubkey = spk;
             (t, cb.serialize(), "pq")
         };
-        let cb = Coinbase::parse(&data).unwrap();
-        let fees: u64 = t["transactions"].as_array().unwrap().iter().map(|x| x["fee"].as_u64().unwrap()).sum();
-        let claimed = cb.claimed_total().unwrap();
-        let fund = if addresstype == "sapling" { cb.transparent_total().unwrap() } else { cb.vout[1..].iter().map(|o| o.value).sum() };
-        let height = t["height"].as_u64().unwrap() as u32;
+        let cb = Coinbase::parse(&data).map_err(fixture)?;
+        let mut fees = 0u64;
+        for x in t["transactions"].as_array().ok_or_else(|| fixture("no transactions"))? {
+            fees += x["fee"].as_u64().ok_or_else(|| fixture("a transaction without a fee"))?;
+        }
+        let claimed = cb.claimed_total().ok_or_else(|| fixture("the coinbase total overflows"))?;
+        let fund = if addresstype == "sapling" { cb.transparent_total().ok_or_else(|| fixture("the outputs overflow"))? } else { cb.vout.iter().skip(1).map(|o| o.value).sum() };
+        let height = t["height"].as_u64().and_then(|v| u32::try_from(v).ok()).ok_or_else(|| fixture("no height"))?;
         let fundrule = if fund == 0 {
             "none"
         } else if self.ydf > 0 {
@@ -222,11 +231,11 @@ impl CoinbaseSource for Stub {
             height,
             previousblockhash: prev.to_string(),
             addresstype: addresstype.into(),
-            subsidy: claimed - fees,
+            subsidy: claimed.saturating_sub(fees),
             fund,
             fundrule: fundrule.into(),
             fees,
-            amount: claimed - fund,
+            amount: claimed.saturating_sub(fund),
             txcount: txids.len(),
             flags: t["coinbaseaux"]["flags"].as_str().unwrap_or("").to_string(),
             sigops: 0,
@@ -242,7 +251,7 @@ struct Counting {
 
 impl CoinbaseSource for Counting {
     fn coinbase_for(&self, address: &str, prev: &str, txids: &[String]) -> Result<CoinbaseFor, RpcError> {
-        *self.asked.lock().unwrap().entry(address.to_string()).or_insert(0) += 1;
+        *self.asked.lock().unwrap_or_else(|e| e.into_inner()).entry(address.to_string()).or_insert(0) += 1;
         self.inner.coinbase_for(address, prev, txids)
     }
 }
@@ -821,14 +830,14 @@ struct Timed {
 impl CoinbaseSource for Timed {
     fn coinbase_for(&self, address: &str, prev: &str, txids: &[String]) -> Result<CoinbaseFor, RpcError> {
         {
-            let mut f = self.in_flight.lock().unwrap();
+            let mut f = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
             f.0 += 1;
             f.1 = f.1.max(f.0);
         }
         let at = Instant::now();
         let r = self.inner.coinbase_for(address, prev, txids);
-        self.durations.lock().unwrap().push(at.elapsed().as_millis());
-        self.in_flight.lock().unwrap().0 -= 1;
+        self.durations.lock().unwrap_or_else(|e| e.into_inner()).push(at.elapsed().as_millis());
+        self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).0 -= 1;
         r
     }
 }

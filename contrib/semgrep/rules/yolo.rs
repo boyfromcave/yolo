@@ -6,6 +6,12 @@ fn rpc(client: &RpcClient) {
     client.call("sendrawtransaction", json!([]));
     // ok: yolo.rpc.non-stock-method
     client.call("getblocktemplate", json!([]));
+    // ok: yolo.rpc.non-stock-method
+    client.call("z_validateaddress", json!([]));
+    // ok: yolo.rpc.non-stock-method
+    client.call("getcoinbasetemplatefor", json!([]));
+    // ruleid: yolo.rpc.non-stock-method
+    client.call("getcoinbasetemplate", json!([]));
 }
 
 async fn read(reader: &mut BufReader<OwnedReadHalf>) {
