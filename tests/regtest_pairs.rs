@@ -248,7 +248,6 @@ struct Ctx {
     w: Node,
     python: PathBuf,
     miner: PathBuf,
-    subsidy: u64,
 }
 
 impl Ctx {
@@ -283,6 +282,13 @@ impl Ctx {
     }
 
     /// The fees of a block's transactions, from P's wallet (it sent all of them).
+    /// The block subsidy at `height`, from the node's `getblocksubsidy` (`miner` plus `founders`:
+    /// both lines answer both keys), not from any coinbase the code under test handled.
+    fn subsidy_at(&self, height: u64) -> u64 {
+        let s = self.p.call("getblocksubsidy", json!([height]));
+        zat(&s["miner"]) + zat(&s["founders"])
+    }
+
     fn block_fees(&self, block: &Value) -> u64 {
         block["tx"].as_array().unwrap()[1..].iter().map(|tx| zat(&json!(-self.p.call("gettransaction", json!([tx["txid"]]))["fee"].as_f64().unwrap()))).sum()
     }
@@ -293,8 +299,9 @@ impl Ctx {
         let block = self.p.call("getblock", json!([height.to_string(), 2]));
         let cb = &block["tx"][0];
         let fees = self.block_fees(&block);
-        let fund = self.subsidy * ydf / 100;
-        let want = self.subsidy - fund + fees;
+        let subsidy = self.subsidy_at(height);
+        let fund = subsidy * ydf / 100;
+        let want = subsidy - fund + fees;
         let vout = cb["vout"].as_array().unwrap();
         let paid = match m.kind {
             "sapling" => {
@@ -317,7 +324,7 @@ impl Ctx {
                 out[0]["valueZat"].as_u64().unwrap_or_else(|| zat(&out[0]["value"]))
             }
         };
-        assert_eq!(paid, want, "{}: block {} pays subsidy {} - fund {} + fees {}", m.user, height, self.subsidy, fund, fees);
+        assert_eq!(paid, want, "{}: block {} pays subsidy {} - fund {} + fees {}", m.user, height, subsidy, fund, fees);
         let funds: Vec<(u64, String)> = vout
             .iter()
             .filter(|o| m.script.as_deref().is_none_or(|s| o["scriptPubKey"]["hex"] != s))
@@ -327,7 +334,7 @@ impl Ctx {
             Some(f) => assert_eq!(funds, vec![f.clone()], "{}: the fund output is the stock coinbase's", m.user),
             None => assert!(funds.is_empty(), "{}: no fund output at -ydf=0: {:?}", m.user, funds),
         }
-        log(&format!("block {} pays {} ({}) {} zat = {} - {} + {} fees; fund {:?}", height, m.user, m.kind, paid, self.subsidy, fund, fees, stock_fund));
+        log(&format!("block {} pays {} ({}) {} zat = {} - {} + {} fees; fund {:?}", height, m.user, m.kind, paid, subsidy, fund, fees, stock_fund));
         fees
     }
 
@@ -489,12 +496,9 @@ async fn paired_jobs_pay_each_miner_in_full() {
         Arc::new(Counting { inner, asked: Mutex::new(HashMap::new()) })
     };
 
-    let mut ctx = Ctx { p, w, python, miner, subsidy: 0 };
-    // The subsidy, from the node's own template: its coinbase claims subsidy plus every fee.
-    let t = ctx.p.call("getblocktemplate", json!([]));
-    let fees: u64 = t["transactions"].as_array().unwrap().iter().map(|x| x["fee"].as_u64().unwrap()).sum();
-    ctx.subsidy = Coinbase::parse(&hex::decode(t["coinbasetxn"]["data"].as_str().unwrap()).unwrap()).unwrap().claimed_total().unwrap() - fees;
-    log(&format!("subsidy {} zat at height {}", ctx.subsidy, t["height"]));
+    let mut ctx = Ctx { p, w, python, miner };
+    let next = ctx.p.height() + 1;
+    log(&format!("subsidy {} zat at height {} (getblocksubsidy)", ctx.subsidy_at(next), next));
 
     let miners = vec![
         Miner { user: t_addr.clone(), address: t_addr.clone(), kind: "p2pkh", script: script(&t_addr) },
