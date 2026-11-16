@@ -22,6 +22,8 @@
 //! `submitblock` ever waits behind a proof.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,7 +31,7 @@ use tokio::sync::{watch, Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::codec::dsha256;
-use crate::rpc::{CoinbaseFor, RpcClient, RpcError, ValidateAddress, ZValidateAddress};
+use crate::rpc::{CoinbaseFor, RpcClient, RpcError, ValidateAddress, ZValidateAddress, RPC_METHOD_NOT_FOUND};
 use crate::state::State;
 use crate::tag::height_push;
 use crate::template::BlockTemplate;
@@ -178,6 +180,14 @@ pub fn check_answer(t: &BlockTemplate, kind: &PayoutKind, txids: &[String], a: &
         return Err(format!("the scriptSig does not start with the height push for {}", t.height));
     }
     let flags = hex::decode(&a.flags).map_err(|e| format!("flags is not hex: {}", e))?;
+    // The coinbase's signature operations count toward the block's limit with the template's
+    // (the size is checked when the job is built: `work::build_paired_work`).
+    if let Some(limit) = t.sigoplimit {
+        let total = t.sigop_total()?.checked_add(u64::from(a.sigops)).ok_or("the sigop total overflows")?;
+        if total > limit {
+            return Err(format!("coinbase-does-not-fit: sigops {} (the coinbase's {} and the template's) exceed {}", total, a.sigops, limit));
+        }
+    }
     // What the coinbase claims equals what the node's own coinbase for this template claims:
     // subsidy plus every fee (both measured equal, note §10 run 1).
     let stock = hex::decode(&t.coinbasetxn.data).map_err(|e| format!("coinbasetxn.data is not hex: {}", e))?;
@@ -247,11 +257,17 @@ pub struct Pair {
     pub coinbase: Vec<u8>,
     pub flags: Vec<u8>,
     pub amount: u64,
+    /// When the pair was made: the oldest pair is renewed first (no address waits behind the
+    /// same others every time).
+    pub built_at: Instant,
 }
 
 struct Entry {
     kind: PayoutKind,
     subscribers: usize,
+    /// When the first connection for the address authorized (orders addresses that have no
+    /// pair yet: the longest waiting first).
+    subscribed_at: Instant,
     current: Option<Arc<Pair>>,
     /// Bumped whenever `current` is replaced (clients compare it with the job they sent).
     version: u64,
@@ -272,6 +288,17 @@ struct Stats {
 /// The pair book: one entry per paired payout address with at least one connection.
 pub struct Pairs {
     entries: Mutex<HashMap<String, Entry>>,
+    /// The paired addresses each source IP has connections for, with their connection counts
+    /// (never locked together with `entries`).
+    per_ip: Mutex<HashMap<IpAddr, HashMap<String, usize>>>,
+    /// `--max-paired-per-ip`: distinct paired addresses one IP may hold at once.
+    max_per_ip: usize,
+    /// Whether the node serves `getcoinbasetemplatefor`. Cleared by a "Method not found" answer
+    /// to any request; while it is clear, paired usernames are refused and the node is
+    /// re-probed every `probe_every`.
+    available: AtomicBool,
+    probe_every: Duration,
+    last_probe: Mutex<Option<Instant>>,
     permits: Arc<Semaphore>,
     concurrency: usize,
     /// Wakes the refresher (a new template, a new subscriber, a finished request).
@@ -281,10 +308,15 @@ pub struct Pairs {
 }
 
 impl Pairs {
-    pub fn new(concurrency: usize) -> Pairs {
+    pub fn new(concurrency: usize, max_per_ip: usize, probe_every: Duration) -> Pairs {
         let concurrency = concurrency.max(1);
         Pairs {
             entries: Mutex::new(HashMap::new()),
+            per_ip: Mutex::new(HashMap::new()),
+            max_per_ip,
+            available: AtomicBool::new(true),
+            probe_every,
+            last_probe: Mutex::new(None),
             permits: Arc::new(Semaphore::new(concurrency)),
             concurrency,
             wake: Notify::new(),
@@ -302,14 +334,47 @@ impl Pairs {
         self.version_tx.subscribe()
     }
 
-    /// A connection mining to `address` (a paired kind) has authorized.
-    pub fn subscribe(&self, address: &str, kind: PayoutKind) {
-        self.entries().entry(address.to_string()).or_insert_with(|| Entry { kind, subscribers: 0, current: None, version: 0, in_flight: false, last_request: None, failed: None }).subscribers += 1;
+    /// A connection from `ip` mining to `address` (a paired kind) has authorized. Refused when
+    /// `ip` already holds connections for `--max-paired-per-ip` other paired addresses: each
+    /// address costs the node a coinbase (a proof, for Sapling) on every block, so one IP must
+    /// not crowd out everyone else's.
+    pub fn subscribe(&self, address: &str, kind: PayoutKind, ip: IpAddr) -> Result<(), String> {
+        {
+            let mut per_ip = self.per_ip.lock().unwrap_or_else(|e| e.into_inner());
+            let held = per_ip.entry(ip).or_default();
+            if !held.contains_key(address) && held.len() >= self.max_per_ip {
+                if held.is_empty() {
+                    per_ip.remove(&ip);
+                }
+                return Err(format!("Too many Sapling and post-quantum payout addresses from this IP (at most {})", self.max_per_ip));
+            }
+            *held.entry(address.to_string()).or_insert(0) += 1;
+        }
+        let now = Instant::now();
+        self.entries()
+            .entry(address.to_string())
+            .or_insert_with(|| Entry { kind, subscribers: 0, subscribed_at: now, current: None, version: 0, in_flight: false, last_request: None, failed: None })
+            .subscribers += 1;
         self.wake.notify_one();
+        Ok(())
     }
 
     /// That connection has gone; the entry goes with the last one.
-    pub fn unsubscribe(&self, address: &str) {
+    pub fn unsubscribe(&self, address: &str, ip: IpAddr) {
+        {
+            let mut per_ip = self.per_ip.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(held) = per_ip.get_mut(&ip) {
+                if let Some(n) = held.get_mut(address) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        held.remove(address);
+                    }
+                }
+                if held.is_empty() {
+                    per_ip.remove(&ip);
+                }
+            }
+        }
         let mut m = self.entries();
         if let Some(e) = m.get_mut(address) {
             e.subscribers = e.subscribers.saturating_sub(1);
@@ -328,6 +393,47 @@ impl Pairs {
 
     pub fn concurrency(&self) -> usize {
         self.concurrency
+    }
+
+    /// Whether the node serves `getcoinbasetemplatefor` (as far as yolo knows).
+    pub fn available(&self) -> bool {
+        self.available.load(Ordering::SeqCst)
+    }
+
+    /// Records what a probe (or the startup check) found. A change wakes every paired miner,
+    /// which leaves when the call is gone.
+    pub fn set_available(&self, yes: bool) {
+        *self.last_probe.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        if self.available.swap(yes, Ordering::SeqCst) != yes {
+            if yes {
+                info!("the node serves getcoinbasetemplatefor: Sapling and post-quantum usernames are accepted again");
+            } else {
+                warn!(
+                    "the node does not serve getcoinbasetemplatefor (Method not found): Sapling and post-quantum usernames are refused until it does (asked again every {} s)",
+                    self.probe_every.as_secs()
+                );
+            }
+            self.version_tx.send_modify(|v| *v += 1);
+        }
+    }
+
+    /// True (and the probe clock restarted) when the call is missing and the last probe is
+    /// `probe_every` old.
+    fn probe_due(&self) -> bool {
+        if self.available() {
+            return false;
+        }
+        let mut last = self.last_probe.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|at| at.elapsed() < self.probe_every) {
+            return false;
+        }
+        *last = Some(Instant::now());
+        true
+    }
+
+    /// How many distinct paired addresses `ip` holds connections for.
+    pub fn paired_per_ip(&self, ip: IpAddr) -> usize {
+        self.per_ip.lock().unwrap_or_else(|e| e.into_inner()).get(&ip).map_or(0, HashMap::len)
     }
 
     /// `/status`: addresses without a pair for the tip `previousblockhash`, the requests in
@@ -373,6 +479,25 @@ fn need(e: &Entry, r: &TemplateRef, now: Instant) -> Option<u8> {
     }
 }
 
+/// The addresses that need a new pair for `r`, in the order they are served: new blocks first,
+/// then new quotes, then changed transaction sets; within each, the address whose current pair
+/// is the oldest (one without a pair before any with one, the longest subscribed first). The
+/// address string never decides, so under load the same addresses do not always lose.
+fn order(m: &HashMap<String, Entry>, r: &TemplateRef, now: Instant) -> Vec<String> {
+    let mut wanted: Vec<(u8, (bool, Instant), &String)> = m
+        .iter()
+        .filter_map(|(a, e)| {
+            let age = match &e.current {
+                None => (false, e.subscribed_at),
+                Some(p) => (true, p.built_at),
+            };
+            need(e, r, now).map(|p| (p, age, a))
+        })
+        .collect();
+    wanted.sort();
+    wanted.into_iter().map(|(_, _, a)| a.clone()).collect()
+}
+
 /// The refresher: on every wake-up (and at least once a second) starts the requests the current
 /// template calls for, new blocks first, within the concurrency cap.
 pub async fn run(state: State) {
@@ -381,13 +506,36 @@ pub async fn run(state: State) {
             _ = state.pairs.wake.notified() => {}
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
+        probe(&state);
         refresh(&state);
     }
+}
+
+/// While the node is known not to serve `getcoinbasetemplatefor`, asks it again every
+/// `probe_every`.
+fn probe(state: &State) {
+    if !state.pairs.probe_due() {
+        return;
+    }
+    let Some(source) = state.coinbase.clone() else { return };
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || match source.has_call() {
+        Ok(found) => {
+            if found {
+                st.pairs.set_available(true);
+                st.pairs.wake.notify_one();
+            }
+        }
+        Err(e) => debug!("getcoinbasetemplatefor probe: {}", e),
+    });
 }
 
 /// One scan of the book against the current template.
 pub fn refresh(state: &State) {
     let Some(source) = state.coinbase.clone() else { return };
+    if !state.pairs.available() {
+        return;
+    }
     let template = {
         let g = state.lock();
         if g.template_stale() {
@@ -403,9 +551,7 @@ pub fn refresh(state: &State) {
     let mut started = Vec::new();
     {
         let mut m = state.pairs.entries();
-        let mut wanted: Vec<(u8, String)> = m.iter().filter_map(|(a, e)| need(e, &r, now).map(|p| (p, a.clone()))).collect();
-        wanted.sort();
-        for (_, address) in wanted {
+        for address in order(&m, &r, now) {
             let Ok(permit) = state.pairs.permits.clone().try_acquire_owned() else { break };
             let e = m.get_mut(&address).expect("listed above");
             e.in_flight = true;
@@ -449,6 +595,15 @@ fn finish(state: &State, address: &str, kind: &PayoutKind, t: &Arc<BlockTemplate
             s.last_round_trip = rtt;
         }
     }
+    if matches!(&answer, Err(e) if e.code() == Some(RPC_METHOD_NOT_FOUND)) {
+        // The node has no such call (the startup probe could not tell, or it was downgraded):
+        // say so once, refuse paired usernames from now on, and ask again later.
+        if let Some(e) = state.pairs.entries().get_mut(address) {
+            e.in_flight = false;
+        }
+        state.pairs.set_available(false);
+        return;
+    }
     let checked = match &answer {
         Ok(a) => check_answer(t, kind, &r.txids, a).map_err(|why| format!("refused answer of getcoinbasetemplatefor: {}", why)),
         Err(e) => Err(e.to_string()),
@@ -467,7 +622,7 @@ fn finish(state: &State, address: &str, kind: &PayoutKind, t: &Arc<BlockTemplate
                 return;
             }
             let amount = answer.as_ref().map(|a| a.amount).unwrap_or(0);
-            e.current = Some(Arc::new(Pair { template: t.clone(), reference: r.clone(), coinbase: c.coinbase, flags: c.flags, amount }));
+            e.current = Some(Arc::new(Pair { template: t.clone(), reference: r.clone(), coinbase: c.coinbase, flags: c.flags, amount, built_at: Instant::now() }));
             e.version += 1;
             drop(m);
             info!(
@@ -625,6 +780,16 @@ mod tests {
         refused(&CoinbaseFor { subsidy: 624_999_999, ..good.clone() }, &s, &ids, "subsidy");
         refused(&CoinbaseFor { fund: 1, fundrule: "optional".into(), ..good.clone() }, &s, &ids, "amount");
         refused(&CoinbaseFor { fundrule: "optional".into(), ..good.clone() }, &s, &ids, "fundrule");
+        // the coinbase's sigops and the template's together must fit the block's limit (the
+        // template's two transactions carry 2 each)
+        check_answer(&t, &s, &ids, &CoinbaseFor { sigops: 20_000 - 4, ..good.clone() }).unwrap();
+        refused(&CoinbaseFor { sigops: 20_000 - 3, ..good.clone() }, &s, &ids, "coinbase-does-not-fit: sigops 20001");
+        let mut tight = t.clone();
+        tight.sigoplimit = Some(4);
+        assert!(check_answer(&tight, &s, &ids, &CoinbaseFor { sigops: 1, ..good.clone() }).unwrap_err().contains("sigops 5"));
+        let mut nosigops = t.clone();
+        Arc::make_mut(&mut nosigops.transactions[1]).sigops = None;
+        assert!(check_answer(&nosigops, &s, &ids, &good).unwrap_err().contains("no sigop count"));
         // the coinbase must claim what the template's own coinbase claims
         let mut low = t.clone();
         let mut cb = Coinbase::parse(&hex::decode(&low.coinbasetxn.data).unwrap()).unwrap();
@@ -634,7 +799,7 @@ mod tests {
         assert!(e.contains("claims"), "{}", e);
         // the template must state every fee
         let mut nofee = t.clone();
-        nofee.transactions[0].fee = None;
+        Arc::make_mut(&mut nofee.transactions[0]).fee = None;
         assert!(check_answer(&nofee, &s, &ids, &good).unwrap_err().contains("no fee"));
         // the scriptSig must start with this height's push
         let mut other = t.clone();
@@ -700,17 +865,102 @@ mod tests {
         assert!(e.contains("fund 0"), "{}", e);
     }
 
+    /// Under load the oldest pair is renewed first, an address without a pair before all of them;
+    /// the address string never decides (the reviewer's starvation case: `wanted.sort()` by
+    /// address always served the same addresses first).
+    #[test]
+    fn order_serves_the_oldest_pair_first() {
+        let t = template(include_str!("../tests/vectors/regtest-template-111-nofund.json"));
+        let r = TemplateRef::of(&t);
+        let old = TemplateRef { previousblockhash: "00".repeat(32), ..r.clone() };
+        let quote = TemplateRef { flags: "24".into(), ..r.clone() };
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let entry = |subscribed: Instant, built: Option<(TemplateRef, Instant)>| Entry {
+            kind: PayoutKind::Sapling,
+            subscribers: 1,
+            subscribed_at: subscribed,
+            current: built.map(|(reference, b)| Arc::new(Pair { template: Arc::new(t.clone()), reference, coinbase: vec![], flags: vec![], amount: 0, built_at: b })),
+            version: 0,
+            in_flight: false,
+            last_request: None,
+            failed: None,
+        };
+        let mut m = HashMap::new();
+        // a new block: every pair is void; "aaa" sorts first by name but its pair is the newest
+        m.insert("aaa".to_string(), entry(at(0), Some((old.clone(), at(30)))));
+        m.insert("mmm".to_string(), entry(at(0), Some((old.clone(), at(10)))));
+        m.insert("zzz".to_string(), entry(at(0), Some((old.clone(), at(20)))));
+        // two without a pair, the earlier subscriber first, both before any with a pair
+        m.insert("yyy".to_string(), entry(at(5), None));
+        m.insert("xxx".to_string(), entry(at(8), None));
+        // a new quote ranks after every new-block need, however old its pair
+        m.insert("bbb".to_string(), entry(at(0), Some((quote, at(1)))));
+        let now = at(40);
+        assert_eq!(order(&m, &r, now), ["yyy", "xxx", "mmm", "zzz", "aaa", "bbb"]);
+        // once served, an address goes to the back of its class
+        m.get_mut("mmm").unwrap().current = Some(Arc::new(Pair { template: Arc::new(t.clone()), reference: old, coinbase: vec![], flags: vec![], amount: 0, built_at: at(41) }));
+        assert_eq!(order(&m, &r, now), ["yyy", "xxx", "zzz", "aaa", "mmm", "bbb"]);
+    }
+
+    /// `--max-paired-per-ip`: distinct paired addresses per source IP; more connections for an
+    /// address the IP already holds, and other IPs, are not affected; the count falls with the
+    /// last connection.
+    #[test]
+    fn paired_addresses_are_capped_per_ip() {
+        let pairs = Pairs::new(2, 2, Duration::from_secs(60));
+        let (ip, other): (IpAddr, IpAddr) = ("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap());
+        pairs.subscribe("z1", PayoutKind::Sapling, ip).unwrap();
+        pairs.subscribe("z2", PayoutKind::Sapling, ip).unwrap();
+        pairs.subscribe("z2", PayoutKind::Sapling, ip).unwrap();
+        let e = pairs.subscribe("z3", PayoutKind::Sapling, ip).unwrap_err();
+        assert_eq!(e, "Too many Sapling and post-quantum payout addresses from this IP (at most 2)");
+        assert_eq!(pairs.paired_per_ip(ip), 2);
+        assert!(!pairs.entries().contains_key("z3"), "the refused one left no entry");
+        pairs.subscribe("z3", PayoutKind::Sapling, other).unwrap();
+        // z2 has two connections: one leaving keeps the address held
+        pairs.unsubscribe("z2", ip);
+        assert!(pairs.subscribe("z3", PayoutKind::Sapling, ip).is_err());
+        pairs.unsubscribe("z2", ip);
+        assert_eq!(pairs.paired_per_ip(ip), 1);
+        pairs.subscribe("z3", PayoutKind::Sapling, ip).unwrap();
+        assert_eq!(pairs.entries()["z3"].subscribers, 2, "two IPs share the address's pair");
+        pairs.unsubscribe("z1", ip);
+        pairs.unsubscribe("z3", ip);
+        pairs.unsubscribe("z3", other);
+        assert_eq!(pairs.paired_per_ip(ip), 0);
+        assert!(pairs.entries().is_empty());
+    }
+
+    /// "Method not found" switches paired jobs off; a probe is due only while it is off, and
+    /// only once per period.
+    #[test]
+    fn availability_and_probes() {
+        let pairs = Pairs::new(2, 8, Duration::from_millis(50));
+        let rx = pairs.subscribe_versions();
+        assert!(pairs.available() && !pairs.probe_due());
+        pairs.set_available(false);
+        assert!(!pairs.available());
+        assert!(rx.has_changed().unwrap(), "paired miners are woken to leave");
+        assert!(!pairs.probe_due(), "not at once after the answer");
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(pairs.probe_due());
+        assert!(!pairs.probe_due(), "one probe per period");
+        pairs.set_available(true);
+        assert!(pairs.available() && !pairs.probe_due());
+    }
+
     #[test]
     fn need_orders_and_rate_limits() {
         let t = template(include_str!("../tests/vectors/regtest-template-111-nofund.json"));
         let r = TemplateRef::of(&t);
         let now = Instant::now();
-        let mut e = Entry { kind: PayoutKind::Sapling, subscribers: 1, current: None, version: 0, in_flight: false, last_request: None, failed: None };
+        let mut e = Entry { kind: PayoutKind::Sapling, subscribers: 1, subscribed_at: now, current: None, version: 0, in_flight: false, last_request: None, failed: None };
         assert_eq!(need(&e, &r, now), Some(0), "no pair yet");
         e.in_flight = true;
         assert_eq!(need(&e, &r, now), None, "one request per address at a time");
         e.in_flight = false;
-        let pair = |reference: TemplateRef| Some(Arc::new(Pair { template: Arc::new(t.clone()), reference, coinbase: vec![], flags: vec![], amount: 0 }));
+        let pair = |reference: TemplateRef| Some(Arc::new(Pair { template: Arc::new(t.clone()), reference, coinbase: vec![], flags: vec![], amount: 0, built_at: now }));
         e.current = pair(r.clone());
         assert_eq!(need(&e, &r, now), None, "the pair is current");
         e.current = pair(TemplateRef { previousblockhash: "00".repeat(32), ..r.clone() });

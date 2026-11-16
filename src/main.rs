@@ -74,6 +74,11 @@ struct Cli {
     /// least this plus 2, so submitblock and the template poll never wait behind them.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=64))]
     coinbase_concurrency: u32,
+    /// Distinct Sapling and post-quantum payout addresses one source IP may mine to at once (each
+    /// costs the node a coinbase on every block); over it, further ones from that IP are refused
+    /// at mining.authorize, transparent ones still work.
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=4096))]
+    max_paired_per_ip: u32,
     /// Stratum sockets open at once, authorized or not; further connections are refused.
     #[arg(long, default_value_t = 1024)]
     max_connections: usize,
@@ -151,6 +156,7 @@ fn main() {
             max_per_ip: cli.max_per_ip,
             share_ratio: cli.share_ratio,
             coinbase_concurrency: cli.coinbase_concurrency as usize,
+            max_paired_per_ip: cli.max_paired_per_ip as usize,
             ..yolo::Limits::default()
         },
         test_coinbase_source: None,

@@ -51,6 +51,14 @@ pub struct Limits {
     pub share_ratio: u32,
     /// `--coinbase-concurrency`: `getcoinbasetemplatefor` requests in flight at once (note §6.3).
     pub coinbase_concurrency: usize,
+    /// `--max-paired-per-ip`: distinct Sapling and post-quantum payout addresses one source IP
+    /// may mine to at once (each costs the node a coinbase per block).
+    pub max_paired_per_ip: usize,
+    /// While the node answers `getcoinbasetemplatefor` with "Method not found", it is asked
+    /// again this often.
+    pub coinbase_probe_every: Duration,
+    /// A miner that has been sent nothing for this long is sent its job again (keepalive).
+    pub keepalive: Duration,
 }
 
 impl Default for Limits {
@@ -67,6 +75,9 @@ impl Default for Limits {
             check_pow: true,
             share_ratio: 1,
             coinbase_concurrency: 2,
+            max_paired_per_ip: 8,
+            coinbase_probe_every: Duration::from_secs(60),
+            keepalive: crate::stratum::MINER_TIMEOUT,
         }
     }
 }
@@ -185,7 +196,7 @@ impl Shared {
             rpc,
             policy,
             coinbase,
-            pairs: Pairs::new(limits.coinbase_concurrency),
+            pairs: Pairs::new(limits.coinbase_concurrency, limits.max_paired_per_ip, limits.coinbase_probe_every),
             equihash,
             password,
             started: Instant::now(),
@@ -328,7 +339,7 @@ impl Shared {
             "miners": g.miners,
             "minersByKind": by_kind,
             "minerList": list,
-            "coinbaseCall": self.coinbase.is_some(),
+            "coinbaseCall": self.coinbase.is_some() && self.pairs.available(),
             "pairs": pairs,
             "connections": g.connections,
             "tag": g.last_tag_kind,

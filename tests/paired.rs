@@ -9,8 +9,9 @@
 //! node built for the same tip and transactions (`regtest-template-111-sapling.json`), the
 //! post-quantum one the pool node's coinbase with the miner's script at `vout[0]` (note §8.4).
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -121,6 +122,8 @@ enum Mode {
     StaleOnce,
     /// A fee total one zatoshi short (a §8.3 check refuses it).
     WrongFees,
+    /// "Method not found", as a node without the call answers.
+    NoMethod,
 }
 
 struct FakeSource {
@@ -130,11 +133,21 @@ struct FakeSource {
     delay: Duration,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
+    /// What a probe (`has_call`) finds.
+    call: AtomicBool,
 }
 
 impl FakeSource {
     fn new(template: Arc<Mutex<Value>>, delay: Duration) -> Arc<FakeSource> {
-        Arc::new(FakeSource { template, mode: Mutex::new(Mode::Good), calls: Mutex::new(Vec::new()), delay, in_flight: AtomicUsize::new(0), max_in_flight: AtomicUsize::new(0) })
+        Arc::new(FakeSource {
+            template,
+            mode: Mutex::new(Mode::Good),
+            calls: Mutex::new(Vec::new()),
+            delay,
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+            call: AtomicBool::new(true),
+        })
     }
     fn calls(&self) -> Vec<(String, String, Vec<String>)> {
         self.calls.lock().unwrap().clone()
@@ -192,10 +205,15 @@ impl CoinbaseSource for FakeSource {
                 Err(RpcError::Node { code: -1, message: "template-stale: previousblockhash is not the tip".into() })
             }
             Mode::WrongFees => answer(&t, address, previousblockhash, txids).map(|a| CoinbaseFor { fees: a.fees - 1, ..a }),
+            Mode::NoMethod => Err(RpcError::Node { code: -32601, message: "Method not found".into() }),
             Mode::Good => answer(&t, address, previousblockhash, txids),
         };
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         r
+    }
+
+    fn has_call(&self) -> Result<bool, RpcError> {
+        Ok(self.call.load(Ordering::SeqCst))
     }
 }
 
@@ -205,9 +223,14 @@ struct Pool {
     template: Arc<Mutex<Value>>,
     submitted: Arc<Mutex<Vec<String>>>,
     source: Option<Arc<FakeSource>>,
+    state: yolo::state::State,
 }
 
 async fn start(text: Option<&str>, source: bool, delay: Duration, concurrency: usize) -> Pool {
+    start_limits(text, source, delay, yolo::Limits { coinbase_concurrency: concurrency, ..yolo::Limits::default() }).await
+}
+
+async fn start_limits(text: Option<&str>, source: bool, delay: Duration, limits: yolo::Limits) -> Pool {
     let template = Arc::new(Mutex::new(serde_json::from_str::<Value>(POOL_TEMPLATE).unwrap()));
     let submitted = Arc::new(Mutex::new(Vec::new()));
     let node = fake_node(template.clone(), submitted.clone()).await;
@@ -221,7 +244,7 @@ async fn start(text: Option<&str>, source: bool, delay: Duration, concurrency: u
         password: None,
         equihash: EquihashArg::Fixed(Equihash::REGTEST),
         // the submits below carry made-up solutions: the pool's own PoW check is tested elsewhere
-        limits: yolo::Limits { check_pow: false, coinbase_concurrency: concurrency, ..yolo::Limits::default() },
+        limits: yolo::Limits { check_pow: false, ..limits },
         test_coinbase_source: fake.clone().map(|f| f as Arc<dyn CoinbaseSource>),
     };
     let rpc = RpcClient::new(&format!("http://{}", node), &RpcAuth { user: "u".into(), password: "p".into() });
@@ -230,7 +253,7 @@ async fn start(text: Option<&str>, source: bool, delay: Duration, concurrency: u
     tokio::spawn(bound.serve());
     for _ in 0..200 {
         if state.lock().template.is_some() {
-            return Pool { addr, status, template, submitted, source: fake };
+            return Pool { addr, status, template, submitted, source: fake, state };
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -481,12 +504,148 @@ async fn refused_usernames() {
     assert_eq!(m.authorize(&format!("{}.rig_1", T_ADDR)).await["result"], json!(true));
     // no test source: the node has no getcoinbasetemplatefor, so only transparent usernames
     let plain = start(None, false, Duration::ZERO, 2).await;
-    for user in [Z_ADDR, PQ_ADDR] {
+    for (user, kind) in [(Z_ADDR, "sapling"), (PQ_ADDR, "pq")] {
         let mut m = Miner::connect(plain.addr).await;
-        assert_eq!(m.authorize(user).await["error"], json!("Invalid address"), "{}", user);
+        let want = format!("Invalid address: this pool cannot pay {} addresses now (its node does not serve getcoinbasetemplatefor)", kind);
+        assert_eq!(m.authorize(user).await["error"], json!(want), "{}", user);
     }
     let mut m = Miner::connect(plain.addr).await;
     assert_eq!(m.authorize(T_ADDR).await["result"], json!(true));
     assert!(m.notify(5000).await.is_some(), "the swap path works as before");
     assert_eq!(status(plain.status).await["coinbaseCall"], json!(false));
+}
+
+/// Many paired addresses over many polls of an unchanged transaction set pin one copy of each
+/// transaction, not one per pair (review finding 1: a full block's hex is megabytes, and every
+/// pair keeps the template it was built for).
+#[tokio::test]
+async fn pairs_share_one_copy_of_an_unchanged_transaction_set() {
+    let limits = yolo::Limits { coinbase_concurrency: 4, max_paired_per_ip: 1000, ..yolo::Limits::default() };
+    let pool = start_limits(None, true, Duration::from_millis(5), limits).await;
+    let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let addresses: Vec<String> = (0..200).map(|i| format!("rqf{:050}", i)).collect();
+    for a in &addresses {
+        pool.state.pairs.subscribe(a, yolo::pairs::PayoutKind::Pq(pq_spk(a)), ip).unwrap();
+    }
+    // the poller's own polls go on; besides them, re-apply the template (a new `curtime` each
+    // time, the same transactions) while the pairs are being made
+    let base: Value = serde_json::from_str(POOL_TEMPLATE).unwrap();
+    let mut polls = 0u64;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while addresses.iter().any(|a| pool.state.pairs.current(a).is_none()) {
+        assert!(tokio::time::Instant::now() < deadline, "the pairs were not all made");
+        let mut t = base.clone();
+        t["curtime"] = json!(t["curtime"].as_i64().unwrap() + polls as i64 % 3);
+        yolo::poller::apply_template(&pool.state, serde_json::from_value(t).unwrap());
+        polls += 1;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert!(polls >= 50, "many polls while the pairs were made: {}", polls);
+    let pairs: Vec<_> = addresses.iter().map(|a| pool.state.pairs.current(a).unwrap().1).collect();
+    let templates: HashSet<*const yolo::template::BlockTemplate> = pairs.iter().map(|p| Arc::as_ptr(&p.template)).collect();
+    assert!(templates.len() > 10, "the pairs hold templates of many polls ({})", templates.len());
+    for k in 0..2 {
+        let copies: HashSet<*const yolo::template::TemplateTx> = pairs.iter().map(|p| Arc::as_ptr(&p.template.transactions[k])).collect();
+        assert_eq!(copies.len(), 1, "transaction {}: one live copy for {} pairs over {} polls", k, pairs.len(), polls);
+    }
+    let current = pool.state.lock().template.clone().unwrap();
+    assert!(Arc::ptr_eq(&current.transactions[0], &pairs[0].template.transactions[0]), "the pool's own template shares it too");
+}
+
+/// `--max-paired-per-ip`: over the cap, a further Sapling or post-quantum address from the same
+/// IP is refused with a clear message; transparent usernames still work.
+#[tokio::test]
+async fn paired_addresses_per_ip_are_capped() {
+    let limits = yolo::Limits { max_paired_per_ip: 1, ..yolo::Limits::default() };
+    let pool = start_limits(None, true, Duration::ZERO, limits).await;
+    let mut zm = Miner::connect(pool.addr).await;
+    assert_eq!(zm.authorize(Z_ADDR).await["result"], json!(true));
+    let mut again = Miner::connect(pool.addr).await;
+    assert_eq!(again.authorize(&format!("{}.rig2", Z_ADDR)).await["result"], json!(true), "the same address again is not another one");
+    let mut pm = Miner::connect(pool.addr).await;
+    assert_eq!(pm.authorize(PQ_ADDR).await["error"], json!("Too many Sapling and post-quantum payout addresses from this IP (at most 1)"));
+    let mut tm = Miner::connect(pool.addr).await;
+    assert_eq!(tm.authorize(T_ADDR).await["result"], json!(true));
+    assert!(tm.notify(5000).await.is_some(), "the swap path is not capped");
+    assert!(zm.notify(5000).await.is_some());
+    // the address is released with its last connection
+    drop(zm);
+    drop(again);
+    let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    for _ in 0..100 {
+        if pool.state.pairs.paired_per_ip(ip) == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut pm = Miner::connect(pool.addr).await;
+    assert_eq!(pm.authorize(PQ_ADDR).await["result"], json!(true));
+}
+
+/// A "Method not found" answer to a request switches paired jobs off: the paired miner is
+/// disconnected, paired usernames are refused with the clear message, transparent ones still
+/// work; a later probe that finds the call switches them on again (review finding 5).
+#[tokio::test]
+async fn method_not_found_switches_paired_jobs_off_until_a_probe_finds_the_call() {
+    let limits = yolo::Limits { coinbase_probe_every: Duration::from_millis(300), ..yolo::Limits::default() };
+    let pool = start_limits(None, true, Duration::ZERO, limits).await;
+    let source = pool.source.clone().unwrap();
+    *source.mode.lock().unwrap() = Mode::NoMethod;
+    source.call.store(false, Ordering::SeqCst);
+    let mut zm = Miner::connect(pool.addr).await;
+    assert_eq!(zm.authorize(Z_ADDR).await["result"], json!(true), "the startup check assumed the call");
+    // the first request is answered "Method not found": the miner is let go, not left without work
+    let closed = async {
+        loop {
+            match zm.rd.next_line().await {
+                Ok(Some(l)) => assert!(!l.contains("mining.notify"), "no job: {}", l),
+                _ => return,
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), closed).await.expect("the paired miner is disconnected");
+    assert_eq!(status(pool.status).await["coinbaseCall"], json!(false));
+    let mut m = Miner::connect(pool.addr).await;
+    assert_eq!(m.authorize(Z_ADDR).await["error"], json!("Invalid address: this pool cannot pay sapling addresses now (its node does not serve getcoinbasetemplatefor)"));
+    let mut tm = Miner::connect(pool.addr).await;
+    assert_eq!(tm.authorize(T_ADDR).await["result"], json!(true));
+    assert!(tm.notify(5000).await.is_some(), "the swap path is unaffected");
+    // the node is upgraded: the next probe finds the call
+    *source.mode.lock().unwrap() = Mode::Good;
+    source.call.store(true, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while status(pool.status).await["coinbaseCall"] != json!(true) {
+        assert!(tokio::time::Instant::now() < deadline, "the probe did not find the call");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut zm = Miner::connect(pool.addr).await;
+    assert_eq!(zm.authorize(Z_ADDR).await["result"], json!(true));
+    assert!(zm.notify(5000).await.is_some(), "paired jobs again");
+}
+
+/// A keepalive never re-sends a paired job whose parent is no longer the tip (review finding 6);
+/// it does re-send a live one.
+#[tokio::test]
+async fn keepalive_does_not_renotify_a_void_paired_job() {
+    let limits = yolo::Limits { keepalive: Duration::from_millis(400), idle_keepalives: 1000, ..yolo::Limits::default() };
+    let pool = start_limits(None, true, Duration::ZERO, limits).await;
+    let source = pool.source.clone().unwrap();
+    let mut pm = Miner::connect(pool.addr).await;
+    pm.authorize(PQ_ADDR).await;
+    let first = pm.notify(5000).await.unwrap();
+    let again = pm.notify(2000).await.expect("a keepalive re-sends the live job");
+    assert_eq!(again[0], first[0]);
+    assert_eq!(again[7], json!(false), "a keepalive is not a clean job");
+    // a new block, and the new pair is refused for a while: the old job is void
+    *source.mode.lock().unwrap() = Mode::WrongFees;
+    let new_prev = format!("{:064x}", 9);
+    pool.template.lock().unwrap()["previousblockhash"] = json!(new_prev);
+    let quiet = tokio::time::Instant::now() + Duration::from_millis(2500);
+    while let Some(j) = pm.notify(quiet.saturating_duration_since(tokio::time::Instant::now()).as_millis() as u64).await {
+        // a re-send that raced the poller's 1-second fetch of the new tip may come once
+        assert!(tokio::time::Instant::now() < quiet - Duration::from_millis(1200), "a void job was re-sent: {}", j);
+    }
+    *source.mode.lock().unwrap() = Mode::Good;
+    let next = pm.notify(10_000).await.expect("the new pair");
+    assert_eq!(next[2], json!(yolo::codec::reverse_hex(&new_prev)));
 }

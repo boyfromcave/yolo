@@ -273,6 +273,12 @@ pub struct CoinbaseFor {
 /// Where paired coinbases come from: the node (`RpcClient`) in production, a stub in tests.
 pub trait CoinbaseSource: Send + Sync {
     fn coinbase_for(&self, address: &str, previousblockhash: &str, txids: &[String]) -> Result<CoinbaseFor, RpcError>;
+
+    /// Whether the call exists, asked again while a "Method not found" answer has switched paired
+    /// jobs off. A source that always serves it (a test fixture) need not say.
+    fn has_call(&self) -> Result<bool, RpcError> {
+        Ok(true)
+    }
 }
 
 impl std::fmt::Debug for dyn CoinbaseSource {
@@ -288,6 +294,10 @@ impl CoinbaseSource for RpcClient {
     fn coinbase_for(&self, address: &str, previousblockhash: &str, txids: &[String]) -> Result<CoinbaseFor, RpcError> {
         let v = self.call("getcoinbasetemplatefor", json!([address, {"previousblockhash": previousblockhash, "txids": txids}]))?;
         serde_json::from_value(v).map_err(|e| RpcError::Protocol(format!("getcoinbasetemplatefor: {}", e)))
+    }
+
+    fn has_call(&self) -> Result<bool, RpcError> {
+        self.has_coinbase_call()
     }
 }
 

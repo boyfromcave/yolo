@@ -235,6 +235,9 @@ struct Client {
     pair_sent: u64,
     /// The last target sent to a paired miner (its jobs carry their own template's target).
     sent_target: Option<String>,
+    /// The parent (`previousblockhash`, lower case) of the pair this paired miner's job was built
+    /// from: a keepalive never re-sends a job whose parent is no longer the tip.
+    pair_parent: Option<String>,
     work_number: u64,
     jobs: VecDeque<Job>,
     last_write: Instant,
@@ -307,6 +310,7 @@ impl Client {
             payout: None,
             pair_sent: 0,
             sent_target: None,
+            pair_parent: None,
             work_number: 0,
             jobs: VecDeque::new(),
             last_write: now,
@@ -327,7 +331,7 @@ impl Client {
     /// `idle_keepalives` keepalive periods (audit H-2).
     fn silence_deadline(&self, state: &State) -> Instant {
         if self.auth {
-            self.last_read + MINER_TIMEOUT * state.limits.idle_keepalives
+            self.last_read + state.limits.keepalive * state.limits.idle_keepalives
         } else {
             self.connected_at + state.limits.auth_timeout
         }
@@ -340,7 +344,7 @@ impl Client {
         let mut line_buf = Vec::with_capacity(1024);
         let mut out = String::new();
         loop {
-            let keepalive = tokio::time::sleep_until(self.last_write + MINER_TIMEOUT);
+            let keepalive = tokio::time::sleep_until(self.last_write + state.limits.keepalive);
             let silence = tokio::time::sleep_until(self.silence_deadline(&state));
             let paired = self.is_paired();
             let action = tokio::select! {
@@ -365,11 +369,25 @@ impl Client {
                     }
                 }
                 changed = self.pairs_rx.changed(), if paired => {
-                    if changed.is_err() { Action::Disconnect } else { Action::Continue }
+                    if changed.is_err() {
+                        Action::Disconnect
+                    } else if !state.pairs.available() {
+                        // The node has stopped serving getcoinbasetemplatefor: this miner would
+                        // get no work; it is told so when it authorizes again.
+                        warn!("miner {}: the node does not serve getcoinbasetemplatefor; disconnecting a {} miner", self.index, self.payout.as_ref().map_or("paired", PayoutKind::name));
+                        Action::Disconnect
+                    } else {
+                        Action::Continue
+                    }
                 }
                 _ = keepalive => {
-                    // Never re-notify a job the node has already built past.
-                    if self.mining && !state.lock().template_stale() {
+                    // Never re-notify a job the node has already built past, nor a paired job
+                    // whose parent is no longer the tip (it is void until its next pair).
+                    let live = {
+                        let g = state.lock();
+                        !g.template_stale() && (!paired || g.template.as_ref().is_some_and(|t| self.pair_parent.as_deref() == Some(t.previousblockhash.to_ascii_lowercase().as_str())))
+                    };
+                    if self.mining && live {
                         if let Some(Job { work: w, .. }) = self.jobs.back() {
                             out.push_str(&msg_notify(w, false));
                             debug!("miner {}: keepalive re-notify job {}", self.index, w.job_id);
@@ -403,7 +421,7 @@ impl Client {
             }
         }
         if self.is_paired() {
-            state.pairs.unsubscribe(&self.address);
+            state.pairs.unsubscribe(&self.address, self.peer.ip());
         }
         state.miner_gone(self.index);
         self.auth
@@ -477,6 +495,7 @@ impl Client {
         self.work_number += 1;
         let params = BuildParams { job_id: self.work_number.to_string(), miner_script_pubkey: None, now: job_time(&pair.template) };
         self.pair_sent = version;
+        self.pair_parent = Some(pair.reference.previousblockhash.clone());
         match build_paired_work(&pair.template, &pair.coinbase, &pair.flags, &state.policy, state.equihash, &params) {
             Ok(w) => {
                 let target = share_target(&pair.template.target, state.limits.share_ratio).unwrap_or_else(|_| pair.template.target.clone());
@@ -599,13 +618,18 @@ impl Client {
                         } else {
                             state.cache_address(&address, Some(kind.clone()));
                         }
-                        if kind.is_paired() && state.coinbase.is_none() {
-                            out.push_str(&msg_auth_failed(&id, "Invalid address"));
+                        if kind.is_paired() && (state.coinbase.is_none() || !state.pairs.available()) {
+                            let why = format!("Invalid address: this pool cannot pay {} addresses now (its node does not serve getcoinbasetemplatefor)", kind.name());
+                            out.push_str(&msg_auth_failed(&id, &why));
                             warn!("miner {}: {} is a {} address, and the node does not serve getcoinbasetemplatefor", self.index, shown(&address), kind.name());
                             return Action::Disconnect;
                         }
                         if kind.is_paired() {
-                            state.pairs.subscribe(&address, kind.clone());
+                            if let Err(why) = state.pairs.subscribe(&address, kind.clone(), self.peer.ip()) {
+                                out.push_str(&msg_auth_failed(&id, &why));
+                                warn!("miner {}: {} refused: {}", self.index, shown(&address), why);
+                                return Action::Disconnect;
+                            }
                         }
                         let info = MinerInfo { address: address.clone(), label: label.clone(), kind: kind.name() };
                         info!("miner {}: authorized, paying {} ({}{})", self.index, shown(&address), kind.name(), label.as_deref().map(|l| format!(", worker {}", l)).unwrap_or_default());

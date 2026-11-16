@@ -73,36 +73,37 @@ pub async fn resolve_payout(rpc: &RpcClient, address: &str) -> Result<Payout, St
     }
 }
 
-/// Where paired coinbases come from: none under `--payout` (every job is a swap job), the test
-/// source when one is given, else the node when it serves `getcoinbasetemplatefor`. Without it,
-/// Sapling and post-quantum usernames are refused at `mining.authorize`.
-async fn resolve_coinbase_source(rpc: &RpcClient, policy: &Policy, test: Option<std::sync::Arc<dyn CoinbaseSource>>) -> Option<std::sync::Arc<dyn CoinbaseSource>> {
+/// Where paired coinbases come from, and whether the call is there now: none under `--payout`
+/// (every job is a swap job), the test source when one is given, else the node. While the call is
+/// not there, Sapling and post-quantum usernames are refused at `mining.authorize` and the node is
+/// asked again every `--coinbase-probe` period; a "Method not found" answer to any request later
+/// switches paired jobs off the same way.
+async fn resolve_coinbase_source(rpc: &RpcClient, policy: &Policy, test: Option<std::sync::Arc<dyn CoinbaseSource>>) -> (Option<std::sync::Arc<dyn CoinbaseSource>>, bool) {
     if policy.payout.is_some() {
-        return None;
+        return (None, false);
     }
     if let Some(t) = test {
         tracing::warn!("paired coinbases come from a TEST source, not the node's getcoinbasetemplatefor");
-        return Some(t);
+        return (Some(t), true);
     }
     let r = rpc.clone();
+    let source: std::sync::Arc<dyn CoinbaseSource> = std::sync::Arc::new(rpc.clone());
     match tokio::task::spawn_blocking(move || r.has_coinbase_call()).await {
         Ok(Ok(true)) => {
             info!("the node serves getcoinbasetemplatefor: Sapling and post-quantum usernames are paid by paired jobs");
-            Some(std::sync::Arc::new(rpc.clone()))
+            (Some(source), true)
         }
-        Ok(Ok(false)) => {
-            tracing::warn!("the node has no getcoinbasetemplatefor: only transparent usernames can be paid; Sapling and post-quantum ones are refused");
-            None
-        }
+        // `Pairs::set_available` says so once
+        Ok(Ok(false)) => (Some(source), false),
         Ok(Err(e)) => {
-            // The node answered getblockchaininfo a moment ago; assume the call exists and let
-            // each request report its own error.
+            // The node answered getblockchaininfo a moment ago; assume the call exists. A
+            // "Method not found" answer to the first request switches paired jobs off.
             tracing::warn!("cannot tell whether the node serves getcoinbasetemplatefor ({}); assuming it does", e);
-            Some(std::sync::Arc::new(rpc.clone()))
+            (Some(source), true)
         }
         Err(e) => {
             tracing::error!("getcoinbasetemplatefor probe task: {}", e);
-            None
+            (Some(source), false)
         }
     }
 }
@@ -197,7 +198,7 @@ pub async fn bind(rpc: RpcClient, config: Config) -> Result<Bound, Box<dyn std::
         tracing::warn!("--no-flags: every block will be mined WITHOUT the Yellowback tag (test switch)");
     }
     let policy = Policy { payout, text: config.text.clone(), no_flags: config.no_flags };
-    let coinbase = resolve_coinbase_source(&rpc, &policy, config.test_coinbase_source.clone()).await;
+    let (coinbase, call_available) = resolve_coinbase_source(&rpc, &policy, config.test_coinbase_source.clone()).await;
     let listener = TcpListener::bind(config.bind).await.map_err(|e| format!("cannot listen on {}: {}", config.bind, e))?;
     let addr = listener.local_addr()?;
     let (status_listener, status_addr) = match config.status_bind {
@@ -209,6 +210,9 @@ pub async fn bind(rpc: RpcClient, config: Config) -> Result<Bound, Box<dyn std::
         None => (None, None),
     };
     let (state, generation_rx) = Shared::new(rpc, policy, coinbase, equihash, config.password.clone(), config.limits.clone());
+    if state.coinbase.is_some() {
+        state.pairs.set_available(call_available);
+    }
     Ok(Bound { addr, status_addr, listener, status_listener, state, generation_rx })
 }
 
