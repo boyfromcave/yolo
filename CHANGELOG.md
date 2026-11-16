@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased — paired jobs: Sapling and post-quantum miners paid at their own address
+
+- A stratum username may be a Sapling or a post-quantum address as well as a transparent one, and
+  may carry a worker label (`<address>.<label>`, 1 to 32 characters of `A-Z a-z 0-9 _ -`, shown in
+  the log and `/status` only). The kind is the node's answer: `validateaddress` (a `pqscheme` means
+  post-quantum), then `z_validateaddress` (`sapling`).
+- Transparent (P2PKH, P2SH) miners stay on the swap path, unchanged. Sapling and post-quantum
+  miners get **paired jobs**: for the template yolo holds, the node builds the miner's coinbase
+  (`getcoinbasetemplatefor`, `docs/plans/beta3/getcoinbasetemplatefor.md`), and the job is that
+  template's transactions, all of them, with that coinbase. No amount is requested or altered;
+  every answer is checked against the stock template (parent, height, transaction count, fee
+  total, the coinbase's claim equal to the node's own coinbase's, amount, the fund output identical
+  to the stock coinbase's, the payout to the miner) and dropped otherwise. Renewed at once on a new
+  block or quote, at most every 5 s on a changed transaction set; a miner keeps its valid pair
+  meanwhile; a `template-stale` answer fetches a new template. `--coinbase-concurrency` (default 2)
+  caps the requests in flight, on threads of their own. `--text` rewrites only a paired coinbase's
+  scriptSig. A node without `getcoinbasetemplatefor` serves transparent miners as before and
+  Sapling and post-quantum usernames are refused.
+- A paired job never drops transactions at the size limit (its coinbase claims all their fees);
+  the swap path refuses a node coinbase that pays a Sapling `-mineraddress`.
+- The coinbase codec carries a Sapling coinbase's shielded part as opaque bytes (shape checked).
+- A coinbase with no fund output (`-ydf=0`, the node default since beta3, past the fund's mandate)
+  is handled and tested (`tests/vectors/regtest-template-111-*.json`).
+- `/status`: `minersByKind`, `minerList` (kind, address, label), `coinbaseCall`, `pairs`.
+- Tests: `tests/paired.rs` (in-process), `tests/regtest_pairs.rs` (the acceptance test on regtest
+  with the Python 48,5 miner; `YOLO_REGTEST_COINBASE=node|stub`).
+
 ## Unreleased — header time after an idle chain, shares, stale submits
 
 - A submit for a job on a parent that is no longer the tip (a newer block came in, or the pool's

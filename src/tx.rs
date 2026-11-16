@@ -4,9 +4,15 @@
 
 //! A minimal Ycash v4 (Sapling) transaction codec, sufficient for a coinbase: header
 //! (`nVersion | fOverwintered`, `nVersionGroupId`), one input (null prevout, scriptSig,
-//! sequence), the outputs, then the tail (`nLockTime`, `nExpiryHeight`, `valueBalance`, and
-//! the three shielded counts, which must be zero — a coinbase with Sapling outputs carries a
-//! binding signature and is not something a pool can rewrite).
+//! sequence), the outputs, then the tail (`nLockTime`, `nExpiryHeight`, `valueBalance` and the
+//! shielded part).
+//!
+//! The shielded part is carried as opaque bytes. Its shape is checked (no Sapling spend and no
+//! JoinSplit, as a coinbase allows; each Sapling output 948 bytes; the binding signature when
+//! there is an output) so that nothing trails the transaction, but it is never parsed further
+//! nor rewritten: a Sapling coinbase from `getcoinbasetemplatefor` is signed over its outputs and
+//! `valueBalance` (ZIP 243), and a pool may change only its scriptSig
+//! (`docs/plans/beta3/getcoinbasetemplatefor.md` §5.5).
 //!
 //! The Perl rewrites `coinbasetxn.data` with a regex over the hex (`ref/yolo/stratumpool:509`);
 //! this parses the structure and rewrites the field.
@@ -33,7 +39,18 @@ pub struct Coinbase {
     pub lock_time: u32,
     pub expiry_height: u32,
     pub value_balance: i64,
+    /// Everything after `valueBalance`, verbatim: the three shielded counts, the Sapling outputs
+    /// and the binding signature. `[0, 0, 0]` for a transparent coinbase.
+    pub shielded: Vec<u8>,
+    /// The number of Sapling outputs in `shielded`.
+    pub sapling_outputs: u64,
 }
+
+/// A Sapling output description in a v4 transaction: cv, cmu, ephemeral key (32 each), the
+/// encrypted note (580), the outgoing ciphertext (80) and the Groth16 proof (192).
+pub const SAPLING_OUTPUT_SIZE: usize = 32 + 32 + 32 + 580 + 80 + 192;
+/// The binding signature that follows the shielded parts when there is a spend or an output.
+pub const BINDING_SIG_SIZE: usize = 64;
 
 /// `pos + len` for a node-supplied compact size, without overflow (audit H-17).
 fn span(pos: usize, len: u64) -> Result<usize, String> {
@@ -95,17 +112,35 @@ impl Coinbase {
         let expiry_height = u32_at(data, pos + 4)?;
         let value_balance = u64_at(data, pos + 8)? as i64;
         pos += 16;
-        for name in ["vShieldedSpend", "vShieldedOutput", "vJoinSplit"] {
-            let (count, n) = read_compact_size(data, pos)?;
-            if count != 0 {
-                return Err(format!("coinbase has {} {} entries; only transparent coinbases are supported", count, name));
+        let shielded_start = pos;
+        let (spends, n) = read_compact_size(data, pos)?;
+        if spends != 0 {
+            return Err(format!("coinbase has {} vShieldedSpend entries", spends));
+        }
+        pos += n;
+        let (sapling_outputs, n) = read_compact_size(data, pos)?;
+        pos += n;
+        let outputs_len = usize::try_from(sapling_outputs).ok().and_then(|c| c.checked_mul(SAPLING_OUTPUT_SIZE)).ok_or_else(|| format!("{} Sapling outputs out of range", sapling_outputs))?;
+        pos = span(pos, outputs_len as u64)?;
+        if pos > data.len() {
+            return Err("truncated Sapling outputs".into());
+        }
+        let (joinsplits, n) = read_compact_size(data, pos)?;
+        if joinsplits != 0 {
+            return Err(format!("coinbase has {} vJoinSplit entries", joinsplits));
+        }
+        pos += n;
+        if sapling_outputs > 0 {
+            pos += BINDING_SIG_SIZE;
+            if pos > data.len() {
+                return Err("truncated binding signature".into());
             }
-            pos += n;
         }
         if pos != data.len() {
             return Err(format!("{} trailing bytes after the transaction", data.len() - pos));
         }
-        Ok(Coinbase { header, version_group_id, script_sig, sequence, vout, lock_time, expiry_height, value_balance })
+        let shielded = data[shielded_start..].to_vec();
+        Ok(Coinbase { header, version_group_id, script_sig, sequence, vout, lock_time, expiry_height, value_balance, shielded, sapling_outputs })
     }
 
     pub fn serialize(&self) -> Vec<u8> {
@@ -127,8 +162,20 @@ impl Coinbase {
         out.extend_from_slice(&self.lock_time.to_le_bytes());
         out.extend_from_slice(&self.expiry_height.to_le_bytes());
         out.extend_from_slice(&(self.value_balance as u64).to_le_bytes());
-        out.extend_from_slice(&[0, 0, 0]);
+        out.extend_from_slice(&self.shielded);
         out
+    }
+
+    /// The sum of the transparent outputs, in zatoshi (None on overflow).
+    pub fn transparent_total(&self) -> Option<u64> {
+        self.vout.iter().try_fold(0u64, |a, o| a.checked_add(o.value))
+    }
+
+    /// What the coinbase claims: its transparent outputs plus what it moves into the Sapling pool
+    /// (`-valueBalance`), i.e. subsidy plus fees for a coinbase the node built.
+    pub fn claimed_total(&self) -> Option<u64> {
+        let t = i128::from(self.transparent_total()?) - i128::from(self.value_balance);
+        u64::try_from(t).ok()
     }
 }
 
@@ -206,6 +253,7 @@ mod tests {
         assert_eq!(cb.header, 0x8000_0004);
         assert_eq!(cb.version_group_id, SAPLING_VERSION_GROUP_ID);
         assert_eq!(cb.sequence, 0xffff_ffff);
+        // this node ran with the 5 % development-fund share (`-ydf=5`, the old default): two outputs
         assert_eq!(cb.vout.len(), 2, "miner output + YDF output");
         assert_eq!(cb.vout[0].value, 593_750_490);
         assert_eq!(cb.vout[1].value, 31_250_000);
@@ -222,6 +270,57 @@ mod tests {
         let cb4 = Coinbase::parse(&data4).unwrap();
         assert_eq!(cb4.script_sig, vec![0x54, 0x00]);
         assert_eq!(cb4.serialize(), data4);
+    }
+
+    fn vector_coinbase(json: &str) -> Vec<u8> {
+        let t: serde_json::Value = serde_json::from_str(json).unwrap();
+        hex::decode(t["coinbasetxn"]["data"].as_str().unwrap()).unwrap()
+    }
+
+    /// A node at the default `-ydf=0` past the fund's mandate: one output, the whole amount.
+    #[test]
+    fn parse_coinbase_without_a_fund_output() {
+        let data = vector_coinbase(include_str!("../tests/vectors/regtest-template-111-nofund.json"));
+        let cb = Coinbase::parse(&data).unwrap();
+        assert_eq!(cb.vout.len(), 1, "no fund output");
+        assert_eq!(cb.vout[0].value, 625_000_489, "subsidy plus the two fees");
+        assert_eq!(cb.sapling_outputs, 0);
+        assert_eq!(cb.shielded, vec![0, 0, 0]);
+        assert_eq!(cb.claimed_total(), Some(625_000_489));
+        assert_eq!(cb.serialize(), data);
+    }
+
+    /// A Sapling coinbase (the node's own `-mineraddress=<Sapling>`, the shape
+    /// `getcoinbasetemplatefor` returns): no transparent output, one Sapling output, the binding
+    /// signature; carried verbatim through a scriptSig rewrite.
+    #[test]
+    fn parse_sapling_coinbase_opaquely() {
+        let data = vector_coinbase(include_str!("../tests/vectors/regtest-template-111-sapling.json"));
+        let cb = Coinbase::parse(&data).unwrap();
+        assert!(cb.vout.is_empty());
+        assert_eq!(cb.sapling_outputs, 1);
+        assert_eq!(cb.value_balance, -625_000_489);
+        assert_eq!(cb.shielded.len(), 1 + 1 + SAPLING_OUTPUT_SIZE + 1 + BINDING_SIG_SIZE);
+        assert_eq!(cb.claimed_total(), Some(625_000_489));
+        assert_eq!(cb.serialize(), data);
+        let mut longer = cb.clone();
+        longer.script_sig.extend_from_slice(b"yolo");
+        let out = longer.serialize();
+        assert_eq!(out.len(), data.len() + 4);
+        let back = Coinbase::parse(&out).unwrap();
+        assert_eq!(back.shielded, cb.shielded);
+        assert_eq!(back.value_balance, cb.value_balance);
+        // with the optional fund share the fund is vout[0], not the miner
+        let fund = Coinbase::parse(&vector_coinbase(include_str!("../tests/vectors/regtest-template-111-sapling-fund.json"))).unwrap();
+        assert_eq!(fund.vout.len(), 1);
+        assert_eq!(fund.vout[0].value, 31_250_000);
+        assert_eq!(fund.sapling_outputs, 1);
+        assert_eq!(fund.claimed_total(), Some(625_000_000));
+        // truncated or padded shielded parts are refused
+        assert!(Coinbase::parse(&data[..data.len() - 1]).unwrap_err().contains("truncated"));
+        let mut extra = data.clone();
+        extra.push(0);
+        assert!(Coinbase::parse(&extra).unwrap_err().contains("trailing"));
     }
 
     #[test]

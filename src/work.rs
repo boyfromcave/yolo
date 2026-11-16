@@ -92,6 +92,12 @@ pub struct BuiltCoinbase {
 pub fn build_coinbase(t: &BlockTemplate, policy: &Policy, p: &BuildParams) -> Result<BuiltCoinbase, String> {
     let data = hex::decode(&t.coinbasetxn.data).map_err(|e| format!("coinbasetxn.data is not hex: {}", e))?;
     let mut cb = Coinbase::parse(&data).map_err(|e| format!("coinbasetxn.data: {}", e))?;
+    if cb.sapling_outputs > 0 {
+        // The node mines to a Sapling -mineraddress: its coinbase is signed over the outputs, and
+        // with the fund share vout[0] is the fund, not the miner. The swap path needs a node whose
+        // own coinbase pays a transparent address.
+        return Err("the node's coinbase pays a Sapling address (-mineraddress): the swap path needs a transparent -mineraddress".into());
+    }
     if cb.vout.is_empty() {
         return Err("coinbase has no outputs".into());
     }
@@ -107,10 +113,13 @@ pub fn build_coinbase(t: &BlockTemplate, policy: &Policy, p: &BuildParams) -> Re
         cb.script_sig = rebuilt.script_sig;
     }
     debug_assert!(cb.script_sig.len() <= MAX_COINBASE_SCRIPTSIG);
-    // The miner's reward is vout[0] (`CreateCoinbaseTransaction`, `ycash-dd/src/miner.cpp:304`);
-    // any further output is the founders/YDF share and stays as the node built it. The
-    // output is rewritten structurally in both payout cases: `--payout <the node's own
-    // address>` is what the Perl `stratumsolo` was.
+    // The miner's reward is vout[0] (`CreateCoinbaseTransaction`, `ycash-dd/src/miner.cpp:304`),
+    // which is the only output when the node adds no development-fund share (the default
+    // `-ydf=0` past the fund's mandate). A further output is that share (required by consensus
+    // below the mandate's end height, optional above it at the node's `-ydf`) and stays as the
+    // node built it: the swap never moves value between outputs. The output is rewritten
+    // structurally in both payout cases: `--payout <the node's own address>` is what the Perl
+    // `stratumsolo` was.
     let spk = match &policy.payout {
         Some(fixed) => fixed.script_pubkey.as_slice(),
         None => p.miner_script_pubkey.ok_or("no --payout: the miner's scriptPubKey is needed (authorize first)")?,
@@ -124,13 +133,31 @@ pub fn build_coinbase(t: &BlockTemplate, policy: &Policy, p: &BuildParams) -> Re
 /// fields byte-reversed as hex the way the Perl sends them.
 pub fn build_work(t: &BlockTemplate, policy: &Policy, equihash: Equihash, p: &BuildParams) -> Result<Work, String> {
     let BuiltCoinbase { data: coinbase, script_sig, text_truncated_to: truncated } = build_coinbase(t, policy, p)?;
+    assemble_work(t, &coinbase, script_sig, truncated, equihash, p, Selection::UpToSizeLimit)
+}
+
+/// Which of the template's transactions a job carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Selection {
+    /// The swap path: in order, while the block stays under the size limit (the stock coinbase
+    /// claims the fees of every transaction, so this only ever forgoes fees).
+    UpToSizeLimit,
+    /// A paired job: all of them, or no job. Its coinbase claims exactly their fees, so a dropped
+    /// transaction would leave it over the limit (`bad-cb-amount`; note D-3).
+    All,
+}
+
+fn assemble_work(t: &BlockTemplate, coinbase: &[u8], script_sig: Vec<u8>, truncated: Option<usize>, equihash: Equihash, p: &BuildParams, selection: Selection) -> Result<Work, String> {
     let limit = t.sizelimit.unwrap_or(DEFAULT_SIZE_LIMIT);
-    let mut txids: Vec<[u8; 32]> = vec![dsha256(&coinbase)];
-    let mut txs_hex = hex::encode(&coinbase);
+    let mut txids: Vec<[u8; 32]> = vec![dsha256(coinbase)];
+    let mut txs_hex = hex::encode(coinbase);
     let mut size = HEADER_SIZE + equihash.solution_wire_len() + 9 + coinbase.len();
     for tx in &t.transactions {
         let tx_size = tx.data.len() / 2;
         if size + tx_size >= limit {
+            if selection == Selection::All {
+                return Err(format!("coinbase-does-not-fit: the paired block would reach {} bytes, the limit is {}", size + tx_size, limit));
+            }
             break;
         }
         txids.push(hash_from_display(&tx.hash)?);
@@ -156,6 +183,29 @@ pub fn build_work(t: &BlockTemplate, policy: &Policy, equihash: Equihash, p: &Bu
         coinbase_script_sig: script_sig,
         text_truncated_to: truncated,
     })
+}
+
+/// A paired job (note §8.2 step 4): the header fields and every transaction of the template the
+/// coinbase was built for, and that coinbase. Its outputs, `valueBalance` and shielded part are
+/// never touched and the `vout[0]` swap is never run on it; `--text` rewrites the scriptSig after
+/// the height push as on the swap path, with the answer's `flags` in place of
+/// `coinbaseaux.flags` (§5.4, §5.5). `t` must be the template the coinbase was requested for.
+pub fn build_paired_work(t: &BlockTemplate, coinbase: &[u8], flags: &[u8], policy: &Policy, equihash: Equihash, p: &BuildParams) -> Result<Work, String> {
+    let mut cb = Coinbase::parse(coinbase).map_err(|e| format!("paired coinbase: {}", e))?;
+    let mut truncated = None;
+    if let Some(text) = &policy.text {
+        let hp_len = height_push_len(&cb.script_sig).ok_or("paired coinbase scriptSig does not start with a height push")?;
+        let height_push = cb.script_sig[..hp_len].to_vec();
+        let flags = if policy.no_flags { &[][..] } else { flags };
+        let rebuilt = rebuild_script_sig(&height_push, flags, text)?;
+        if rebuilt.text_used < text.len() {
+            truncated = Some(rebuilt.text_used);
+        }
+        cb.script_sig = rebuilt.script_sig;
+    }
+    let script_sig = cb.script_sig.clone();
+    let data = if policy.text.is_some() { cb.serialize() } else { coinbase.to_vec() };
+    assemble_work(t, &data, script_sig, truncated, equihash, p, Selection::All)
 }
 
 /// Checked `mining.submit` params: ntime, nonce2 and solution as hex.

@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify, Semaphore};
 
 use crate::equihash::Equihash;
-use crate::rpc::RpcClient;
+use crate::pairs::{Pairs, PayoutKind};
+use crate::rpc::{CoinbaseSource, RpcClient};
 use crate::template::{BlockTemplate, ChangeKey};
 use crate::work::Policy;
 
@@ -48,6 +49,8 @@ pub struct Limits {
     /// `--share-ratio`: the target sent to miners is this many times easier than the block's
     /// (capped at the all-ones target). 1 = the block target, as the Perl did.
     pub share_ratio: u32,
+    /// `--coinbase-concurrency`: `getcoinbasetemplatefor` requests in flight at once (note §6.3).
+    pub coinbase_concurrency: usize,
 }
 
 impl Default for Limits {
@@ -63,17 +66,29 @@ impl Default for Limits {
             address_cache_ttl: Duration::from_secs(600),
             check_pow: true,
             share_ratio: 1,
+            coinbase_concurrency: 2,
         }
     }
 }
 
-/// A `validateaddress` answer: the scriptPubKey, or None for an invalid/shielded address.
-type AddressAnswer = Option<Vec<u8>>;
+/// What the node said a username's address is: its payout kind, or None (refused).
+type AddressAnswer = Option<PayoutKind>;
 const ADDRESS_CACHE_MAX: usize = 4096;
 const AUTH_RATE_MAX_IPS: usize = 4096;
 
+/// An authorized connection, as `/status` lists it.
+#[derive(Debug, Clone)]
+pub struct MinerInfo {
+    /// The payout address (or, with `--payout`, the fixed one).
+    pub address: String,
+    /// The worker label (`<address>.<label>`), or with `--payout` the username (cut to 32).
+    pub label: Option<String>,
+    /// `p2pkh`, `p2sh`, `pq`, `sapling`, or `fixed` under `--payout`.
+    pub kind: &'static str,
+}
+
 pub struct Inner {
-    pub template: Option<BlockTemplate>,
+    pub template: Option<Arc<BlockTemplate>>,
     pub key: ChangeKey,
     pub template_at: Option<Instant>,
     pub generation: u64,
@@ -121,6 +136,12 @@ pub struct Shared {
     pub refresh: Notify,
     pub rpc: RpcClient,
     pub policy: Policy,
+    /// Where paired coinbases come from (the node's `getcoinbasetemplatefor`); None when the node
+    /// does not serve it or a `--payout` makes every job a swap job: Sapling and post-quantum
+    /// usernames are then refused.
+    pub coinbase: Option<Arc<dyn CoinbaseSource>>,
+    /// The pair book (`crate::pairs`).
+    pub pairs: Pairs,
     pub equihash: Equihash,
     pub password: Option<String>,
     pub started: Instant,
@@ -132,12 +153,13 @@ pub struct Shared {
     per_ip: Mutex<HashMap<IpAddr, usize>>,
     authorize_rate: Mutex<HashMap<IpAddr, (Instant, u32)>>,
     address_cache: Mutex<HashMap<String, (Instant, AddressAnswer)>>,
+    miner_list: Mutex<HashMap<u64, MinerInfo>>,
 }
 
 pub type State = Arc<Shared>;
 
 impl Shared {
-    pub fn new(rpc: RpcClient, policy: Policy, equihash: Equihash, password: Option<String>, limits: Limits) -> (State, watch::Receiver<u64>) {
+    pub fn new(rpc: RpcClient, policy: Policy, coinbase: Option<Arc<dyn CoinbaseSource>>, equihash: Equihash, password: Option<String>, limits: Limits) -> (State, watch::Receiver<u64>) {
         let (generation_tx, rx) = watch::channel(0);
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
@@ -162,6 +184,8 @@ impl Shared {
             refresh: Notify::new(),
             rpc,
             policy,
+            coinbase,
+            pairs: Pairs::new(limits.coinbase_concurrency),
             equihash,
             password,
             started: Instant::now(),
@@ -171,6 +195,7 @@ impl Shared {
             per_ip: Mutex::new(HashMap::new()),
             authorize_rate: Mutex::new(HashMap::new()),
             address_cache: Mutex::new(HashMap::new()),
+            miner_list: Mutex::new(HashMap::new()),
         });
         (shared, rx)
     }
@@ -235,7 +260,7 @@ impl Shared {
         m.get(address).filter(|(at, _)| at.elapsed() < self.limits.address_cache_ttl).map(|(_, spk)| spk.clone())
     }
 
-    pub fn cache_address(&self, address: &str, script_pubkey: AddressAnswer) {
+    pub fn cache_address(&self, address: &str, kind: AddressAnswer) {
         let mut m = self.address_cache.lock().unwrap_or_else(|e| e.into_inner());
         if m.len() >= ADDRESS_CACHE_MAX {
             let ttl = self.limits.address_cache_ttl;
@@ -244,7 +269,16 @@ impl Shared {
                 return;
             }
         }
-        m.insert(address.to_string(), (Instant::now(), script_pubkey));
+        m.insert(address.to_string(), (Instant::now(), kind));
+    }
+
+    /// Lists an authorized connection on `/status`.
+    pub fn miner_authorized(&self, index: u64, info: MinerInfo) {
+        self.miner_list.lock().unwrap_or_else(|e| e.into_inner()).insert(index, info);
+    }
+
+    pub fn miner_gone(&self, index: u64) {
+        self.miner_list.lock().unwrap_or_else(|e| e.into_inner()).remove(&index);
     }
 
     /// Records an accepted block and asks the poller for the next template now.
@@ -259,6 +293,26 @@ impl Shared {
 
     /// The `/status` document.
     pub fn status_json(&self) -> serde_json::Value {
+        // The book after the state, never both at once the other way round.
+        let tip = self.lock().template.as_ref().map(|t| t.previousblockhash.clone());
+        let pairs = self.pairs.status(tip.as_deref());
+        let (by_kind, list) = {
+            let m = self.miner_list.lock().unwrap_or_else(|e| e.into_inner());
+            let mut by_kind = serde_json::Map::new();
+            for k in ["p2pkh", "p2sh", "pq", "sapling", "fixed"] {
+                by_kind.insert(k.into(), serde_json::json!(m.values().filter(|i| i.kind == k).count()));
+            }
+            let mut ids: Vec<&u64> = m.keys().collect();
+            ids.sort();
+            let list: Vec<serde_json::Value> = ids
+                .into_iter()
+                .map(|id| {
+                    let i = &m[id];
+                    serde_json::json!({ "id": id, "kind": i.kind, "address": i.address, "label": i.label })
+                })
+                .collect();
+            (by_kind, list)
+        };
         let g = self.lock();
         serde_json::json!({
             "payout": self.policy.payout_label(),
@@ -272,6 +326,10 @@ impl Shared {
             "height": g.template.as_ref().map(|t| t.height),
             "templateAgeSeconds": g.template_at.map(|t| t.elapsed().as_secs_f64().round()),
             "miners": g.miners,
+            "minersByKind": by_kind,
+            "minerList": list,
+            "coinbaseCall": self.coinbase.is_some(),
+            "pairs": pairs,
             "connections": g.connections,
             "tag": g.last_tag_kind,
             "lastSubmitVerdict": g.last_verdict,

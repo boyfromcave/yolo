@@ -70,6 +70,7 @@ fn config(flags: Flags, status: bool) -> Config {
         // template's, so their hashes cannot meet the target here; the replays are about
         // wire shapes, the pool's own PoW check has its own tests below.
         limits: yolo::Limits { check_pow: false, ..yolo::Limits::default() },
+        test_coinbase_source: None,
     }
 }
 

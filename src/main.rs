@@ -14,8 +14,10 @@ use yolo::Config;
 /// Ycash stratum pool (yolo), Yellowback tag aware.
 ///
 /// Two flags decide the coinbase. --payout unset: each miner's stratum username is its
-/// payout address (checked with validateaddress); set: every block pays that address and
-/// the username is just a worker name. --text unset: the node's coinbase scriptSig is used
+/// payout address, optionally with a worker label (<address>.<label>): a transparent one is
+/// written into the node's coinbase, a Sapling or post-quantum one is paid by a coinbase the
+/// node builds for it (getcoinbasetemplatefor); set: every block pays that address and the
+/// username is just a worker name. --text unset: the node's coinbase scriptSig is used
 /// as is; set: it is rebuilt as height push, coinbaseaux.flags (the Yellowback tag) and the
 /// text, within 100 bytes. The tag is carried in every combination.
 #[derive(Parser, Debug)]
@@ -67,6 +69,11 @@ struct Cli {
     /// (an authorized miner silent for three minutes is disconnected) and shows their speed.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=1_000_000))]
     share_ratio: u32,
+    /// getcoinbasetemplatefor requests in flight at once, for Sapling and post-quantum miners'
+    /// paired jobs (each Sapling one costs the node a proof). Give the node -rpcthreads of at
+    /// least this plus 2, so submitblock and the template poll never wait behind them.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=64))]
+    coinbase_concurrency: u32,
     /// Stratum sockets open at once, authorized or not; further connections are refused.
     #[arg(long, default_value_t = 1024)]
     max_connections: usize,
@@ -139,7 +146,14 @@ fn main() {
         no_flags: cli.no_flags,
         password: cli.password.filter(|p| !p.is_empty()),
         equihash: cli.equihash,
-        limits: yolo::Limits { max_connections: cli.max_connections, max_per_ip: cli.max_per_ip, share_ratio: cli.share_ratio, ..yolo::Limits::default() },
+        limits: yolo::Limits {
+            max_connections: cli.max_connections,
+            max_per_ip: cli.max_per_ip,
+            share_ratio: cli.share_ratio,
+            coinbase_concurrency: cli.coinbase_concurrency as usize,
+            ..yolo::Limits::default()
+        },
+        test_coinbase_source: None,
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap_or_else(|e| fail(&e.to_string()));

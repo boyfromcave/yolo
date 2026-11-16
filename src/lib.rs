@@ -10,6 +10,7 @@
 
 pub mod codec;
 pub mod equihash;
+pub mod pairs;
 pub mod poller;
 pub mod rpc;
 pub mod state;
@@ -26,7 +27,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use equihash::{Equihash, EquihashArg};
-use rpc::RpcClient;
+use rpc::{CoinbaseSource, RpcClient};
 pub use state::Limits;
 use state::Shared;
 use work::{Payout, Policy};
@@ -44,6 +45,10 @@ pub struct Config {
     pub password: Option<String>,
     pub equihash: EquihashArg,
     pub limits: Limits,
+    /// Test only: where paired coinbases come from instead of the node's `getcoinbasetemplatefor`
+    /// (the regtest stub until a node serves the call, and the in-process fakes). None in every
+    /// production invocation: the CLI never sets it.
+    pub test_coinbase_source: Option<std::sync::Arc<dyn CoinbaseSource>>,
 }
 
 /// Resolves `--payout` to its scriptPubKey with `validateaddress`, retrying while the node is
@@ -65,6 +70,40 @@ pub async fn resolve_payout(rpc: &RpcClient, address: &str) -> Result<Payout, St
             Err(e) => tracing::error!("validateaddress task: {}", e),
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// Where paired coinbases come from: none under `--payout` (every job is a swap job), the test
+/// source when one is given, else the node when it serves `getcoinbasetemplatefor`. Without it,
+/// Sapling and post-quantum usernames are refused at `mining.authorize`.
+async fn resolve_coinbase_source(rpc: &RpcClient, policy: &Policy, test: Option<std::sync::Arc<dyn CoinbaseSource>>) -> Option<std::sync::Arc<dyn CoinbaseSource>> {
+    if policy.payout.is_some() {
+        return None;
+    }
+    if let Some(t) = test {
+        tracing::warn!("paired coinbases come from a TEST source, not the node's getcoinbasetemplatefor");
+        return Some(t);
+    }
+    let r = rpc.clone();
+    match tokio::task::spawn_blocking(move || r.has_coinbase_call()).await {
+        Ok(Ok(true)) => {
+            info!("the node serves getcoinbasetemplatefor: Sapling and post-quantum usernames are paid by paired jobs");
+            Some(std::sync::Arc::new(rpc.clone()))
+        }
+        Ok(Ok(false)) => {
+            tracing::warn!("the node has no getcoinbasetemplatefor: only transparent usernames can be paid; Sapling and post-quantum ones are refused");
+            None
+        }
+        Ok(Err(e)) => {
+            // The node answered getblockchaininfo a moment ago; assume the call exists and let
+            // each request report its own error.
+            tracing::warn!("cannot tell whether the node serves getcoinbasetemplatefor ({}); assuming it does", e);
+            Some(std::sync::Arc::new(rpc.clone()))
+        }
+        Err(e) => {
+            tracing::error!("getcoinbasetemplatefor probe task: {}", e);
+            None
+        }
     }
 }
 
@@ -125,7 +164,7 @@ impl Bound {
                 }
             }
         }
-        let mut tasks = AbortOnDrop(vec![tokio::spawn(poller::run(self.state.clone()))]);
+        let mut tasks = AbortOnDrop(vec![tokio::spawn(poller::run(self.state.clone())), tokio::spawn(pairs::run(self.state.clone()))]);
         if let Some(l) = self.status_listener {
             info!("status on http://{}/status", self.status_addr.unwrap());
             tasks.0.push(tokio::spawn(status::serve(self.state.clone(), l)));
@@ -158,6 +197,7 @@ pub async fn bind(rpc: RpcClient, config: Config) -> Result<Bound, Box<dyn std::
         tracing::warn!("--no-flags: every block will be mined WITHOUT the Yellowback tag (test switch)");
     }
     let policy = Policy { payout, text: config.text.clone(), no_flags: config.no_flags };
+    let coinbase = resolve_coinbase_source(&rpc, &policy, config.test_coinbase_source.clone()).await;
     let listener = TcpListener::bind(config.bind).await.map_err(|e| format!("cannot listen on {}: {}", config.bind, e))?;
     let addr = listener.local_addr()?;
     let (status_listener, status_addr) = match config.status_bind {
@@ -168,7 +208,7 @@ pub async fn bind(rpc: RpcClient, config: Config) -> Result<Bound, Box<dyn std::
         }
         None => (None, None),
     };
-    let (state, generation_rx) = Shared::new(rpc, policy, equihash, config.password.clone(), config.limits.clone());
+    let (state, generation_rx) = Shared::new(rpc, policy, coinbase, equihash, config.password.clone(), config.limits.clone());
     Ok(Bound { addr, status_addr, listener, status_listener, state, generation_rx })
 }
 
