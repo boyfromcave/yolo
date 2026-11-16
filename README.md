@@ -84,10 +84,20 @@ ways the coinbase is made, by the kind of the username's address:
   template it holds, `yolo` asks the node for that miner's coinbase,
   `getcoinbasetemplatefor <address> {"previousblockhash": …, "txids": […]}`, and issues the
   **pair** (that template's transactions, all of them, and that coinbase) as one job. It checks
-  every answer against the stock template before using it (height, parent, the fee total, the
-  coinbase's total equal to the node's own coinbase's, the fund output identical, the payout to
-  the miner's address) and never pairs a coinbase with any transaction set other than the one it
-  was built for. One request serves every connection of one address. The pair is renewed at once
+  every answer against the stock template before using it: the height and parent; the fee total;
+  the coinbase's total equal to the node's own coinbase's; the fund output identical; the
+  coinbase's sigops with the template's within its `sigoplimit` (and, when the job is built, the
+  block within its size limit); for a post-quantum payout, an output of exactly the amount to the
+  miner's script. **For a Sapling payout `yolo` checks the shape and the value, not the
+  recipient:** exactly one Sapling output, a `valueBalance` of minus the amount, and no
+  transparent output besides the fund's. That the Sapling output is addressed to the miner is the
+  node's responsibility: `yolo` does not decrypt it (it could, with the all-zero outgoing viewing
+  key of ZIP 213, but that needs a Sapling crate it does not carry). It never pairs a coinbase
+  with any transaction set other than the one it was built for. One request serves every
+  connection of one address. Under load the address whose pair is the oldest is served first.
+  One source IP may hold at most `--max-paired-per-ip` (default 8) Sapling and post-quantum
+  payout addresses at once; further ones from it are refused at `mining.authorize`, transparent
+  ones are not. The pair is renewed at once
   on a new block (the miner gets no work until its pair arrives, a fraction of a second, a few
   seconds for a Sapling proof on a small host) and on a new Yellowback quote, and on a changed
   transaction set no more often than every 5 seconds (the miner keeps its valid job meanwhile).
@@ -232,6 +242,7 @@ yolo [OPTIONS]
   --share-ratio <N>          the target sent to miners is N times easier than the block's; a submit
                              between the two is a share (counted, never forwarded)      [default: 1]
   --coinbase-concurrency <N> getcoinbasetemplatefor requests in flight at once (paired jobs) [default: 2]
+  --max-paired-per-ip <N>    Sapling and post-quantum payout addresses one IP may mine to at once [default: 8]
   --max-connections <N>      stratum sockets open at once, authorized or not [default: 1024]
   --max-per-ip <N>           stratum sockets open at once from one IP     [default: 64]
   --log <LOG>                error, warn, info, debug, trace              [default: info]
@@ -307,8 +318,11 @@ listen address.
 - **For Sapling and post-quantum usernames: a ycashd with `getcoinbasetemplatefor`** (Ycash
   6.22.0-beta3 or later, either node line). `yolo` asks the node at startup; a node without it
   still serves transparent miners exactly as before, and Sapling and post-quantum usernames are
-  refused with `Invalid address` (logged once at startup). `-rpcthreads` at least
-  `--coinbase-concurrency` plus 2.
+  refused with `Invalid address: this pool cannot pay <kind> addresses now (its node does not
+  serve getcoinbasetemplatefor)`, logged once. A "Method not found" answer to any later request
+  (a startup check that could not reach the node, a downgraded node) does the same and lets the
+  paired miners go; `yolo` asks the node again every minute and accepts them again once it
+  serves the call. `-rpcthreads` at least `--coinbase-concurrency` plus 2.
 - `-ydf=0` (the default since beta3) pays miners the whole subsidy past the fund's mandate; see
   *Which address gets paid*.
 - **`mineraddress=s1…`**: a transparent address **of the node wallet** (`ycash-cli getnewaddress`),

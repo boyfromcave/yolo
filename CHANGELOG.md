@@ -12,12 +12,23 @@
   template's transactions, all of them, with that coinbase. No amount is requested or altered;
   every answer is checked against the stock template (parent, height, transaction count, fee
   total, the coinbase's claim equal to the node's own coinbase's, amount, the fund output identical
-  to the stock coinbase's, the payout to the miner) and dropped otherwise. Renewed at once on a new
+  to the stock coinbase's, the coinbase's sigops with the template's within `sigoplimit`, a
+  post-quantum payout to the miner's script; for a Sapling payout one Sapling output of the amount
+  and no other transparent output than the fund's, the recipient being the node's responsibility)
+  and dropped otherwise. Renewed at once on a new
   block or quote, at most every 5 s on a changed transaction set; a miner keeps its valid pair
   meanwhile; a `template-stale` answer fetches a new template. `--coinbase-concurrency` (default 2)
   caps the requests in flight, on threads of their own. `--text` rewrites only a paired coinbase's
   scriptSig. A node without `getcoinbasetemplatefor` serves transparent miners as before and
-  Sapling and post-quantum usernames are refused.
+  Sapling and post-quantum usernames are refused. A "Method not found" answer to any request
+  switches paired jobs off the same way (the paired miners are let go, said once in the log) and
+  the node is asked again every minute.
+- Under load, the address whose pair is oldest is served first (never the address order).
+  `--max-paired-per-ip` (default 8) caps the Sapling and post-quantum payout addresses one source
+  IP holds at once; over it further ones are refused at `mining.authorize`, transparent ones are not.
+- A keepalive never re-sends a paired job whose parent is no longer the tip.
+- Templates polled one after another share the transactions they have in common (one allocation
+  each), so the template every pair keeps costs no copy of a full block's transactions.
 - A paired job never drops transactions at the size limit (its coinbase claims all their fees);
   the swap path refuses a node coinbase that pays a Sapling `-mineraddress`.
 - The coinbase codec carries a Sapling coinbase's shielded part as opaque bytes (shape checked).
