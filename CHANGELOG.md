@@ -1,6 +1,22 @@
 # Changelog
 
-## Unreleased — paired jobs: Sapling and post-quantum miners paid at their own address
+## Unreleased — beta3 (the 6.22.0-beta3 release train)
+
+Everything in this section is new since the beta2 train, which pinned yolo `fcb5a9e`.
+
+### What a pool operator must do
+
+- Nothing, for transparent miners or a `--payout` pool: they work as before.
+- To pay Sapling and post-quantum miners at their own address: run the pool node on ycashd
+  6.22.0-beta3 or later (`getcoinbasetemplatefor`), with `-rpcthreads` of at least
+  `--coinbase-concurrency` plus 2.
+- Leave the pool node's `-ydf` at its default, 0 (new in the beta3 nodes): a miner is then paid the
+  whole subsidy plus every fee past the fund's mandate. Only a node started with a nonzero `-ydf`
+  takes a fund share, and its operator must tell the miners.
+- GPU miners on a network whose blocks come minutes apart: set `--share-ratio` (below) so they are
+  not disconnected as silent.
+
+### Paired jobs: Sapling and post-quantum miners paid at their own address
 
 - A stratum username may be a Sapling or a post-quantum address as well as a transparent one, and
   may carry a worker label (`<address>.<label>`, 1 to 32 characters of `A-Z a-z 0-9 _ -`, shown in
@@ -38,7 +54,7 @@
 - Tests: `tests/paired.rs` (in-process), `tests/regtest_pairs.rs` (the acceptance test on regtest
   with the Python 48,5 miner; `YOLO_REGTEST_COINBASE=node|stub`).
 
-## Unreleased — header time after an idle chain, shares, stale submits
+### Header time after an idle chain, shares, stale submits
 
 - A submit for a job on a parent that is no longer the tip (a newer block came in, or the pool's
   own block was just accepted) or for an unknown job id is **stale**: answered at once with
@@ -99,6 +115,10 @@
   an honest card's occasional invalid solution never adds up to a disconnect, while a flood with
   fewer shares between refusals still does. A block is remembered as a duplicate only once the
   node has answered, so a retry after an RPC error goes through.
+
+### CI
+
+- The Semgrep scanner's OpenTelemetry pins move to 1.45.2 (GHSA-mf5v-w3w3-f6cg); CI tooling only.
 
 ## Unreleased — security CI
 

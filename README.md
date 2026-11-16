@@ -20,17 +20,20 @@ each block's coinbase, and pools that do earn a share of the pool fee paid on ea
   `--payout` and `--text` say. Every upgraded node enforces YED's rules on every block, so a pool
   has nothing to switch on. yolo needs no change for the upgrade and keeps mining across its
   activation block (tested on regtest). It does not touch the wYEC bridge.
-- **Post-quantum vaults:** the post-quantum layer (the nodes' `upgrade/quantum-vaults` branches,
-  which join `upgrade/vault` at release) rides the same activation and leaves the coinbase, the
-  quote tag and the mining RPCs as they are, so yolo needs no change for it either. Blocks may
-  then carry large post-quantum transactions; yolo passes the node's template through.
-- **Node it needs:** any ycashd v4.5.0 or 6.20.0 for plain mining; for tagged blocks, a ycashd
-  built from the `upgrade/vault` branch of [ycash-dd](https://github.com/boyfromcave/ycash-dd) or
+- **Post-quantum vaults:** the post-quantum layer rides the same activation and leaves the
+  coinbase, the quote tag and the mining RPCs as they are, so yolo needs no change for it either.
+  Blocks may then carry large post-quantum transactions; yolo passes the node's template through.
+- **Miners at their own address, of any kind:** a transparent, Sapling or post-quantum address as
+  the stratum username is paid in full by the block it finds (*Which address gets paid*).
+- **Node it needs:** any ycashd v4.5.0, or 6.20.0 or later, for transparent miners; ycashd
+  6.22.0-beta3 or later (`getcoinbasetemplatefor`) for Sapling and post-quantum miners; for tagged
+  blocks, a ycashd built from the `upgrade/vault` branch of
+  [ycash-dd](https://github.com/boyfromcave/ycash-dd) or
   [ycash6](https://github.com/boyfromcave/ycash6) (see *Node requirements*).
 - **More:** the parent project, [Ycash vaults and Yellowback](https://github.com/boyfromcave/yellowback).
-- **Status: proposed, not live.** It runs on a local test network (regtest) only. It has not been
-  adopted by the Ycash Foundation, has not been audited, and has no activation height on mainnet
-  or testnet.
+- **Status: proposed, not live on mainnet.** It runs on regtest and on the project's fast testnet
+  (testnet-yb-fast), where the vault upgrade is active. The upgrade has not been adopted by the
+  Ycash Foundation, has not been audited, and has no activation height on mainnet.
 - **Try it:** *Regtest quick start* below, or the node's
   [devnet](https://github.com/boyfromcave/ycash-dd/blob/upgrade/vault/contrib/yellowback/devnet/README.md).
 
@@ -47,7 +50,8 @@ If you'd like to buy beers for the original developer (@ChileBob):
 
 ## Build
 
-Stable Rust 1.85 or newer, no OpenSSL (the HTTP client uses rustls):
+Rust 1.85 or newer (`rust-toolchain.toml` pins the release builds to 1.91.0), no OpenSSL (the
+HTTP client uses rustls):
 
 ```
 cargo build --release
@@ -71,8 +75,10 @@ The label is 1 to 32 characters of `A-Z a-z 0-9 _ -`, everything after the first
 in the log and on `/status` only, and never changes who is paid.
 
 **How each miner is paid in full.** A miner who finds a block gets the block subsidy plus every
-fee of the transactions in that block (less the development-fund share, if the pool node carries
-one: see below). `yolo` never chooses or asks for an amount: the node derives it. There are two
+fee of the transactions in that block. The only thing that can come out of it is the
+development-fund share, and only the node applies it: where consensus requires it, or where the
+pool node is started with a nonzero `-ydf` (below). `yolo` never chooses, asks for or lowers an
+amount: the node derives it from the template. There are two
 ways the coinbase is made, by the kind of the username's address:
 
 - **Transparent (P2PKH, P2SH): the swap path.** The node's own coinbase (`coinbasetxn`) already
@@ -111,11 +117,12 @@ The design is `docs/plans/beta3/getcoinbasetemplatefor.md` in the workspace.
 
 **The development-fund share is not always there.** Consensus requires a fund output (5 % of the
 subsidy) only below the fund's mandate end height (mainnet: ended at 2,275,000; the testnets and
-regtest have their own). Past it the share is optional and comes from the pool node's
-`-ydf=<0..5>`, whose default is **0** since beta3: the coinbase then has one output and the miner
-gets the whole subsidy plus fees. A node with `-ydf=5` adds the share to its own coinbase and to
-every coinbase `getcoinbasetemplatefor` builds, so both paths pay a miner the same; a pool that
-does this donates 5 % of every miner's subsidy and should say so.
+regtest have their own). Past it the share is optional and comes only from the pool node's
+`-ydf=<n>` (a percentage of the subsidy, 0 to 100), whose default is **0** since beta3: the
+coinbase then has one output and the miner gets the whole subsidy plus fees. Run a pool node at
+the default. A node started with `-ydf=5` adds the share to its own coinbase and to every coinbase
+`getcoinbasetemplatefor` builds, so both paths pay a miner the same, and that node donates 5 % of
+every miner's subsidy: an operator who sets it must tell the miners.
 
 The address given to `--payout` is validated once at startup (`validateaddress`; a shielded or
 invalid address is a startup error). There is no "leave the coinbase as the node built it"
@@ -315,6 +322,9 @@ listen address.
 
 - `server=1` and RPC credentials in `ycash.conf`; the node fully synced with at least one
   peer (`getblocktemplate` refuses to serve work otherwise).
+- The RPCs yolo calls: `getblocktemplate`, `submitblock`, `getblockchaininfo` and
+  `validateaddress`, plus `z_validateaddress` and `getcoinbasetemplatefor` for Sapling and
+  post-quantum usernames. It never calls a wallet-spending or `yed_*` RPC.
 - **For Sapling and post-quantum usernames: a ycashd with `getcoinbasetemplatefor`** (Ycash
   6.22.0-beta3 or later, either node line). `yolo` asks the node at startup; a node without it
   still serves transparent miners exactly as before, and Sapling and post-quantum usernames are
@@ -323,8 +333,8 @@ listen address.
   (a startup check that could not reach the node, a downgraded node) does the same and lets the
   paired miners go; `yolo` asks the node again every minute and accepts them again once it
   serves the call. `-rpcthreads` at least `--coinbase-concurrency` plus 2.
-- `-ydf=0` (the default since beta3) pays miners the whole subsidy past the fund's mandate; see
-  *Which address gets paid*.
+- `-ydf=0` (the default since beta3; leave it there) pays miners the whole subsidy past the fund's
+  mandate; see *Which address gets paid*.
 - **`mineraddress=s1…`**: a transparent address **of the node wallet** (`ycash-cli getnewaddress`),
   never a Sapling one (the swap path needs the node's coinbase to pay a transparent `vout[0]`).
   Always needed — without it the node builds no template — and the tag's payout key defaults
@@ -339,7 +349,7 @@ listen address.
   node repository. Where YED is not live (a stock node, or before the activation) the
   template's `coinbaseaux.flags` is empty and `yolo` behaves exactly as the Perl did (`--text`
   then gives `height push ‖ push(text)`).
-- ycashd v4.5.0 or 6.20.0 (either node line). The header root is read from `lightclientroothash` (v4.5.0, and
+- ycashd v4.5.0, or 6.20.0 or later (either node line). The header root is read from `lightclientroothash` (v4.5.0, and
   6.20.0 while the `gbt_oldhashes` deprecation is allowed, the default) or from 6.20.0's
   `defaultroots`. One combination cannot serve work: a chain before Heartwood (regtest only)
   on 6.20.0 with `-allowdeprecated=none`, whose template carries no Sapling root.
