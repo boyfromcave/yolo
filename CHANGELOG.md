@@ -16,6 +16,19 @@ Everything in this section is new since the beta2 train, which pinned yolo `fcb5
 - GPU miners on a network whose blocks come minutes apart: set `--share-ratio` (below) so they are
   not disconnected as silent.
 
+### Block pacing for testnets (`--min-block-interval`, after the beta3 tags)
+
+- `--min-block-interval <seconds>` (or `YOLO_MIN_BLOCK_INTERVAL`; default 0 = off, at most 300;
+  it runs only where the node says `test` or `regtest`, so it is **refused on mainnet** at start,
+  and the pool stops if the node comes back on another chain): a block is submitted no sooner than that after its job's time
+  was read from the node. Block timestamps end up at least that far apart, so a fast miner on the
+  pool no longer drives a test network's difficulty up. The held block is one at random among the
+  verified block-target solutions of a tip's first sixth of the interval, always its finder's own
+  block, paid in full; the others are answered `true` and credited as shares. A held block is
+  dropped, never submitted, when the tip changes under it. With the flag at 0 nothing changes
+  except one new `/status` key, `minBlockInterval: 0`. README "Block pacing".
+- `/status` with pacing on: `nextBlockInSeconds`, `held`, `heldStale`, `paceCandidates`.
+
 ### Paired jobs: Sapling and post-quantum miners paid at their own address
 
 - A stratum username may be a Sapling or a post-quantum address as well as a transparent one, and

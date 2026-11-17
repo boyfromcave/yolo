@@ -34,6 +34,19 @@ pub fn job_time(t: &BlockTemplate) -> u32 {
     t.curtime.and_then(|c| u32::try_from(c).ok()).unwrap_or_else(now_unix)
 }
 
+/// Block pacing (`--min-block-interval`; nothing without it): tells the pacer which parent the
+/// template is on. A block held on another parent is dropped here, never submitted: the chain has
+/// moved, somebody else's block arrived first.
+fn see_tip(g: &mut crate::state::Inner) {
+    if !g.pacer.enabled() {
+        return;
+    }
+    let Some(parent) = g.template.as_ref().map(|t| crate::codec::reverse_hex(&t.previousblockhash)) else { return };
+    if let Some(h) = g.pacer.see_tip(&parent, Instant::now()) {
+        warn!("held block {} (miner {}, job {}) dropped: the chain moved to another block before its release", h.height, h.miner, h.job_id);
+    }
+}
+
 /// Applies a freshly fetched template; returns true when miners need new work.
 pub fn apply_template(state: &State, mut template: BlockTemplate) -> bool {
     let key = template.change_key();
@@ -49,6 +62,7 @@ pub fn apply_template(state: &State, mut template: BlockTemplate) -> bool {
     if g.template.is_some() && g.key == key && !was_down {
         g.template = Some(std::sync::Arc::new(template));
         g.template_at = Some(Instant::now());
+        see_tip(&mut g);
         return false;
     }
     let reason = if was_down {
@@ -65,6 +79,7 @@ pub fn apply_template(state: &State, mut template: BlockTemplate) -> bool {
     g.key = key;
     g.template = Some(std::sync::Arc::new(template));
     g.template_at = Some(Instant::now());
+    see_tip(&mut g);
     g.generation += 1;
     let generation = g.generation;
     // Log the tag on every template change by building a probe job under the policy (a
@@ -123,6 +138,30 @@ pub async fn run(state: State) {
         match fetched {
             Ok(Ok(v)) => match serde_json::from_value::<BlockTemplate>(v) {
                 Ok(t) => {
+                    // Block pacing: a node that was away may have come back on another chain
+                    // (restarted onto mainnet behind the same URL). Ask before any work is built
+                    // from its template; on a chain pacing is refused on, the pool stops.
+                    if !state.limits.min_block_interval.is_zero() && !state.lock().node_up {
+                        let r = state.rpc.clone();
+                        let chain = match tokio::task::spawn_blocking(move || r.getblockchaininfo()).await {
+                            Ok(Ok(info)) => info.get("chain").and_then(|c| c.as_str()).unwrap_or("main").to_string(),
+                            Ok(Err(e)) => {
+                                warn!("getblockchaininfo: {} (the node's chain must be known before pacing; retrying in 5 s)", e);
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
+                            Err(e) => {
+                                error!("getblockchaininfo task: {}", e);
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
+                        };
+                        if let Err(why) = crate::pace::check_chain(&chain, state.limits.min_block_interval) {
+                            error!("the node is back on chain {:?}: {}; stopping", chain, why);
+                            state.fail(format!("the node is now on chain {:?}: {}", chain, why));
+                            return;
+                        }
+                    }
                     down_logged = false;
                     if !apply_template(&state, t) {
                         debug!("template unchanged");

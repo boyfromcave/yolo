@@ -260,6 +260,10 @@ pub struct Pair {
     /// When the pair was made: the oldest pair is renewed first (no address waits behind the
     /// same others every time).
     pub built_at: Instant,
+    /// When the pool read `template` from the node (its `curtime` is the job's header time):
+    /// block pacing counts from here, not from `built_at`, so the node's time to build the
+    /// coinbase is not added to a paired miner's hold.
+    pub read_at: Instant,
 }
 
 struct Entry {
@@ -536,13 +540,13 @@ pub fn refresh(state: &State) {
     if !state.pairs.available() {
         return;
     }
-    let template = {
+    let (template, read_at) = {
         let g = state.lock();
         if g.template_stale() {
             return;
         }
         match &g.template {
-            Some(t) => t.clone(),
+            Some(t) => (t.clone(), g.template_at.unwrap_or_else(Instant::now)),
             None => return,
         }
     };
@@ -571,14 +575,14 @@ pub fn refresh(state: &State) {
         let (t, r) = (template.clone(), r.clone());
         if let Err(e) = spawned {
             error!("cannot spawn a coinbase request thread: {}", e);
-            finish(&st, &address, &kind, &t, &r, Err(RpcError::Protocol(format!("thread: {}", e))), None);
+            finish(&st, &address, &kind, (&t, read_at), &r, Err(RpcError::Protocol(format!("thread: {}", e))), None);
             drop(permit);
             continue;
         }
         tokio::spawn(async move {
             match rx.await {
-                Ok((answer, rtt)) => finish(&st, &address, &kind, &t, &r, answer, Some(rtt)),
-                Err(_) => finish(&st, &address, &kind, &t, &r, Err(RpcError::Protocol("the request thread died".into())), None),
+                Ok((answer, rtt)) => finish(&st, &address, &kind, (&t, read_at), &r, answer, Some(rtt)),
+                Err(_) => finish(&st, &address, &kind, (&t, read_at), &r, Err(RpcError::Protocol("the request thread died".into())), None),
             }
             drop(permit);
             st.pairs.wake.notify_one();
@@ -587,7 +591,7 @@ pub fn refresh(state: &State) {
 }
 
 /// Records the outcome of one request.
-fn finish(state: &State, address: &str, kind: &PayoutKind, t: &Arc<BlockTemplate>, r: &TemplateRef, answer: Result<CoinbaseFor, RpcError>, rtt: Option<Duration>) {
+fn finish(state: &State, address: &str, kind: &PayoutKind, (t, read_at): (&Arc<BlockTemplate>, Instant), r: &TemplateRef, answer: Result<CoinbaseFor, RpcError>, rtt: Option<Duration>) {
     {
         let mut s = state.pairs.stats.lock().unwrap_or_else(|e| e.into_inner());
         s.requests += 1;
@@ -622,7 +626,7 @@ fn finish(state: &State, address: &str, kind: &PayoutKind, t: &Arc<BlockTemplate
                 return;
             }
             let amount = answer.as_ref().map(|a| a.amount).unwrap_or(0);
-            e.current = Some(Arc::new(Pair { template: t.clone(), reference: r.clone(), coinbase: c.coinbase, flags: c.flags, amount, built_at: Instant::now() }));
+            e.current = Some(Arc::new(Pair { template: t.clone(), reference: r.clone(), coinbase: c.coinbase, flags: c.flags, amount, built_at: Instant::now(), read_at }));
             e.version += 1;
             drop(m);
             info!(
@@ -880,7 +884,7 @@ mod tests {
             kind: PayoutKind::Sapling,
             subscribers: 1,
             subscribed_at: subscribed,
-            current: built.map(|(reference, b)| Arc::new(Pair { template: Arc::new(t.clone()), reference, coinbase: vec![], flags: vec![], amount: 0, built_at: b })),
+            current: built.map(|(reference, b)| Arc::new(Pair { template: Arc::new(t.clone()), reference, coinbase: vec![], flags: vec![], amount: 0, built_at: b, read_at: b })),
             version: 0,
             in_flight: false,
             last_request: None,
@@ -899,7 +903,7 @@ mod tests {
         let now = at(40);
         assert_eq!(order(&m, &r, now), ["yyy", "xxx", "mmm", "zzz", "aaa", "bbb"]);
         // once served, an address goes to the back of its class
-        m.get_mut("mmm").unwrap().current = Some(Arc::new(Pair { template: Arc::new(t.clone()), reference: old, coinbase: vec![], flags: vec![], amount: 0, built_at: at(41) }));
+        m.get_mut("mmm").unwrap().current = Some(Arc::new(Pair { template: Arc::new(t.clone()), reference: old, coinbase: vec![], flags: vec![], amount: 0, built_at: at(41), read_at: at(41) }));
         assert_eq!(order(&m, &r, now), ["yyy", "xxx", "zzz", "aaa", "mmm", "bbb"]);
     }
 
@@ -960,7 +964,7 @@ mod tests {
         e.in_flight = true;
         assert_eq!(need(&e, &r, now), None, "one request per address at a time");
         e.in_flight = false;
-        let pair = |reference: TemplateRef| Some(Arc::new(Pair { template: Arc::new(t.clone()), reference, coinbase: vec![], flags: vec![], amount: 0, built_at: now }));
+        let pair = |reference: TemplateRef| Some(Arc::new(Pair { template: Arc::new(t.clone()), reference, coinbase: vec![], flags: vec![], amount: 0, built_at: now, read_at: now }));
         e.current = pair(r.clone());
         assert_eq!(need(&e, &r, now), None, "the pair is current");
         e.current = pair(TemplateRef { previousblockhash: "00".repeat(32), ..r.clone() });

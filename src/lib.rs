@@ -10,6 +10,7 @@
 
 pub mod codec;
 pub mod equihash;
+pub mod pace;
 pub mod pairs;
 pub mod poller;
 pub mod rpc;
@@ -144,8 +145,10 @@ impl Bound {
         self.state.clone()
     }
 
-    /// Serves until the task is dropped.
-    pub async fn serve(self) {
+    /// Serves until the task is dropped, or until something makes the pool stop itself
+    /// (`Shared::fail`: the node came back on a chain block pacing is refused on), which is the
+    /// error returned.
+    pub async fn serve(self) -> Result<(), String> {
         info!(
             "yolo {} listening on {} (payout {}, text {}, Equihash {}, node {})",
             env!("CARGO_PKG_VERSION"),
@@ -166,12 +169,27 @@ impl Bound {
             }
         }
         let mut tasks = AbortOnDrop(vec![tokio::spawn(poller::run(self.state.clone())), tokio::spawn(pairs::run(self.state.clone()))]);
+        let pace = self.state.limits.min_block_interval;
+        if !pace.is_zero() {
+            let window = self.state.lock().pacer.selection_window();
+            info!(
+                "block pacing: a block is submitted no sooner than {:?} after its job's time was read from the node; \
+                 the held block is one at random among the solutions of a tip's first {:?}",
+                pace, window
+            );
+            tasks.0.push(tokio::spawn(pace::run(self.state.clone())));
+        }
         if let Some(l) = self.status_listener {
             info!("status on http://{}/status", self.status_addr.unwrap());
             tasks.0.push(tokio::spawn(status::serve(self.state.clone(), l)));
         }
-        stratum::serve(self.state, self.listener, self.generation_rx).await;
+        let mut fatal = self.state.fatal.subscribe();
+        let result = tokio::select! {
+            _ = stratum::serve(self.state.clone(), self.listener, self.generation_rx) => Ok(()),
+            why = fatal.wait_for(|f| f.is_some()) => Err(why.ok().and_then(|f| f.clone()).unwrap_or_else(|| "stopped".into())),
+        };
         drop(tasks);
+        result
     }
 }
 
@@ -179,8 +197,26 @@ fn policy_payout_is_username(payout: &Option<Payout>) -> bool {
     payout.is_none()
 }
 
+/// The node's chain name (`getblockchaininfo` `chain`), retrying while it is unreachable. An
+/// answer without the field counts as mainnet, the careful reading.
+pub async fn resolve_chain(rpc: &RpcClient) -> String {
+    loop {
+        let r = rpc.clone();
+        match tokio::task::spawn_blocking(move || r.getblockchaininfo()).await {
+            Ok(Ok(info)) => return info.get("chain").and_then(|c| c.as_str()).unwrap_or("main").to_string(),
+            Ok(Err(e)) => tracing::warn!("getblockchaininfo: {} (retrying in 5 s)", e),
+            Err(e) => tracing::error!("getblockchaininfo task: {}", e),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
 /// Resolves the Equihash parameters against the node and binds the listeners.
 pub async fn bind(rpc: RpcClient, config: Config) -> Result<Bound, Box<dyn std::error::Error>> {
+    if !config.limits.min_block_interval.is_zero() {
+        // Refused on mainnet before anything listens: a block held there is a block lost.
+        pace::check_chain(&resolve_chain(&rpc).await, config.limits.min_block_interval)?;
+    }
     let equihash = resolve_equihash(&rpc, config.equihash).await;
     let payout = match &config.payout {
         Some(a) => Some(resolve_payout(&rpc, a).await?),
@@ -218,6 +254,6 @@ pub async fn bind(rpc: RpcClient, config: Config) -> Result<Bound, Box<dyn std::
 
 /// Runs the pool until the process is stopped.
 pub async fn run(rpc: RpcClient, config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    bind(rpc, config).await?.serve().await;
+    bind(rpc, config).await?.serve().await?;
     Ok(())
 }

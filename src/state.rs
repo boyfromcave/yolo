@@ -59,6 +59,9 @@ pub struct Limits {
     pub coinbase_probe_every: Duration,
     /// A miner that has been sent nothing for this long is sent its job again (keepalive).
     pub keepalive: Duration,
+    /// `--min-block-interval`: a block is submitted no sooner than this after its job's time was
+    /// read from the node (`crate::pace`). Zero: off, every block goes to the node at once.
+    pub min_block_interval: Duration,
 }
 
 impl Default for Limits {
@@ -78,6 +81,7 @@ impl Default for Limits {
             max_paired_per_ip: 8,
             coinbase_probe_every: Duration::from_secs(60),
             keepalive: crate::stratum::MINER_TIMEOUT,
+            min_block_interval: Duration::ZERO,
         }
     }
 }
@@ -128,6 +132,8 @@ pub struct Inner {
     /// and no work is built from it until the poller brings the next one — otherwise a fast
     /// solver re-solves the old job and every submit comes back `inconclusive`.
     pub accepted_parent: Option<String>,
+    /// Block pacing (`--min-block-interval`): the held block and its counters.
+    pub pacer: crate::pace::Pacer,
 }
 
 impl Inner {
@@ -145,6 +151,10 @@ pub struct Shared {
     pub generation_tx: watch::Sender<u64>,
     /// Wakes the poller before its next 1 s tick (after an accepted `submitblock`).
     pub refresh: Notify,
+    /// Wakes the release task when a block is held (`crate::pace::run`).
+    pub pace_wake: Notify,
+    /// A reason to stop the pool (`Shared::fail`): `Bound::serve` returns it as its error.
+    pub fatal: watch::Sender<Option<String>>,
     pub rpc: RpcClient,
     pub policy: Policy,
     /// Where paired coinbases come from (the node's `getcoinbasetemplatefor`); None when the node
@@ -190,9 +200,12 @@ impl Shared {
                 high_hash: 0,
                 shares: 0,
                 accepted_parent: None,
+                pacer: crate::pace::Pacer::new(limits.min_block_interval),
             }),
             generation_tx,
             refresh: Notify::new(),
+            pace_wake: Notify::new(),
+            fatal: watch::channel(None).0,
             rpc,
             policy,
             coinbase,
@@ -209,6 +222,18 @@ impl Shared {
             miner_list: Mutex::new(HashMap::new()),
         });
         (shared, rx)
+    }
+
+    /// Stops the pool: `Bound::serve` ends with this error (the first one given).
+    pub fn fail(&self, why: String) {
+        self.fatal.send_if_modified(|f| {
+            if f.is_none() {
+                *f = Some(why);
+                true
+            } else {
+                false
+            }
+        });
     }
 
     pub fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -325,7 +350,7 @@ impl Shared {
             (by_kind, list)
         };
         let g = self.lock();
-        serde_json::json!({
+        let mut status = serde_json::json!({
             "payout": self.policy.payout_label(),
             // The tag's payoutKey is always the node's -yellowbackpayoutaddress (MINER-2),
             // whatever --payout says about the coinbase payee (audit H-7).
@@ -351,6 +376,18 @@ impl Shared {
             "shares": g.shares,
             "shareRatio": self.limits.share_ratio,
             "uptimeSeconds": self.started.elapsed().as_secs(),
-        })
+            "minBlockInterval": g.pacer.interval().as_secs(),
+        });
+        if g.pacer.enabled() {
+            // Only with --min-block-interval: without it the document is the one it always was,
+            // plus the zero above.
+            let now = Instant::now();
+            let o = status.as_object_mut().expect("an object");
+            o.insert("nextBlockInSeconds".into(), serde_json::json!(g.pacer.next_block_in(now).as_secs_f64().ceil()));
+            o.insert("held".into(), g.pacer.held_json(now));
+            o.insert("heldStale".into(), serde_json::json!(g.pacer.held_stale));
+            o.insert("paceCandidates".into(), serde_json::json!(g.pacer.candidates_total));
+        }
+        status
     }
 }

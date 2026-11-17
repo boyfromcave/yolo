@@ -79,6 +79,12 @@ struct Cli {
     /// at mining.authorize, transparent ones still work.
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=4096))]
     max_paired_per_ip: u32,
+    /// Testnet and regtest only (refused on mainnet): submit a block no sooner than this many
+    /// seconds after its job's time was read from the node; a block found sooner is held, its
+    /// miner answered at once. Block timestamps end up at least this far apart, so a fast miner
+    /// on this pool does not drive the difficulty up. 0: off. Also YOLO_MIN_BLOCK_INTERVAL.
+    #[arg(long, value_name = "SECONDS", env = "YOLO_MIN_BLOCK_INTERVAL", default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=yolo::pace::MAX_INTERVAL_SECS as i64))]
+    min_block_interval: u32,
     /// Stratum sockets open at once, authorized or not; further connections are refused.
     #[arg(long, default_value_t = 1024)]
     max_connections: usize,
@@ -157,6 +163,7 @@ fn main() {
             share_ratio: cli.share_ratio,
             coinbase_concurrency: cli.coinbase_concurrency as usize,
             max_paired_per_ip: cli.max_paired_per_ip as usize,
+            min_block_interval: std::time::Duration::from_secs(u64::from(cli.min_block_interval)),
             ..yolo::Limits::default()
         },
         test_coinbase_source: None,
@@ -196,6 +203,20 @@ fn fail(msg: &str) -> ! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn min_block_interval_flag() {
+        use super::Cli;
+        use clap::Parser;
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("yolo").chain(args.iter().copied()));
+        assert_eq!(parse(&["--min-block-interval", "60"]).unwrap().min_block_interval, 60);
+        assert_eq!(parse(&["--min-block-interval", "300"]).unwrap().min_block_interval, 300);
+        assert!(parse(&["--min-block-interval", "301"]).is_err(), "at most 300 seconds");
+        assert!(parse(&["--min-block-interval", "-1"]).is_err());
+        if std::env::var_os("YOLO_MIN_BLOCK_INTERVAL").is_none() {
+            assert_eq!(parse(&[]).unwrap().min_block_interval, 0, "off by default");
+        }
+    }
+
     #[test]
     fn rpc_url_locality() {
         use super::rpc_url_is_local_or_tls as local;
