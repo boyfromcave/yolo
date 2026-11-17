@@ -138,6 +138,30 @@ pub async fn run(state: State) {
         match fetched {
             Ok(Ok(v)) => match serde_json::from_value::<BlockTemplate>(v) {
                 Ok(t) => {
+                    // Block pacing: a node that was away may have come back on another chain
+                    // (restarted onto mainnet behind the same URL). Ask before any work is built
+                    // from its template; on a chain pacing is refused on, the pool stops.
+                    if !state.limits.min_block_interval.is_zero() && !state.lock().node_up {
+                        let r = state.rpc.clone();
+                        let chain = match tokio::task::spawn_blocking(move || r.getblockchaininfo()).await {
+                            Ok(Ok(info)) => info.get("chain").and_then(|c| c.as_str()).unwrap_or("main").to_string(),
+                            Ok(Err(e)) => {
+                                warn!("getblockchaininfo: {} (the node's chain must be known before pacing; retrying in 5 s)", e);
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
+                            Err(e) => {
+                                error!("getblockchaininfo task: {}", e);
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
+                        };
+                        if let Err(why) = crate::pace::check_chain(&chain, state.limits.min_block_interval) {
+                            error!("the node is back on chain {:?}: {}; stopping", chain, why);
+                            state.fail(format!("the node is now on chain {:?}: {}", chain, why));
+                            return;
+                        }
+                    }
                     down_logged = false;
                     if !apply_template(&state, t) {
                         debug!("template unchanged");

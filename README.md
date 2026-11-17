@@ -309,7 +309,8 @@ the node**. A block found sooner is held and submitted when that moment comes.
 
 What it does:
 
-- **Block timestamps end up at least S seconds apart**, and that is all the difficulty rule reads.
+- **Block timestamps end up at least S seconds apart, while the node's `curtime` is its clock**
+  (the usual case; the exception is below), and that is all the difficulty rule reads.
   A job's header time is the node's `curtime`, and the pool builds no job on a block before the
   node has accepted it; so a block with time *t* is published at *t* + S or later and every job
   on top of it is dated after that. A held block's timestamp is therefore S seconds older than
@@ -327,9 +328,12 @@ What it does:
   whose job arrives first, and a Sapling or post-quantum miner, whose job waits for the node's
   coinbase, would never win. The block is never rebuilt: its coinbase pays its finder the whole
   amount at its own address, as without pacing.
-- **Never on a stale tip.** When the pool sees another parent before the release (somebody
-  else's block arrived), the held block is dropped, logged and counted (`heldStale`), not
-  submitted. At the release the tip is checked once more.
+- **Never on a stale tip, and one block a parent.** When the pool sees another parent before the
+  release (somebody else's block arrived), the held block is dropped, logged and counted
+  (`heldStale`), not submitted. At the release the tip is checked once more, after the wait for
+  a submit slot; and from the release until the node has answered, every further solution on
+  that parent is a share, so the node never gets two blocks of this pool for one parent. A
+  `submitblock` that does not reach the node is tried again every second while the tip stands.
 - `/status`: `minBlockInterval` (always; 0 when off), and with pacing on `nextBlockInSeconds`
   (0 when a block could go to the node now), `held` (`null`, or `height`, `miner`, `candidates`,
   `releaseInSeconds`), `heldStale` and `paceCandidates`. The log says `block N held … release in
@@ -339,15 +343,35 @@ What it does not do:
 
 - **It paces this pool only.** Another pool, a solo miner or `ycashd -gen` can still produce
   blocks as fast as it likes, with any timestamps; and such a block, arriving during a hold,
-  takes the place of the held one, whose work is lost. That is why the flag is **refused on
-  mainnet** (`getblockchaininfo` says `main`): yolo does not start.
+  takes the place of the held one, whose work is lost. That is why the flag runs **only where
+  the node's `getblockchaininfo` says `test` or `regtest`** (the three names the node lines
+  report are `main`, `test` for every testnet, and `regtest`; anything else is refused too): on
+  mainnet yolo does not start. The chain is asked again whenever the node has been unreachable
+  and answers again, before any work is built; if it is then not `test` or `regtest`, the pool
+  stops with that error. A node swapped without one failed poll (the pool polls every second)
+  is not noticed.
 - It does not make blocks come exactly every S seconds. The interval is S plus the age of the
   winning job (a few seconds: at most the selection window while solutions are plentiful) plus
   the pool's and miners' turn-around; with S = 60 expect a block about every 65 seconds.
-- It does not space timestamps the node does not take from the clock: after a stop of more than
-  three hours `curtime` is capped at median-time-past + 3 h until the chain catches up, and a
-  regtest chain generated in a burst has `curtime` = median-time-past + 1. Blocks are still
-  published S seconds apart then.
+- It does not space timestamps the node does not take from the clock. After a stop of more than
+  three hours `curtime` is capped at median-time-past + 3 h until the chain's times have caught
+  up with the clock, and a regtest chain generated in a burst has `curtime` = median-time-past +
+  1. The first blocks' header times then advance as the median does: several blocks with the
+  same time and then a jump, less than S apart or far more. Blocks are still published S
+  seconds apart; the jumps lower the difficulty, they do not raise it.
+- It does not hold every miner's block equally long. The release is counted from the block's own
+  job, and a job is renewed (with the node's newest time) when its share set fills, when the
+  miner reconnects and, for a Sapling or post-quantum miner, whenever the transaction set
+  changes. A winner with a newer job is held until S after that newer time, so on a busy
+  mempool a paired miner's block waits a little longer and is a little more exposed to another
+  miner's block arriving. Among the candidates of the selection window the difference is at
+  most the window (S/6); with `--share-ratio` above 1 transparent jobs are renewed every few
+  seconds too. It cannot be evened out without giving up the spacing: a block released sooner
+  than S after its own header time lets the next block's time follow it by less than S, and
+  giving every job on a tip one header time would pair a template's time with a later
+  template's transactions. The node's time to build a paired coinbase is not counted: a paired
+  job's hold runs from the read of its template, as a transparent job's does. Who wins is not
+  affected: every candidate is equally likely.
 - It wastes work on purpose: a card that has a block in a second waits out the rest.
 
 Values, for the fast testnet (target spacing 75 s, simulation in the workspace's

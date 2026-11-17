@@ -58,8 +58,8 @@ struct Job {
     work: Work,
     /// SHA256d of each counted share's header (nonce2 and solution included).
     shares: HashSet<[u8; 32]>,
-    /// When the pool read this job's header time from the node (the template's fetch; for a
-    /// paired job, when its pair was built, which is later). Block pacing counts from here.
+    /// When the pool read this job's header time from the node (the fetch of the template it was
+    /// built from, for a paired job too). Block pacing counts from here.
     issued: std::time::Instant,
 }
 
@@ -509,7 +509,7 @@ impl Client {
                 }
                 out.push_str(&msg_notify(&w, true));
                 debug!("miner {}: paired job {} height {} ({} txs, {} zat) tag {}", self.index, w.job_id, w.height, w.transaction_count, pair.amount, w.tag_kind());
-                self.jobs.push_back(Job { work: w, shares: HashSet::new(), issued: pair.built_at });
+                self.jobs.push_back(Job { work: w, shares: HashSet::new(), issued: pair.read_at });
                 while self.jobs.len() > JOBS_KEPT {
                     self.jobs.pop_front();
                 }

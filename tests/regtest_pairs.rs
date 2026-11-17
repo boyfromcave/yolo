@@ -399,7 +399,9 @@ async fn serve_with(ctx: &Ctx, source: Option<Arc<dyn CoinbaseSource>>, limits: 
     };
     let bound = yolo::bind(ctx.p.rpc.clone(), config).await.unwrap();
     let (addr, status, state) = (bound.addr, bound.status_addr.unwrap(), bound.state());
-    let server = tokio::spawn(bound.serve());
+    let server = tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
     let deadline = Instant::now() + Duration::from_secs(20);
     while state.lock().template.is_none() {
         assert!(Instant::now() < deadline, "the poller never fetched a template");

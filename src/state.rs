@@ -153,6 +153,8 @@ pub struct Shared {
     pub refresh: Notify,
     /// Wakes the release task when a block is held (`crate::pace::run`).
     pub pace_wake: Notify,
+    /// A reason to stop the pool (`Shared::fail`): `Bound::serve` returns it as its error.
+    pub fatal: watch::Sender<Option<String>>,
     pub rpc: RpcClient,
     pub policy: Policy,
     /// Where paired coinbases come from (the node's `getcoinbasetemplatefor`); None when the node
@@ -203,6 +205,7 @@ impl Shared {
             generation_tx,
             refresh: Notify::new(),
             pace_wake: Notify::new(),
+            fatal: watch::channel(None).0,
             rpc,
             policy,
             coinbase,
@@ -219,6 +222,18 @@ impl Shared {
             miner_list: Mutex::new(HashMap::new()),
         });
         (shared, rx)
+    }
+
+    /// Stops the pool: `Bound::serve` ends with this error (the first one given).
+    pub fn fail(&self, why: String) {
+        self.fatal.send_if_modified(|f| {
+            if f.is_none() {
+                *f = Some(why);
+                true
+            } else {
+                false
+            }
+        });
     }
 
     pub fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {

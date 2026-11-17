@@ -9,9 +9,24 @@
 //! Why this spaces the chain's timestamps, which is all the difficulty rule reads: a job's header
 //! time is the node's `curtime` of the template it was built from (`poller::job_time`), and the
 //! pool builds no job on a block before the node has accepted that block. So a block with time
-//! `t` is published at `t + interval` or later, every job on top of it is read after that, and the
-//! next block's time is at least `t + interval`. Each timestamp is one interval older than its
-//! block's publication, and at least one interval after its parent's timestamp.
+//! `t` is published at `t + interval` or later, every job on top of it is read after that, and,
+//! **while the node's `curtime` is its clock**, the next block's time is at least `t + interval`.
+//! Each timestamp is one interval older than its block's publication, and at least one interval
+//! after its parent's timestamp.
+//!
+//! The condition matters. `curtime` is the clock only inside the header-time rules: after an idle
+//! gap of more than three hours the node caps it at median-time-past + 3 h, and on a chain whose
+//! median-time-past is ahead of the clock it is median-time-past + 1. Until the chain's times have
+//! caught up with the clock, the first blocks' header times advance as the median does (several
+//! blocks with one time, then a jump), by less than the interval or by far more, whatever the
+//! pool does. The pool still publishes those blocks one interval apart.
+//!
+//! The hold is counted from the job, so it differs a little between miners: a miner whose job
+//! was renewed later (a paired job follows the transaction set; any job is renewed when its share
+//! set fills or the miner reconnects) carries a later time and is held until one interval after
+//! that. The release cannot be made earlier than the block's own time plus the interval without
+//! giving up the spacing above. Among the candidates of the selection window the difference is
+//! at most the window.
 //!
 //! Which block is held: at the lowest difficulty a card has a block within a second of its job,
 //! so "the first one" would always be the miner whose job arrives first, and a Sapling or
@@ -38,12 +53,22 @@ pub const SELECTION_DIVISOR: u32 = 6;
 /// testnet block may be mined at the minimum difficulty.
 pub const MAX_INTERVAL_SECS: u32 = 300;
 
-/// Refuses pacing on mainnet: a block held there is lost to every other miner.
+/// The chain names (`getblockchaininfo` `chain`) pacing may run on. All three node lines report
+/// one of three names: `main`, `test` (every testnet profile, ycash6 and ycash-dd
+/// `src/chainparams.cpp` `strNetworkID`; kogany `bip70_network_name`, which says `test` for its
+/// regtest too) and `regtest`. Anything else, an unknown name included, is refused.
+pub const PACED_CHAINS: [&str; 2] = ["test", "regtest"];
+
+/// Refuses pacing anywhere but on a testnet or regtest: a block held on mainnet is lost to every
+/// other miner.
 pub fn check_chain(chain: &str, interval: Duration) -> Result<(), String> {
-    if !interval.is_zero() && chain == "main" {
+    if interval.is_zero() || PACED_CHAINS.contains(&chain) {
+        return Ok(());
+    }
+    if chain == "main" {
         return Err("--min-block-interval is refused on mainnet (chain \"main\"): a held block would be lost to any other miner; it is a testnet and regtest setting".into());
     }
-    Ok(())
+    Err(format!("--min-block-interval is refused on chain {:?}: it runs only where the node says \"test\" or \"regtest\"", chain))
 }
 
 /// A block waiting for its release.
@@ -79,6 +104,9 @@ pub struct Pacer {
     /// The parent the pool mines on and when the poller first saw it.
     tip: Option<(String, Instant)>,
     held: Option<Held>,
+    /// The parent of a block the release task has taken and is submitting: until the node has
+    /// answered, no other block on that parent goes to the node or is held.
+    releasing: Option<String>,
     /// Candidates on this tip so far.
     candidates: u64,
     /// Blocks held on a tip the chain moved away from: dropped, never submitted.
@@ -89,7 +117,7 @@ pub struct Pacer {
 
 impl Pacer {
     pub fn new(interval: Duration) -> Pacer {
-        Pacer { interval, tip: None, held: None, candidates: 0, held_stale: 0, candidates_total: 0 }
+        Pacer { interval, tip: None, held: None, releasing: None, candidates: 0, held_stale: 0, candidates_total: 0 }
     }
 
     pub fn enabled(&self) -> bool {
@@ -136,6 +164,11 @@ impl Pacer {
         }
         // The caller has just checked that `parent` is the template's; the poller normally told us first.
         self.see_tip(parent, now);
+        if self.releasing.as_deref() == Some(parent) {
+            // The block for this tip is on its way to the node.
+            self.candidates_total += 1;
+            return Offer::NotChosen;
+        }
         let due = issued + self.interval;
         if self.held.is_none() {
             if now >= due {
@@ -160,17 +193,31 @@ impl Pacer {
         }
     }
 
-    /// The held block, once it is due.
+    /// The held block, once it is due. From here until `release_done` or `put_back` its parent is
+    /// "releasing": every further solution on it is a share, so the node gets one block a parent.
     pub fn take_due(&mut self, now: Instant) -> Option<Held> {
         if self.held.as_ref().is_some_and(|h| now >= h.due) {
-            return self.held.take();
+            let h = self.held.take();
+            self.releasing = h.as_ref().map(|h| h.parent.clone());
+            return h;
         }
         None
+    }
+
+    /// The release of the block `take_due` gave out is over: the node answered, or the block was
+    /// dropped.
+    pub fn release_done(&mut self) {
+        self.releasing = None;
+    }
+
+    pub fn releasing(&self) -> Option<&str> {
+        self.releasing.as_deref()
     }
 
     /// Puts a block back after a `submitblock` that did not reach the node, to be tried again at
     /// `due`, unless the tip has changed or another block is held meanwhile.
     pub fn put_back(&mut self, mut held: Held, due: Instant) -> bool {
+        self.releasing = None;
         if self.held.is_some() || self.tip.as_ref().is_none_or(|(p, _)| *p != held.parent) {
             return false;
         }
@@ -233,44 +280,58 @@ pub async fn run(state: State) {
                 }
             }
         }
-        let held = {
+        let Some(held) = state.lock().pacer.take_due(Instant::now()) else { continue };
+        release(&state, held).await;
+    }
+}
+
+/// Submits a block `take_due` gave out, if the pool is still mining on its parent.
+async fn release(state: &State, held: Held) {
+    let _permit = state.submit_permits.acquire().await;
+    {
+        // Never submit on a stale tip: the template must still be on this parent and must not be
+        // one the node has already built past. Checked here, after the wait for a permit, so that
+        // nothing but the RPC itself lies between the check and the submit.
+        let mut g = state.lock();
+        let on_tip = g.template.as_ref().is_some_and(|t| crate::codec::reverse_hex(&t.previousblockhash) == held.parent) && !g.template_stale();
+        if !on_tip {
+            g.pacer.held_stale += 1;
+            g.pacer.release_done();
+            warn!("held block {} (miner {}, job {}) dropped at its release: the chain has moved past its parent", held.height, held.miner, held.job_id);
+            return;
+        }
+    }
+    let rpc = state.rpc.clone();
+    let block = held.block.clone();
+    match tokio::task::spawn_blocking(move || rpc.submitblock(&block)).await {
+        Ok(Ok(None)) => {
+            info!("held block {} accepted by the node (miner {}, job {}, tag {})", held.height, held.miner, held.job_id, held.tag);
+            // accepted first (the template is stale from here on), then the release is over
+            state.block_accepted(&held.parent);
+            state.lock().pacer.release_done();
+        }
+        Ok(Ok(Some(verdict))) => {
+            warn!("held block {} (miner {}, job {}) rejected by the node: {}", held.height, held.miner, held.job_id, verdict);
             let mut g = state.lock();
-            let Some(h) = g.pacer.take_due(Instant::now()) else { continue };
-            // Never submit on a stale tip: the template must still be on this parent and must not
-            // be one the node has already built past.
-            let on_tip = g.template.as_ref().is_some_and(|t| crate::codec::reverse_hex(&t.previousblockhash) == h.parent) && !g.template_stale();
-            if !on_tip {
+            if crate::stratum::RACE_VERDICTS.contains(&verdict.as_str()) {
                 g.pacer.held_stale += 1;
-                warn!("held block {} (miner {}, job {}) dropped at its release: the chain has moved past its parent", h.height, h.miner, h.job_id);
-                continue;
+            } else {
+                g.rejected += 1;
             }
-            h
-        };
-        let rpc = state.rpc.clone();
-        let block = held.block.clone();
-        let _permit = state.submit_permits.acquire().await;
-        match tokio::task::spawn_blocking(move || rpc.submitblock(&block)).await {
-            Ok(Ok(None)) => {
-                info!("held block {} accepted by the node (miner {}, job {}, tag {})", held.height, held.miner, held.job_id, held.tag);
-                state.block_accepted(&held.parent);
+            g.last_verdict = verdict;
+            g.pacer.release_done();
+        }
+        Ok(Err(e)) => {
+            warn!("held block {}: submitblock failed: {}; trying again in a second", held.height, e);
+            if state.lock().pacer.put_back(held, Instant::now() + Duration::from_secs(1)) {
+                state.pace_wake.notify_one();
+            } else {
+                warn!("the block is dropped: the chain has moved on");
             }
-            Ok(Ok(Some(verdict))) => {
-                warn!("held block {} (miner {}, job {}) rejected by the node: {}", held.height, held.miner, held.job_id, verdict);
-                let mut g = state.lock();
-                if crate::stratum::RACE_VERDICTS.contains(&verdict.as_str()) {
-                    g.pacer.held_stale += 1;
-                } else {
-                    g.rejected += 1;
-                }
-                g.last_verdict = verdict;
-            }
-            Ok(Err(e)) => {
-                warn!("held block {}: submitblock failed: {}; trying again in a second", held.height, e);
-                if !state.lock().pacer.put_back(held, Instant::now() + Duration::from_secs(1)) {
-                    warn!("the block is dropped: the chain has moved on");
-                }
-            }
-            Err(e) => warn!("held block {}: submitblock task: {}", held.height, e),
+        }
+        Err(e) => {
+            warn!("held block {}: submitblock task: {}", held.height, e);
+            state.lock().pacer.release_done();
         }
     }
 }
@@ -289,13 +350,47 @@ mod tests {
         Duration::from_secs(n)
     }
 
+    /// An allow-list: only the names the node lines give a testnet or regtest.
     #[test]
-    fn mainnet_is_refused_and_only_mainnet() {
+    fn only_testnets_and_regtest_are_paced() {
         assert!(check_chain("main", N).unwrap_err().contains("refused on mainnet"));
-        assert!(check_chain("main", Duration::ZERO).is_ok(), "off is allowed everywhere");
-        for chain in ["test", "regtest", "testnet-yb-fast", "testnet-yb-slow"] {
+        for chain in ["", "mainnet", "Main", "testnet-yb-fast", "signet", "anything"] {
+            assert!(check_chain(chain, N).unwrap_err().contains("refused on chain"), "{:?}", chain);
+        }
+        for chain in ["test", "regtest"] {
             assert!(check_chain(chain, N).is_ok(), "{}", chain);
         }
+        for chain in ["main", "test", "regtest", "anything"] {
+            assert!(check_chain(chain, Duration::ZERO).is_ok(), "off is allowed everywhere: {}", chain);
+        }
+    }
+
+    /// While the block of a parent is on its way to the node, nothing else on that parent is
+    /// submitted or held: a solution on a job already one interval old would otherwise go out.
+    #[test]
+    fn one_block_a_parent_while_a_release_is_in_flight() {
+        let t0 = Instant::now();
+        let mut p = Pacer::new(N);
+        p.see_tip("p1", t0);
+        p.offer("p1", t0, t0 + s(1), |_| 0, held(1));
+        let h = p.take_due(t0 + s(60)).unwrap();
+        assert_eq!(p.releasing(), Some("p1"));
+        assert_eq!(p.offer("p1", t0, t0 + s(60), |_| 0, held(2)), Offer::NotChosen, "an old job: not SubmitNow");
+        assert_eq!(p.offer("p1", t0 + s(59), t0 + s(60), |_| 0, held(3)), Offer::NotChosen, "a young job: not held");
+        assert!(p.held().is_none());
+        // a failed submit puts the block back; the parent is then held again, not releasing
+        assert!(p.put_back(h, t0 + s(61)));
+        assert_eq!(p.releasing(), None);
+        assert_eq!(p.offer("p1", t0, t0 + s(60), |_| 0, held(4)), Offer::NotChosen);
+        let h = p.take_due(t0 + s(61)).unwrap();
+        assert_eq!(h.miner, 1);
+        p.release_done();
+        // the node refused it (not a race): the tip is unchanged and the next solution goes out
+        assert_eq!(p.offer("p1", t0, t0 + s(62), |_| 0, held(5)), Offer::SubmitNow);
+        // another parent is not affected by a release in flight
+        p.offer("p1", t0 + s(100), t0 + s(101), |_| 0, held(6));
+        p.take_due(t0 + s(160)).unwrap();
+        assert_eq!(p.offer("p2", t0 + s(160), t0 + s(161), |_| 0, held(7)), Offer::Held { replaced: false });
     }
 
     #[test]
@@ -394,6 +489,7 @@ mod tests {
                     p.offer(&format!("p{}", round), t, t + Duration::from_millis(100 * (m + 1)), next, held(m));
                 }
                 wins[p.take_due(t + N).expect("one block a round").miner as usize] += 1;
+                p.release_done();
                 t += N;
             }
             let expected = rounds as f64 / k as f64;
