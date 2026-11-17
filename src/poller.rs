@@ -34,6 +34,19 @@ pub fn job_time(t: &BlockTemplate) -> u32 {
     t.curtime.and_then(|c| u32::try_from(c).ok()).unwrap_or_else(now_unix)
 }
 
+/// Block pacing (`--min-block-interval`; nothing without it): tells the pacer which parent the
+/// template is on. A block held on another parent is dropped here, never submitted: the chain has
+/// moved, somebody else's block arrived first.
+fn see_tip(g: &mut crate::state::Inner) {
+    if !g.pacer.enabled() {
+        return;
+    }
+    let Some(parent) = g.template.as_ref().map(|t| crate::codec::reverse_hex(&t.previousblockhash)) else { return };
+    if let Some(h) = g.pacer.see_tip(&parent, Instant::now()) {
+        warn!("held block {} (miner {}, job {}) dropped: the chain moved to another block before its release", h.height, h.miner, h.job_id);
+    }
+}
+
 /// Applies a freshly fetched template; returns true when miners need new work.
 pub fn apply_template(state: &State, mut template: BlockTemplate) -> bool {
     let key = template.change_key();
@@ -49,6 +62,7 @@ pub fn apply_template(state: &State, mut template: BlockTemplate) -> bool {
     if g.template.is_some() && g.key == key && !was_down {
         g.template = Some(std::sync::Arc::new(template));
         g.template_at = Some(Instant::now());
+        see_tip(&mut g);
         return false;
     }
     let reason = if was_down {
@@ -65,6 +79,7 @@ pub fn apply_template(state: &State, mut template: BlockTemplate) -> bool {
     g.key = key;
     g.template = Some(std::sync::Arc::new(template));
     g.template_at = Some(Instant::now());
+    see_tip(&mut g);
     g.generation += 1;
     let generation = g.generation;
     // Log the tag on every template change by building a probe job under the policy (a

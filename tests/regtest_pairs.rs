@@ -17,6 +17,9 @@
 //!    in each template: transparent (35 characters), Sapling with a worker label (91 + 6),
 //!    post-quantum FN-DSA (53), post-quantum SLH-DSA (53).
 //! 2. The mixed pool: the three miners at once, one block each.
+//!    Then phase 2p, the same pool with `--min-block-interval` 5 s (`paced` below): header times
+//!    at least the interval apart, each block its finder's own and paid in full, a held block
+//!    dropped when the node finds one first, one chain tip at the end.
 //! 3. `-ydf=5` on P (and W): the three kinds again; each block pays 95 % of the subsidy plus all
 //!    fees, and its fund output equals the stock coinbase's.
 //!
@@ -446,6 +449,121 @@ async fn sequential(ctx: &Ctx, miners: &[Miner], ydf: u64, source: Arc<Counting>
     server.abort();
 }
 
+/// Phase 2p, block pacing (`--min-block-interval`, here 5 s; the Python miner has a block within a
+/// second). The chain's clock is the real one here: the blocks of phases 1 and 2 were mined at the
+/// wall clock, so the node's `curtime` is the clock and not median-time-past + 1.
+///
+/// a. Each kind alone, two blocks each with a fee-paying transaction: every block's header time is
+///    at least the interval after its parent's, the block is the finder's own (paid in full, fees
+///    included), and it reaches the chain although the miner left as soon as it was answered.
+/// b. The three kinds at once, three tips: one block a tip, paying one of the three in full; the
+///    other solutions are answered `true` and counted as shares.
+/// c. A block mined by the node while one is held: the held block is dropped and never submitted.
+///
+/// At the end the node knows one chain tip only: no block was lost to a fork or orphaned.
+async fn paced(ctx: &Ctx, miners: &[Miner], source: Arc<Counting>) {
+    const N: u64 = 5;
+    let limits = yolo::Limits { min_block_interval: Duration::from_secs(N), ..yolo::Limits::default() };
+    let (pool, status, server, state) = serve_with(ctx, Some(source as Arc<dyn CoinbaseSource>), limits).await;
+    let st = status_json(status).await;
+    assert_eq!((st["minBlockInterval"].clone(), st["held"].clone()), (json!(N), Value::Null), "{}", st);
+    let time_of = |h: u64| ctx.p.call("getblockheader", json!([ctx.p.call("getblockhash", json!([h]))]))["time"].as_u64().unwrap();
+    let payee = |h: u64| -> &Miner {
+        let cb = &ctx.p.call("getblock", json!([h.to_string(), 2]))["tx"][0];
+        if cb["vShieldedOutput"].as_array().is_some_and(|v| !v.is_empty()) {
+            miners.iter().find(|m| m.kind == "sapling").unwrap()
+        } else {
+            miners.iter().find(|m| m.script.as_deref().is_some_and(|s| cb["vout"].as_array().unwrap().iter().any(|o| o["scriptPubKey"]["hex"] == s))).expect("a block paying one of the miners")
+        }
+    };
+    let first = ctx.p.height() + 1;
+    let started = Instant::now();
+    let mut blocks = 0u64;
+    let mut candidates = 0u64;
+
+    // a. one kind at a time
+    for m in miners {
+        for _ in 0..2 {
+            let ids = ctx.send_fees(1);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !state.lock().template.as_ref().is_some_and(|t| ids.iter().all(|i| t.txids().contains(i))) {
+                assert!(Instant::now() < deadline, "the pool's template never carried the transaction");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let before = ctx.p.height();
+            let child = ctx.mine(pool, &m.user);
+            let user = m.user.clone();
+            // the miner is answered `true` and leaves; its block is still held
+            tokio::task::spawn_blocking(move || finish(child, &user)).await.unwrap();
+            assert_eq!(ctx.p.height(), before, "{}: the block is held, not yet at the node", m.user);
+            let st = status_json(status).await;
+            assert_eq!(st["held"]["height"], json!(before + 1), "{}", st);
+            wait_for("the held block on chain", Duration::from_secs(N + 20), || ctx.p.height() > before);
+            wait_for("W at the new height", Duration::from_secs(30), || ctx.w.height() > before);
+            assert_eq!(payee(before + 1).user, m.user, "the block is its finder's own");
+            assert!(ctx.check_block(before + 1, m, 0, None) > 0, "{}: the block pays its fee", m.user);
+            blocks += 1;
+            candidates += 1;
+        }
+    }
+
+    // b. the three kinds at once
+    let mut winners = BTreeSet::new();
+    for _ in 0..3 {
+        let before = ctx.p.height();
+        let children: Vec<_> = miners.iter().map(|m| (ctx.mine(pool, &m.user), m.user.clone())).collect();
+        for (child, user) in children {
+            // every miner's solution is answered `true`, whether or not it is the held block
+            tokio::task::spawn_blocking(move || finish(child, &user)).await.unwrap();
+        }
+        wait_for("the held block on chain", Duration::from_secs(N + 20), || ctx.p.height() > before);
+        wait_for("W at the new height", Duration::from_secs(30), || ctx.w.height() > before);
+        // no second block for the tip follows
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(ctx.p.height(), before + 1, "one block a tip");
+        let m = payee(before + 1);
+        ctx.check_block(before + 1, m, 0, None);
+        winners.insert(m.kind);
+        blocks += 1;
+        candidates += miners.len() as u64;
+    }
+    log(&format!("paced, mixed: blocks went to {:?}", winners));
+
+    let last = ctx.p.height();
+    assert_eq!(last, first + blocks - 1);
+    let times: Vec<u64> = (first - 1..=last).map(time_of).collect();
+    let gaps: Vec<u64> = times.windows(2).map(|w| w[1] - w[0]).collect();
+    log(&format!("paced: {} blocks in {:.0} s, header-time gaps {:?}", blocks, started.elapsed().as_secs_f64(), gaps));
+    assert!(gaps.iter().all(|g| *g >= N), "every header time is at least {} s after its parent's: {:?}", N, gaps);
+    assert!(started.elapsed() >= Duration::from_secs(N * blocks), "and the blocks arrived no faster");
+    let st = status_json(status).await;
+    assert_eq!(
+        (st["accepted"].clone(), st["rejected"].clone(), st["stale"].clone(), st["heldStale"].clone(), st["shares"].clone(), st["paceCandidates"].clone()),
+        (json!(blocks), json!(0), json!(0), json!(0), json!(candidates), json!(candidates)),
+        "every block held was accepted, every solution credited: {}",
+        st
+    );
+
+    // c. the node finds a block while one is held
+    let m = &miners[0];
+    let before = ctx.p.height();
+    let child = ctx.mine(pool, &m.user);
+    let user = m.user.clone();
+    tokio::task::spawn_blocking(move || finish(child, &user)).await.unwrap();
+    assert_eq!(status_json(status).await["held"]["height"], json!(before + 1));
+    ctx.p.call("generate", json!([1]));
+    tokio::time::sleep(Duration::from_secs(N + 3)).await;
+    assert_eq!(ctx.p.height(), before + 1, "only the node's block: the held one was never submitted");
+    let cb = &ctx.p.call("getblock", json!([(before + 1).to_string(), 2]))["tx"][0];
+    assert!(!cb["vout"].as_array().unwrap().iter().any(|o| Some(o["scriptPubKey"]["hex"].as_str().unwrap_or("")) == m.script.as_deref()), "the block at {} is the node's", before + 1);
+    let st = status_json(status).await;
+    assert_eq!((st["heldStale"].clone(), st["held"].clone(), st["accepted"].clone(), st["rejected"].clone()), (json!(1), Value::Null, json!(blocks), json!(0)), "{}", st);
+    let tips = ctx.p.call("getchaintips", json!([]));
+    assert_eq!(tips.as_array().map(Vec::len), Some(1), "one chain tip, nothing orphaned: {}", tips);
+    wait_for("W at the tip", Duration::from_secs(30), || ctx.w.height() == before + 1);
+    server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn paired_jobs_pay_each_miner_in_full() {
     let Some(ycashd) = std::env::var_os("YCASHD").map(PathBuf::from) else {
@@ -621,6 +739,10 @@ async fn paired_jobs_pay_each_miner_in_full() {
     }
     assert_eq!(paid.len(), 3, "each of the three kinds found a block");
     log("phase 2 (the mixed pool): ok");
+
+    // 2p. the same pool with --min-block-interval (phases 1 and 2 above ran without it)
+    paced(&ctx, &miners[..3], make_source(&ctx.p, &ctx.w, 0)).await;
+    log("phase 2p (block pacing): ok");
 
     // 3. -ydf=5 on the pool node (D-2): both paths pay 95 % of the subsidy plus all fees
     ctx.p.stop();

@@ -51,13 +51,16 @@ const SHARES_PER_JOB: usize = 128;
 pub const SHARES_PER_FORGIVEN: u32 = 32;
 /// The node's `submitblock` verdicts for a block that lost a race (another block at the height,
 /// or a tip that moved on): not the miner's fault, never counted as bad submits.
-const RACE_VERDICTS: [&str; 4] = ["inconclusive", "duplicate", "duplicate-inconclusive", "bad-prevblk"];
+pub const RACE_VERDICTS: [&str; 4] = ["inconclusive", "duplicate", "duplicate-inconclusive", "bad-prevblk"];
 
 /// A job handed out and the shares already counted on it.
 struct Job {
     work: Work,
     /// SHA256d of each counted share's header (nonce2 and solution included).
     shares: HashSet<[u8; 32]>,
+    /// When the pool read this job's header time from the node (the template's fetch; for a
+    /// paired job, when its pair was built, which is later). Block pacing counts from here.
+    issued: std::time::Instant,
 }
 
 pub fn make_nonce1(client_index: u64) -> String {
@@ -455,6 +458,7 @@ impl Client {
             // `$client->{'worknumber'}`; the `stratumsolo` global job is gone with the modes, Y7).
             self.work_number += 1;
             let params = BuildParams { job_id: self.work_number.to_string(), miner_script_pubkey: self.payout.as_ref().and_then(PayoutKind::swap_script), now: job_time(template) };
+            let issued = g.template_at.unwrap_or_else(std::time::Instant::now);
             let work = match build_work(template, &state.policy, state.equihash, &params) {
                 Ok(w) => Some(w),
                 Err(e) => {
@@ -466,7 +470,7 @@ impl Client {
             if let Some(w) = work {
                 out.push_str(&msg_notify(&w, true));
                 debug!("miner {}: job {} height {} tag {}", self.index, w.job_id, w.height, w.tag_kind());
-                self.jobs.push_back(Job { work: w, shares: HashSet::new() });
+                self.jobs.push_back(Job { work: w, shares: HashSet::new(), issued });
                 while self.jobs.len() > JOBS_KEPT {
                     self.jobs.pop_front();
                 }
@@ -505,7 +509,7 @@ impl Client {
                 }
                 out.push_str(&msg_notify(&w, true));
                 debug!("miner {}: paired job {} height {} ({} txs, {} zat) tag {}", self.index, w.job_id, w.height, w.transaction_count, pair.amount, w.tag_kind());
-                self.jobs.push_back(Job { work: w, shares: HashSet::new() });
+                self.jobs.push_back(Job { work: w, shares: HashSet::new(), issued: pair.built_at });
                 while self.jobs.len() > JOBS_KEPT {
                     self.jobs.pop_front();
                 }
@@ -829,6 +833,72 @@ impl Client {
                 }
             }
         }
+        if !state.limits.min_block_interval.is_zero() {
+            // Block pacing (`crate::pace`): a block whose job is younger than the interval is not
+            // sent to the node now. It is held, or it competes with the held one, or it is passed
+            // over; in each case the miner is answered `true` at once and credited a share, and
+            // stays on its job. A solution that is not the held block is never answered stale or
+            // invalid: it was a good block, and a refusal would make a miner back off.
+            let now = std::time::Instant::now();
+            let issued = self.jobs[slot].issued;
+            // A job whose set of remembered headers is full cannot remember this one, so a repeat
+            // would count as a new candidate each time: such a solution is refused `job-full`, as
+            // a share on a full job is (the miner was moved to a fresh job when the set filled),
+            // unless it would go to the node at once.
+            let full = self.jobs[slot].shares.len() >= SHARES_PER_JOB;
+            let offer = {
+                let mut g = state.lock();
+                // The Equihash check awaited: the tip may have moved meanwhile.
+                let on_tip = g.template.as_ref().is_some_and(|t| crate::codec::reverse_hex(&t.previousblockhash) == work.previousblockhash) && !g.template_stale();
+                if !on_tip {
+                    g.stale += 1;
+                    g.last_verdict = "stale".into();
+                    return Submitted::Stale("Stale share");
+                }
+                if full && (g.pacer.held().is_some() || now < issued + state.limits.min_block_interval) {
+                    g.rejected += 1;
+                    g.last_verdict = "job-full".into();
+                    return Submitted::Refused(ERR_STALE, "job-full".into());
+                }
+                let offer = g.pacer.offer(&work.previousblockhash, issued, now, crate::pace::draw, |due| crate::pace::Held {
+                    block: block.clone(),
+                    parent: work.previousblockhash.clone(),
+                    height: work.height,
+                    miner: self.index,
+                    job_id: job_id.to_string(),
+                    tag: work.tag_kind(),
+                    due,
+                });
+                if offer != crate::pace::Offer::SubmitNow {
+                    g.shares += 1;
+                    g.last_verdict = if matches!(offer, crate::pace::Offer::Held { .. }) { "held".into() } else { "candidate".into() };
+                }
+                offer
+            };
+            match offer {
+                crate::pace::Offer::SubmitNow => {}
+                crate::pace::Offer::Held { replaced } => {
+                    let wait = (issued + state.limits.min_block_interval).saturating_duration_since(now);
+                    info!(
+                        "miner {}: block {} held (job {}, tag {}{}), release in {:.1} s",
+                        self.index,
+                        work.height,
+                        job_id,
+                        work.tag_kind(),
+                        if replaced { ", chosen over the block held before" } else { "" },
+                        wait.as_secs_f64()
+                    );
+                    state.pace_wake.notify_one();
+                    self.credit_candidate(slot, key);
+                    return Submitted::Share;
+                }
+                crate::pace::Offer::NotChosen => {
+                    debug!("miner {}: block-target solution for job {} is not the held block; credited as a share", self.index, job_id);
+                    self.credit_candidate(slot, key);
+                    return Submitted::Share;
+                }
+            }
+        }
         let verdict = tokio::task::spawn_blocking(move || rpc.submitblock(&block)).await;
         if let Ok(Ok(_)) = verdict {
             // the node has answered: a repeat is refused `duplicate`; after an RPC or task error
@@ -861,6 +931,21 @@ impl Client {
                 warn!("miner {}: submitblock task: {}", self.index, e);
                 self.refuse(state, ERR_OTHER, "task-error")
             }
+        }
+    }
+
+    /// A block-target solution that block pacing did not send to the node: remembered for the
+    /// duplicate check and credited exactly as a share is (the miner moves to a fresh job when its
+    /// job's set is full; shares forgive refused submits).
+    fn credit_candidate(&mut self, slot: usize, key: [u8; 32]) {
+        self.remember(slot, key);
+        if self.jobs[slot].shares.len() >= SHARES_PER_JOB {
+            self.mining = false;
+        }
+        self.share_credit += 1;
+        if self.share_credit >= SHARES_PER_FORGIVEN {
+            self.share_credit = 0;
+            self.bad_submits = self.bad_submits.saturating_sub(1);
         }
     }
 
