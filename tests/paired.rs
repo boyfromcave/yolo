@@ -721,7 +721,8 @@ async fn coinbase_does_not_fit_keeps_the_previous_pair() {
 /// is one finder's own block, byte for byte.
 #[tokio::test]
 async fn pacing_holds_one_block_and_submits_it_after_the_interval() {
-    let interval = Duration::from_millis(2500);
+    let interval = Duration::from_millis(4000);
+    let started = std::time::Instant::now();
     let pool = start_limits(None, true, Duration::ZERO, yolo::Limits { min_block_interval: interval, ..yolo::Limits::default() }).await;
     let helper: Value = serde_json::from_str(HELPER_TEMPLATE).unwrap();
     let sapling_cb = helper["coinbasetxn"]["data"].as_str().unwrap().to_string();
@@ -735,11 +736,10 @@ async fn pacing_holds_one_block_and_submits_it_after_the_interval() {
     let (tj, zj, pj) = (tm.job_on(&pool.template).await, zm.job_on(&pool.template).await, pm.job_on(&pool.template).await);
 
     let st = status(pool.status).await;
-    assert_eq!((st["minBlockInterval"].clone(), st["held"].clone(), st["heldStale"].clone()), (json!(2), Value::Null, json!(0)), "{}", st);
+    assert_eq!((st["minBlockInterval"].clone(), st["held"].clone(), st["heldStale"].clone()), (json!(4), Value::Null, json!(0)), "{}", st);
 
-    let first = std::time::Instant::now();
     assert_eq!(tm.submit(10, &tj).await["result"], json!(true), "held: answered at once");
-    assert!(first.elapsed() < Duration::from_millis(1000), "the answer does not wait for the release");
+    let answered = std::time::Instant::now();
     assert_eq!(zm.submit(11, &zj).await["result"], json!(true), "a second block-target solution: true, a share");
     assert_eq!(pm.submit(12, &pj).await["result"], json!(true));
     // the same solution again is a duplicate, as it always was
@@ -750,17 +750,27 @@ async fn pacing_holds_one_block_and_submits_it_after_the_interval() {
     assert!(st["held"]["candidates"].as_u64().unwrap() >= 1 && st["nextBlockInSeconds"].as_f64().unwrap() >= 1.0, "{}", st);
     assert_eq!((st["shares"].clone(), st["paceCandidates"].clone(), st["accepted"].clone(), st["stale"].clone()), (json!(3), json!(3), json!(0), json!(0)), "{}", st);
 
+    // The release moment is the pool's own: the held block's job was read from the node at
+    // `due - interval`, some time after the pool started and before the first answer (the clock
+    // the test must not guess: the job is older than the submit by however long the miners took).
+    let due = pool.state.lock().pacer.held().expect("a held block").due;
+    assert!(due - interval >= started && due - interval <= answered, "the hold is counted from the job's read");
+    assert!(answered < due, "the answer did not wait for the release");
+
     // every miner still holds its job and is not sent a new one because of the hold
     assert!(tm.notify(300).await.is_none(), "no restart after a held block");
 
-    for _ in 0..100 {
+    // nothing reaches the node before `due`: the clock is read before each look at the node
+    loop {
+        let now = std::time::Instant::now();
         if !pool.submitted.lock().unwrap().is_empty() {
+            assert!(now >= due, "submitted {:?} before its release", due - now);
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(now < due + Duration::from_secs(30), "the held block was never submitted");
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(first.elapsed() >= interval - Duration::from_millis(50), "released {:?} after the first solution", first.elapsed());
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until("the block accepted", 30_000, async || status(pool.status).await["accepted"] == json!(1)).await;
     let blocks = pool.submitted.lock().unwrap().clone();
     assert_eq!(blocks.len(), 1, "one block for the tip");
     // the block is one finder's own: its coinbase pays that finder in full
@@ -784,29 +794,27 @@ async fn pacing_holds_one_block_and_submits_it_after_the_interval() {
 /// submitted (it would be a fork block on a stale tip), and the pool mines on the new tip.
 #[tokio::test]
 async fn pacing_drops_the_held_block_when_the_tip_changes() {
-    let interval = Duration::from_millis(1500);
+    let interval = Duration::from_millis(4000);
     let pool = start_limits(None, false, Duration::ZERO, yolo::Limits { min_block_interval: interval, ..yolo::Limits::default() }).await;
     let mut tm = Miner::connect(pool.addr).await;
     assert_eq!(tm.authorize(T_ADDR).await["result"], json!(true));
     let job = tm.job_on(&pool.template).await;
     assert_eq!(tm.submit(10, &job).await["result"], json!(true));
-    assert_eq!(status(pool.status).await["held"]["height"], json!(111));
+    let due = pool.state.lock().pacer.held().expect("a held block").due;
     // somebody else's block: the node's template moves to another parent
     other_miners_block(&pool.template);
     let next = tm.job_on(&pool.template).await;
-    tokio::time::sleep(interval + Duration::from_millis(500)).await;
+    // the pool dropped it when it saw the new tip, before the release (else the scenario did not happen)
+    assert!(pool.state.lock().pacer.held().is_none() && std::time::Instant::now() < due, "the tip changed during the hold");
+    // well past the old block's release: it never goes out (waiting longer cannot change that)
+    tokio::time::sleep((due + Duration::from_millis(500)).saturating_duration_since(std::time::Instant::now())).await;
     assert!(pool.submitted.lock().unwrap().is_empty(), "the held block is never submitted on a stale tip");
     let st = status(pool.status).await;
     assert_eq!((st["heldStale"].clone(), st["held"].clone(), st["accepted"].clone(), st["rejected"].clone()), (json!(1), Value::Null, json!(0), json!(0)), "{}", st);
     // a late submit for the old job is stale, as without pacing; the new tip's job is held in its turn
     assert_eq!(tm.submit(11, &job).await["error"][0], json!(21));
     assert_eq!(tm.submit(12, &next).await["result"], json!(true));
-    for _ in 0..100 {
-        if !pool.submitted.lock().unwrap().is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_until("the new tip's block at the node", 30_000, async || !pool.submitted.lock().unwrap().is_empty()).await;
     assert_eq!(pool.submitted.lock().unwrap().len(), 1);
 }
 
@@ -855,7 +863,7 @@ async fn pacing_is_refused_on_mainnet() {
 /// of counting as one more candidate. The miner was moved to a fresh job when the set filled.
 #[tokio::test]
 async fn pacing_does_not_count_candidates_on_a_full_job() {
-    let pool = start_limits(None, false, Duration::ZERO, yolo::Limits { min_block_interval: Duration::from_secs(30), ..yolo::Limits::default() }).await;
+    let pool = start_limits(None, false, Duration::ZERO, yolo::Limits { min_block_interval: Duration::from_secs(300), ..yolo::Limits::default() }).await;
     let mut tm = Miner::connect(pool.addr).await;
     assert_eq!(tm.authorize(T_ADDR).await["result"], json!(true));
     let job = tm.job_on(&pool.template).await;
@@ -909,8 +917,9 @@ async fn wait_until(what: &str, ms: u64, mut ok: impl AsyncFnMut() -> bool) {
 #[tokio::test]
 async fn pacing_submits_one_block_a_parent_while_the_release_is_in_flight() {
     let interval = Duration::from_millis(1500);
+    let delay = Duration::from_millis(4000);
     let pool = start_limits(None, false, Duration::ZERO, yolo::Limits { min_block_interval: interval, ..yolo::Limits::default() }).await;
-    pool.template.lock().unwrap().as_object_mut().unwrap().insert("x-test-submit-delay-ms".into(), json!(1500));
+    pool.template.lock().unwrap().as_object_mut().unwrap().insert("x-test-submit-delay-ms".into(), json!(delay.as_millis() as u64));
     let mut a = Miner::connect(pool.addr).await;
     assert_eq!(a.authorize(T_ADDR).await["result"], json!(true));
     let mut b = Miner::connect(pool.addr).await;
@@ -918,13 +927,16 @@ async fn pacing_submits_one_block_a_parent_while_the_release_is_in_flight() {
     let (ja, jb) = (a.job_on(&pool.template).await, b.job_on(&pool.template).await);
     assert_eq!(a.submit(10, &ja).await["result"], json!(true));
     // the release has begun: nothing is held any more, and the node has not answered yet
-    wait_until("the release", 5000, async || status(pool.status).await["held"].is_null()).await;
-    assert!(pool.submitted.lock().unwrap().is_empty(), "the node is still at work on the held block");
+    wait_until("the release", 30_000, async || pool.state.lock().pacer.releasing().is_some()).await;
     // b's job is as old as a's: without the guard its block would go to the node now
-    let asked = std::time::Instant::now();
     assert_eq!(b.submit(11, &jb).await["result"], json!(true));
-    assert!(asked.elapsed() < Duration::from_millis(700), "answered as a share, not after a submitblock of its own: {:?}", asked.elapsed());
-    tokio::time::sleep(Duration::from_millis(3500)).await;
+    // the answer came while the held block's submitblock was still in flight (else the scenario
+    // did not happen): it was a share, not a submitblock of its own, which would have taken `delay`
+    assert!(pool.state.lock().pacer.releasing().is_some() && pool.submitted.lock().unwrap().is_empty(), "answered during the release");
+    wait_until("the held block at the node", 30_000, async || pool.submitted.lock().unwrap().len() == 1).await;
+    wait_until("the block accepted", 30_000, async || status(pool.status).await["accepted"] == json!(1)).await;
+    // a second submitblock, had b's solution started one, would land within `delay` of its submit
+    tokio::time::sleep(delay + Duration::from_millis(500)).await;
     assert_eq!(pool.submitted.lock().unwrap().len(), 1, "exactly one submitblock for the parent");
     let st = status(pool.status).await;
     assert_eq!((st["accepted"].clone(), st["rejected"].clone(), st["shares"].clone(), st["heldStale"].clone()), (json!(1), json!(0), json!(2), json!(0)), "{}", st);
@@ -934,19 +946,21 @@ async fn pacing_submits_one_block_a_parent_while_the_release_is_in_flight() {
 /// made again once the permit is there, and the block is dropped, not sent.
 #[tokio::test]
 async fn pacing_checks_the_tip_again_after_the_wait_for_a_permit() {
-    let limits = yolo::Limits { min_block_interval: Duration::from_millis(1000), submits_in_flight: 1, ..yolo::Limits::default() };
+    let limits = yolo::Limits { min_block_interval: Duration::from_millis(3000), submits_in_flight: 1, ..yolo::Limits::default() };
     let pool = start_limits(None, false, Duration::ZERO, limits).await;
     let mut tm = Miner::connect(pool.addr).await;
     assert_eq!(tm.authorize(T_ADDR).await["result"], json!(true));
     let job = tm.job_on(&pool.template).await;
     assert_eq!(tm.submit(10, &job).await["result"], json!(true));
     let permit = pool.state.submit_permits.acquire().await.unwrap();
-    // the release task has taken the block and waits for the permit
-    wait_until("the release", 5000, async || status(pool.status).await["held"].is_null()).await;
+    // the permit was taken while the block was still held (else the scenario did not happen)
+    assert!(pool.state.lock().pacer.held().is_some(), "the only permit is the test's before the release");
+    // the release task takes the block and waits for the permit
+    wait_until("the release", 30_000, async || pool.state.lock().pacer.releasing().is_some()).await;
     other_miners_block(&pool.template);
     tm.job_on(&pool.template).await;
     drop(permit);
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    wait_until("the release over", 30_000, async || pool.state.lock().pacer.releasing().is_none()).await;
     assert!(pool.submitted.lock().unwrap().is_empty(), "not submitted on the tip the chain left");
     let st = status(pool.status).await;
     assert_eq!((st["heldStale"].clone(), st["accepted"].clone(), st["rejected"].clone()), (json!(1), json!(0), json!(0)), "{}", st);
@@ -964,16 +978,18 @@ async fn pacing_does_not_hold_a_block_whose_tip_moved_during_the_check() {
     let permit = pool.state.submit_permits.acquire().await.unwrap();
     let sol = format!("24{}", "ab".repeat(36));
     tm.send(&format!("{{\"id\":10,\"method\":\"mining.submit\",\"params\":[\"w\",{},{},\"{}\",\"{}\"]}}", job[0], job[5], "0".repeat(36), sol)).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // (if the submit has not reached the pool yet when the tip moves, it is stale by the first
+    // check instead: the same answer)
+    tokio::time::sleep(Duration::from_millis(500)).await;
     other_miners_block(&pool.template);
-    wait_until("the pool on the new tip", 5000, async || {
+    wait_until("the pool on the new tip", 30_000, async || {
         let want = pool.template.lock().unwrap()["previousblockhash"].clone();
         pool.state.lock().template.as_ref().map(|t| json!(t.previousblockhash)) == Some(want)
     })
     .await;
     drop(permit);
     let answer = loop {
-        let v = tm.next(5000).await.expect("an answer to the submit");
+        let v = tm.next(30_000).await.expect("an answer to the submit");
         if v["id"] == json!(10) {
             break v;
         }
@@ -995,10 +1011,9 @@ async fn pacing_tries_a_failed_release_again() {
     let job = tm.job_on(&pool.template).await;
     assert_eq!(tm.submit(10, &job).await["result"], json!(true));
     // the first attempt gets no answer; the block is held again
-    wait_until("the failed attempt", 8000, async || pool.template.lock().unwrap().get("x-test-submit-fail-once").is_none()).await;
-    assert!(pool.submitted.lock().unwrap().is_empty());
-    wait_until("the second attempt", 8000, async || pool.submitted.lock().unwrap().len() == 1).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until("the failed attempt", 30_000, async || pool.template.lock().unwrap().get("x-test-submit-fail-once").is_none()).await;
+    wait_until("the second attempt", 30_000, async || pool.submitted.lock().unwrap().len() == 1).await;
+    wait_until("the block accepted", 30_000, async || status(pool.status).await["accepted"] == json!(1)).await;
     let st = status(pool.status).await;
     assert_eq!((st["accepted"].clone(), st["rejected"].clone(), st["heldStale"].clone(), st["held"].clone()), (json!(1), json!(0), json!(0), Value::Null), "{}", st);
     assert_eq!(pool.submitted.lock().unwrap().len(), 1);
@@ -1025,17 +1040,17 @@ async fn pacing_stops_the_pool_when_the_node_comes_back_on_mainnet() {
     let bound = yolo::bind(rpc, config).await.unwrap();
     let state = bound.state();
     let server = tokio::spawn(bound.serve());
-    wait_until("the first template", 5000, async || state.lock().template.is_some()).await;
+    wait_until("the first template", 30_000, async || state.lock().template.is_some()).await;
     let generation = state.lock().generation;
     template.lock().unwrap().as_object_mut().unwrap().insert("x-test-down".into(), json!(true));
-    wait_until("the node seen down", 5000, async || !state.lock().node_up).await;
+    wait_until("the node seen down", 30_000, async || !state.lock().node_up).await;
     {
         let mut t = template.lock().unwrap();
         let o = t.as_object_mut().unwrap();
         o.insert("x-test-chain".into(), json!("main"));
         o.remove("x-test-down");
     }
-    let stopped = tokio::time::timeout(Duration::from_secs(15), server).await.expect("the pool stops").unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(60), server).await.expect("the pool stops").unwrap();
     let why = stopped.expect_err("an error, not a quiet end");
     assert!(why.contains("\"main\"") && why.contains("--min-block-interval is refused on mainnet"), "{}", why);
     let g = state.lock();

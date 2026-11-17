@@ -497,9 +497,8 @@ async fn paced(ctx: &Ctx, miners: &[Miner], source: Arc<Counting>) {
             let user = m.user.clone();
             // the miner is answered `true` and leaves; its block is still held
             tokio::task::spawn_blocking(move || finish(child, &user)).await.unwrap();
-            assert_eq!(ctx.p.height(), before, "{}: the block is held, not yet at the node", m.user);
-            let st = status_json(status).await;
-            assert_eq!(st["held"]["height"], json!(before + 1), "{}", st);
+            // (that it was held is shown below by the header times and the elapsed time, not by
+            // looking at the node at a moment the test would have to guess)
             wait_for("the held block on chain", Duration::from_secs(N + 20), || ctx.p.height() > before);
             wait_for("W at the new height", Duration::from_secs(30), || ctx.w.height() > before);
             assert_eq!(payee(before + 1).user, m.user, "the block is its finder's own");
