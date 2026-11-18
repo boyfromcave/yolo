@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — beta4
+
+- A quote above $100 is read as a quote: yolo's tag reader capped the price at 100,000,000 µUSD,
+  the node's ceiling is 4,294,967,295 (`src/yellowback/params.h` `PRICE_MAX`). Only yolo's logs and
+  `/status` (`lastTagKind`) were affected; the coinbase always carried the node's flags verbatim.
+- `tests/regtest_pairs.rs` phase 4: blocks for transparent, Sapling, FN-DSA and SLH-DSA miners all
+  carry the pool node's quote tag; the same quote again makes no new job, a new price exactly one.
+
 ## Unreleased — beta3 (the 6.22.0-beta3 release train)
 
 Everything in this section is new since the beta2 train, which pinned yolo `fcb5a9e`.

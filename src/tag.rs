@@ -13,7 +13,10 @@ pub const TAG_SIZE: usize = 36;
 pub const TAG_PUSH_SIZE: usize = TAG_SIZE + 1;
 pub const TAG_VERSION: u8 = 1;
 pub const PRICE_MIN: i64 = 100;
-pub const PRICE_MAX: i64 = 100_000_000;
+/// The node's PRICE_MAX (ycash6 / ycash-dd `src/yellowback/params.h`: 4,294,967,295 µUSD, about
+/// $4,295). It was $100 here, so a valid quote above $100 read as "no tag" in yolo's logs and
+/// /status; the node and the chain were never affected (yolo copies the flags verbatim).
+pub const PRICE_MAX: i64 = 4_294_967_295;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tag {
@@ -181,6 +184,14 @@ mod tests {
         let mut sig = vec![0x54];
         sig.extend(&f);
         assert_eq!(tag_kind(&sig), "none");
+        // the node's ceiling itself, and a price above the old $100 limit, are quotes
+        for price in [PRICE_MAX, 250_000_000] {
+            let mut f = flags();
+            f[7..15].copy_from_slice(&price.to_le_bytes());
+            let mut sig = vec![0x54];
+            sig.extend(&f);
+            assert_eq!(tag_kind(&sig), "quote", "price {}", price);
+        }
         let mut f = flags();
         f[6] = 2; // flags bit 1 is reserved
         let mut sig = vec![0x54];

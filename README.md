@@ -537,8 +537,9 @@ from them and `tests/wire.rs` replays them byte for byte). What changed on purpo
   Each such change is one `mining.notify` with `clean_jobs` to every miner (and one
   `getcoinbasetemplatefor` per paired address); the same quote sent again leaves the flags'
   bytes as they were and makes no new job (`tests/regtest_pairs.rs`, phase 4). The quote
-  agent pushes on a price move above 0.1 % or a 10-minute heartbeat (ycash6 / ycash-dd
-  `contrib/yellowback/yellowback-quote`, beta4), so this is at most one extra job per block.
+  agent pushes once a block (ycash6 / ycash-dd `contrib/yellowback/yellowback-quote`,
+  `poll_seconds` 75 from beta4), so this is at most one extra job per block, and only when
+  the price changed.
 - `mining.submit` is answered `true` only when `submitblock` returned `null`; every
   rejection string is logged, counted and reported to the miner as `false` (the Perl answered
   `true` to `Block decode failed`, `time-too-old`, …).
