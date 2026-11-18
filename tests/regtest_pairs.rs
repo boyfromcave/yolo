@@ -29,7 +29,8 @@
 //! node's call only, phase 4 proves what the stub cannot: the answer's exact keys and every §8.3
 //! check on it for each kind, a Sapling coinbase built per request, the error codes and strings
 //! yolo matches on, `flags` from the node's current quote tag (an attestor set and `yed_setquote`;
-//! a paired block carries the tag), six Sapling addresses renewing under the cap of 2 with
+//! a block for each of the four kinds, transparent, Sapling, FN-DSA and SLH-DSA, carries the tag,
+//! and the same quote sent again makes no new job while a new price makes one), six Sapling addresses renewing under the cap of 2 with
 //! `-rpcthreads=4` while the template poll, `getblockcount` and `submitblock` are timed, and
 //! `coinbase-does-not-fit` for named transactions over the sigop limit.
 //!
@@ -850,11 +851,39 @@ async fn real_call_facts(ctx: &mut Ctx, ycashd: &Path, base: &[String], miners: 
     let cb = Coinbase::parse(&hex::decode(&a.data).unwrap()).unwrap();
     let push = yolo::tag::height_push(t.height);
     assert!(cb.script_sig.starts_with(&push) && cb.script_sig[push.len()..].windows(37).any(|w| w == hex::decode(&a.flags).unwrap().as_slice()), "the scriptSig carries the tag after the height push");
-    // a paired (Sapling) block with the quote: the chain reads the tag back
-    sequential(ctx, &miners[1..2], 5, Arc::new(Counting { inner: Arc::new(ctx.p.rpc.clone()), asked: Mutex::new(HashMap::new()) })).await;
-    let tag = ctx.p.call("yed_gettag", json!([ctx.p.height().to_string()]));
-    assert_eq!((tag["found"].clone(), tag["kind"].clone()), (json!(true), json!("quote")), "the paired block's tag: {}", tag);
-    log(&format!("quote: flags {} from the node's current tag; a paired Sapling block at {} carries it (yed_gettag {})", a.flags, ctx.p.height(), tag["kind"]));
+    // a block for every kind of miner with the quote (beta4 item 3a): transparent on the swap path,
+    // Sapling, FN-DSA and SLH-DSA on paired jobs; the chain reads each block's tag back
+    let first = ctx.p.height() + 1;
+    sequential(ctx, miners, 5, Arc::new(Counting { inner: Arc::new(ctx.p.rpc.clone()), asked: Mutex::new(HashMap::new()) })).await;
+    for (h, m) in (first..).zip(miners) {
+        let tag = ctx.p.call("yed_gettag", json!([h.to_string()]));
+        assert_eq!((tag["found"].clone(), tag["kind"].clone(), tag["priceMicroUsd"].clone()), (json!(true), json!("quote"), json!(50_000)), "{}: the block's tag: {}", m.user, tag);
+        log(&format!("quote: block {} for {} ({}) carries the tag: {}", h, m.user, m.kind, tag));
+    }
+    log(&format!("quote: flags {} from the node's current tag; blocks {}..{} (every kind) carry it", a.flags, first, ctx.p.height()));
+
+    // (5) what a quote does to the pool's jobs: the poller makes new work (one `mining.notify`
+    // with clean_jobs to every miner) only when `coinbaseaux.flags` changes. The same price again
+    // (a heartbeat) rebuilds the node's template (quoteGeneration) but leaves the tag's bytes, so
+    // no new job; a new price is one new job.
+    {
+        let (_, _, server, state) = serve_with(ctx, None, yolo::Limits::default()).await;
+        let settle = || tokio::time::sleep(Duration::from_secs(3));
+        settle().await;
+        let g0 = state.lock().generation;
+        ctx.p.call("yed_setquote", json!([50_000, 1]));
+        settle().await;
+        let g1 = state.lock().generation;
+        assert_eq!(g1, g0, "the same quote again makes no new work");
+        ctx.p.call("yed_setquote", json!([50_050, 1]));
+        settle().await;
+        let g2 = state.lock().generation;
+        assert_eq!(g2, g1 + 1, "a new price makes exactly one new work (flags changed)");
+        ctx.p.call("yed_setquote", json!([50_000, 1]));
+        settle().await;
+        server.abort();
+        log(&format!("quote and jobs: same price again -> {} new work, a new price -> {} new work (clean_jobs to every miner)", g1 - g0, g2 - g1));
+    }
 
     // (6) the request cap against -rpcthreads=4: six Sapling addresses renewing at once while the
     // template poll, getblockcount and submitblock are timed on their own connections
