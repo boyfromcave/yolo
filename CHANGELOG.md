@@ -2,6 +2,16 @@
 
 ## Unreleased — beta4
 
+- Tag v2 (rpcversion 11, a post-quantum payout key): yolo's tag reader decodes the 49-byte v2 tag
+  (`31 YED! 02`, payout scheme and 32-byte key hash) beside v1, first occurrence deciding, as the
+  node does; the log line names the version and the payee scheme, and `/status` gains `tagVersion`
+  and `tagPayoutScheme`. The coinbase was never affected: yolo copies the node's flags verbatim, and
+  a v2 tag (50 bytes with its push) fits the 100-byte scriptSig with `--text` (truncated to 49 bytes
+  at mainnet heights). The node lines' shared vectors (`tests/vectors/yellowback_tag_vectors.json`,
+  ycash-dd / ycash6 `src/test/data/`) are checked byte for byte.
+- `tests/regtest.rs`: a tag v2 phase on a beta4 node (both post-quantum schemes, plain and 90-byte
+  `--text`); `tests/regtest_pairs.rs` phase 4 runs with a post-quantum payout key on a beta4 node, so
+  paired coinbases for every kind of miner carry the v2 tag.
 - A quote above $100 is read as a quote: yolo's tag reader capped the price at 100,000,000 µUSD,
   the node's ceiling is 4,294,967,295 (`src/yellowback/params.h` `PRICE_MAX`). Only yolo's logs and
   `/status` (`lastTagKind`) were affected; the coinbase always carried the node's flags verbatim.
