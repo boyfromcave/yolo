@@ -80,9 +80,15 @@ recipients, with no change. Today only the ycashd wallet (Ycash 6.22.0-beta3 or 
 line) and yewd (the wallet beside koganyd, in the [yew](https://github.com/boyfromcave/yew)
 repository) can do that: `z_sendmany` from the address to a Sapling address, once the reward has
 101 confirmations, sending the exact amount the wallet names when it refuses a send that would
-leave change. The YEW phone app and the web wallet cannot yet: they do not know that a coin is a
-coinbase, so a reward paid to one of their addresses shows as spendable and their sends are
-refused.
+leave change. A YEW app or web address is not suitable as a payout address: the YEW phone app
+and the web wallet cannot make that exact-amount shielded send, and they do not know that a coin
+is a coinbase, so a reward paid to one of their addresses shows as spendable and their sends are
+refused. Pool operators: tell post-quantum miners this where they choose a username.
+
+A miner already paid at a YEW address has not lost the reward: restore the YEW recovery phrase in
+yewd (`-mnemonicfile=<file>`, a new wallet, which scans from genesis), `z_sendmany` the exact
+amount from the post-quantum address to a Sapling address of that wallet, then send it on. The
+full procedure is in the [yewd README](https://github.com/boyfromcave/yew/blob/upgrade/vault/yewd/README.md).
 
 **How each miner is paid in full.** A miner who finds a block gets the block subsidy plus every
 fee of the transactions in that block. The only thing that can come out of it is the
