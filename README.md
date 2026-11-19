@@ -87,8 +87,10 @@ refused. Pool operators: tell post-quantum miners this where they choose a usern
 
 A miner already paid at a YEW address has not lost the reward: restore the YEW recovery phrase in
 yewd (`-mnemonicfile=<file>`, a new wallet, which scans from genesis), `z_sendmany` the exact
-amount from the post-quantum address to a Sapling address of that wallet, then send it on. The
-full procedure is in the [yewd README](https://github.com/boyfromcave/yew/blob/upgrade/vault/yewd/README.md).
+amount from the post-quantum address to a Sapling address of that wallet (yewd's `z_shieldcoinbase`
+also moves a post-quantum reward, at the exact amount with no change: a yewd-only extension;
+ycashd's does not), then send it on. The
+full procedure is in the [yewd README](https://github.com/boyfromcave/yew/blob/upgrade/vault/yewd/README.md#recovering-a-mining-reward-paid-to-a-yew-address).
 
 **How each miner is paid in full.** A miner who finds a block gets the block subsidy plus every
 fee of the transactions in that block. The only thing that can come out of it is the
