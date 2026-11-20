@@ -136,18 +136,15 @@ jobs:
             pool_node_args: -allowdeprecated=none
           # The third node line (AGENTS.md "The third node line"): yolo serves a kogany node's
           # templates (YOLO_REGTEST_KOGANY, tests/regtest.rs "The kogany mode"), the ycash6 nodes
-          # (always vaults/kogany-compat, the kogany work's ycash6 branch: the mode needs the Vault
-          # upgrade) hold the wallet and check every block. koganyd at kogany_ref, kogany's
-          # vaults/kogany-compat at dd834da8b (the koganyd identity): kogany's koganyd-bin artifact
-          # of a push, schedule or dispatch run at that commit when one exists, else built here. Until
-          # boyfromcave/zakura-common-ycash exists on GitHub (kogany plan K-2), kogany's
-          # [patch.crates-io] cannot resolve, kogany publishes nothing, and this entry fails at
-          # the build step.
+          # (always upgrade/vault: the mode needs the Vault upgrade; vaults/kogany-compat is retired)
+          # hold the wallet and check every block. koganyd at kogany_ref, kogany's upgrade/vault at
+          # the beta4 consensus merge (kogany #49, rpcversion 11, 09a4c1408): kogany's koganyd-bin
+          # artifact of a push, schedule or dispatch run at that commit when one exists, else built here.
           - node: ycash6
             node_line: kogany
-            of_record: vaults/kogany-compat
+            of_record: upgrade/vault
             pool_node_args: ""
-            kogany_ref: dd834da8b77e882b9e6a00b3ce70f2b30b930c37
+            kogany_ref: 09a4c14084411c92af275994fc3b2e61d0f57118
     runs-on: ubuntu-latest
     timeout-minutes: ${{ matrix.node_line == 'kogany' && 180 || 60 }}
     env:
@@ -158,7 +155,7 @@ jobs:
       REF_NAME: ${{ github.ref_name }}
       # The node branch, from a fixed list: this run's branch when it is one of the two lines,
       # else the node line's branch of record. Nothing a dispatcher types reaches the checkout.
-      # The kogany entry always takes vaults/kogany-compat (its of_record).
+      # The kogany entry always takes upgrade/vault (its of_record).
       NODE_BRANCH: ${{ matrix.node_line != 'kogany' && contains(fromJSON('["upgrade/vault", "harden/yellowback"]'), github.ref_name) && github.ref_name || matrix.of_record }}
       NODE_LINE: ${{ matrix.node_line || matrix.node }}
     steps:
@@ -209,7 +206,7 @@ jobs:
         with:
           repository: boyfromcave/kogany
           # The literal of matrix.kogany_ref (bump both): a fixed commit, nothing a dispatcher types.
-          ref: dd834da8b77e882b9e6a00b3ce70f2b30b930c37
+          ref: 09a4c14084411c92af275994fc3b2e61d0f57118
           path: kogany
           persist-credentials: false
           sparse-checkout: ${{ steps.koganyd.outputs.got == 'true' && '.github/actions/setup-zakura-build' || '' }}

@@ -149,7 +149,9 @@ and the block it produces is byte for byte the node's. Under `--payout` every jo
 
 The node's **`mineraddress=` is still required** in both cases: without it there is no
 template to serve (the node builds the coinbase, `yolo` only edits it), and the Yellowback
-tag's payout key defaults to it (`-yellowbackpayoutaddress=` overrides).
+tag's payout key defaults to it (`-yellowbackpayoutaddress=` overrides). From beta4 (rpcversion
+11) the payout key may be a post-quantum address (`sqf…`/`sqs…` on mainnet): set it with
+`-yellowbackpayoutaddress=`, since the node still refuses a post-quantum `-mineraddress`.
 
 **The tag's `payoutKey` is always the node's, whatever `--payout` says.** The Yellowback tag
 inside the coinbase scriptSig comes from the node (`coinbaseaux.flags`) and carries the
@@ -161,10 +163,17 @@ logs this once at startup and `/status` says `"tagPayoutKey":"node"`.
 
 ## Coinbase text and the Yellowback tag
 
-Under Yellowback a miner's block carries a 36-byte tag in its coinbase scriptSig (the push
-`0x24 'Y' 'E' 'D' '!'` followed by version, flags, the YEC/USD price in micro-USD, a source
-mask and the miner's payout key) — the miner's price quote; a node without a fresh quote serves
-no tag. The node offers the tag to pool software through `getblocktemplate` twice: inside `coinbasetxn.data` (the whole
+Under Yellowback a miner's block carries a tag in its coinbase scriptSig — the miner's price
+quote; a node without a fresh quote serves no tag. Two versions exist (the first pattern in the
+scriptSig decides, as in the node):
+
+- **v1**, 36 bytes (37 with its push): `0x24 'Y' 'E' 'D' '!'`, version 1, flags, the YEC/USD price
+  in micro-USD, a source mask and a P2PKH payout key (20-byte hash);
+- **v2**, from beta4 (rpcversion 11), 49 bytes (50 with its push): `0x31 'Y' 'E' 'D' '!'`,
+  version 2, flags, price, source mask, the payout scheme (1 = SLH-DSA-SHA2-128s, 2 = FN-DSA-512)
+  and the 32-byte post-quantum key hash. The node emits it when its payout address is post-quantum.
+
+yolo never builds or changes a tag; it copies the node's bytes, whichever version they are. The node offers the tag to pool software through `getblocktemplate` twice: inside `coinbasetxn.data` (the whole
 coinbase the node built, tag included) and as `coinbaseaux.flags` (the tag bytes alone, for
 software that assembles its own scriptSig). `--text` decides which carrier `yolo` uses:
 
@@ -174,8 +183,8 @@ software that assembles its own scriptSig). `--text` decides which carrier `yolo
 | `--text "…"` | rebuilt as `height push ‖ coinbaseaux.flags (verbatim) ‖ push(text)` | `cenote` |
 
 The rebuilt scriptSig is kept within the consensus limit of 100 bytes: the tag is 37 bytes
-with its push and the height push up to 5, so the text is truncated to what fits (62 bytes on
-mainnet heights) and a warning is logged when that happens. The Perl `cenote` sliced the
+with its push (50 for v2) and the height push up to 5, so the text is truncated to what fits (62
+bytes on mainnet heights, 49 with a v2 tag) and a warning is logged when that happens. The Perl `cenote` sliced the
 height push off and appended its text, discarding the node's tag; the Rust one keeps it.
 An empty `--text ""` gives `height push ‖ flags` with nothing pushed after.
 
@@ -185,7 +194,9 @@ tag-dropping scriptSig for the negative test. It only works in a binary built wi
 reports `"noFlags":true` and every block is logged `tag: none`.
 
 On every template change the server decodes the scriptSig it is about to serve with the node's
-own byte scan and logs `tag: quote|signal|none` (`signal` is a tag with a zero price); the same fields are on `GET /status`
+own byte scan and logs `tag: v1|v2 quote|signal|none` with the payee as `<scheme>:<hash>`
+(`signal` is a tag with a zero price); the same fields are on `GET /status`, with `tagVersion`
+(1, 2 or null) and `tagPayoutScheme` (`p2pkh`, `slh-dsa-sha2-128s`, `fn-dsa-512` or null)
 (`--status-port`):
 
 ```
@@ -195,7 +206,7 @@ own byte scan and logs `tag: quote|signal|none` (`signal` is a tag with a zero p
  "minerList":[{"id":0,"kind":"p2pkh","address":"s1…","label":null},{"id":1,"kind":"sapling","address":"ys1…","label":"rig1"}],
  "coinbaseCall":true,"pairs":{"addresses":1,"waiting":0,"inFlight":0,"concurrency":2,"requests":3,"failures":0,"lastRoundTripMs":180},
  "connections":2,
- "tag":"quote","lastSubmitVerdict":"accepted","accepted":1,"rejected":0,"stale":0,"highHash":0,"uptimeSeconds":12}
+ "tag":"quote","tagVersion":2,"tagPayoutScheme":"fn-dsa-512","lastSubmitVerdict":"accepted","accepted":1,"rejected":0,"stale":0,"highHash":0,"uptimeSeconds":12}
 ```
 
 `payout` is the string `"username"` or the fixed `--payout` address; `text` is whether
@@ -499,7 +510,12 @@ without the deprecated root keys), one block
 per case: the four cells of the payout × text grid (username / `--payout`, with and without
 `--text`), `--text --no-flags` (the hidden test switch that reproduces the Perl: the block is
 accepted and `yed_gettag` says `found: false`) and a 90-byte `--text` (scriptSig exactly
-100 bytes, tag intact). It skips when `YCASHD` is unset.
+100 bytes, tag intact). Then, on a node of rpcversion 11 or later (beta4), the tag v2 phase: node A
+restarts with a post-quantum `-yellowbackpayoutaddress` for each scheme (FN-DSA-512, then
+SLH-DSA-SHA2-128s; the nodes run `-pqfalconheight=0`, FN-DSA from the Vault activation as on
+mainnet), and a plain and a 90-byte `--text` block each carry the 50-byte v2 tag: `yed_gettag`
+version 2 with the scheme and the post-quantum payout address, `/status` `tagVersion` 2, the text
+truncated to keep the tag intact. It skips when `YCASHD` is unset.
 
 `tests/regtest_pairs.rs` (`cargo test --features regtest --test regtest_pairs`) is the paired-job
 acceptance test: one pool, a transparent, a Sapling (with a worker label) and two post-quantum

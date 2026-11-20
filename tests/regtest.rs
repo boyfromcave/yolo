@@ -340,6 +340,8 @@ struct Case {
 
 struct Outcome {
     height: u64,
+    /// yolo's `/status` after the block.
+    status: Value,
     tag: Value,
     script_sig: Vec<u8>,
     vout0_addresses: Vec<String>,
@@ -407,7 +409,7 @@ async fn run_case(case: &Case, a: &dyn Rpc, b: &dyn Rpc, facts: &dyn Rpc, python
     let script_sig = hex::decode(coinbase["vin"][0]["coinbase"].as_str().unwrap()).unwrap();
     let vout0_addresses = coinbase["vout"][0]["scriptPubKey"]["addresses"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
     log(&format!("{}: height {} tag {} scriptSig {} ({} bytes) vout0 {:?}", case.name, height, tag, hex::encode(&script_sig), script_sig.len(), vout0_addresses));
-    Outcome { height, tag, script_sig, vout0_addresses }
+    Outcome { height, status, tag, script_sig, vout0_addresses }
 }
 
 /// Serves yolo with no Yellowback state (no quote, no tag) and mines `blocks` blocks through the
@@ -507,6 +509,14 @@ async fn payout_text_grid_against_a_regtest_node() {
     let mut b = Node::new(1, &scratch, rpc_base + 1, p2p_base + 1, Some(p2p_base));
     a.base_args = node_args(vault);
     b.base_args = node_args(vault);
+    // FN-DSA-512 from the vault activation, as on mainnet (D-Q-2), so the tag v2 phase below gets
+    // both post-quantum payout schemes (`getnewaddress pq` = FN-DSA once Falcon is active). Not in
+    // the kogany mode, whose node has no such switch, nor on a node without the vault upgrade.
+    if vault.is_some() && kogany_bin.is_none() {
+        for args in [&mut a.base_args, &mut b.base_args] {
+            args.push("-pqfalconheight=0".into());
+        }
+    }
     // A burst of generated blocks runs median-time-past ahead of the clock (Y-F5); generate the
     // chain an hour in the past so the node's `curtime` (the pool's header time) stays within its rules. The
     // first start runs on `-mocktime` rather than `setmocktime` + `setmocktime 0`: 6.20.0 refuses
@@ -663,6 +673,65 @@ async fn payout_text_grid_against_a_regtest_node() {
             _ => unreachable!(),
         }
         log(&format!("{}: ok", case.name));
+    }
+
+    // Tag v2 (beta4, rpcversion 11): a post-quantum -yellowbackpayoutaddress makes the node emit a
+    // 50-byte v2 tag (`31 YED! 02 …`, payoutScheme + 32-byte key hash). yolo copies it as it copies
+    // v1, decodes it for /status, and keeps it intact under --text at the 100-byte limit. Node A
+    // restarts once per scheme with the payout key set; nodes before rpcversion 11 skip (they
+    // refuse a post-quantum payout address), as does the kogany mode (its payout key is a config
+    // file setting, `yed.payout_address`). The address comes from node B (A refuses getnewaddress
+    // under -allowdeprecated=none); the payout key needs no wallet on the pool node.
+    let rpcversion = a.call("yed_getinfo", json!([]))["rpcversion"].as_u64().unwrap_or(0);
+    if vault.is_none() || kogany.is_some() || rpcversion < 11 {
+        log(&format!("tag v2: skipped (vault {:?}, kogany {}, rpcversion {})", vault, kogany.is_some(), rpcversion));
+    } else {
+        let pool_args = a.extra_args.clone();
+        let mut schemes_seen = Vec::new();
+        for kind in ["pq", "pqslh"] {
+            let pq = b.call("getnewaddress", json!([kind])).as_str().unwrap().to_string();
+            let scheme = match pq.as_bytes().get(2) {
+                Some(b'f') => "fn-dsa-512",
+                Some(b's') => "slh-dsa-sha2-128s",
+                _ => panic!("getnewaddress {}: {} is not a scheme-visible post-quantum address", kind, pq),
+            };
+            if schemes_seen.contains(&scheme) {
+                continue;
+            }
+            schemes_seen.push(scheme);
+            let height = a.height();
+            a.stop();
+            a.extra_args = pool_args.clone();
+            a.extra_args.push(format!("-yellowbackpayoutaddress={}", pq));
+            a.start(&ycashd);
+            assert!(wait_height(&[&a, &b], height, Duration::from_secs(60)), "tag v2: node A did not come back at {}", height);
+            a.call("yed_setquote", json!([QUOTE_MICRO_USD, 1]));
+            let template = a.call("getblocktemplate", json!([]));
+            let flags2 = hex::decode(template["coinbaseaux"]["flags"].as_str().unwrap_or("")).unwrap();
+            assert_eq!(flags2.len(), 50, "tag v2: the template carries a 50-byte v2 tag: {:?}", template["coinbaseaux"]);
+            assert_eq!(&flags2[..6], &[0x31, b'Y', b'E', b'D', b'!', 0x02], "tag v2: the push and the version");
+            for (name, text) in [("username-v2", None), ("text-90-v2", Some(long_text.as_str()))] {
+                let case = Case { name, payout: None, text: text.map(String::from), no_flags: false, user: miner_addr.clone() };
+                let o = run_case(&case, &a, &b, &a, &python, &miner).await;
+                assert_quote(name, &o.tag, &pq);
+                assert_eq!(o.tag["version"], json!(2), "{}: yed_gettag version", name);
+                assert_eq!(o.tag["payoutScheme"], json!(scheme), "{}: yed_gettag payoutScheme", name);
+                assert_eq!(o.status["tag"], json!("quote"), "{}: /status tag", name);
+                assert_eq!(o.status["tagVersion"], json!(2), "{}: /status tagVersion", name);
+                assert_eq!(o.status["tagPayoutScheme"], json!(scheme), "{}: /status tagPayoutScheme", name);
+                assert_eq!(o.vout0_addresses, vec![miner_addr.clone()], "{}: the username is paid", name);
+                let hp = height_push(o.height as u32);
+                let decoded = yolo::tag::decode_coinbase_tag(&o.script_sig).expect("v2 tag in the block's scriptSig");
+                assert_eq!((decoded.version, decoded.payout_scheme_name()), (2, scheme), "{}: yolo's decoder", name);
+                if text.is_some() {
+                    assert_eq!(o.script_sig.len(), 100, "{}: --text at the scriptSig limit", name);
+                    assert!(o.script_sig.starts_with(&hp) && o.script_sig[hp.len()..].starts_with(&flags2), "{}: height push ‖ v2 tag ‖ text", name);
+                } else {
+                    assert!(o.script_sig.starts_with(&hp) && o.script_sig.ends_with(&flags2), "{}: no --text keeps the node's scriptSig", name);
+                }
+                log(&format!("{} ({}): ok", name, scheme));
+            }
+        }
     }
 
     a.stop();

@@ -89,18 +89,21 @@ pub fn apply_template(state: &State, mut template: BlockTemplate) -> bool {
     match build_work(&t, &state.policy, state.equihash, &probe) {
         Ok(w) => {
             g.last_tag_kind = w.tag_kind();
+            g.last_tag = w.tag.as_ref().map(|t| (t.version, t.payout_scheme_name()));
             match &w.tag {
                 Some(tag) => info!(
-                    "work {} (gen {}, {}): {} txs, tag: {} price={} µUSD mask={:#x} signal={} payout={} scriptSig={}B",
+                    "work {} (gen {}, {}): {} txs, tag: v{} {} price={} µUSD mask={:#x} signal={} payout={}:{} scriptSig={}B",
                     t.height,
                     generation,
                     reason,
                     w.transaction_count,
+                    tag.version,
                     tag.kind(),
                     tag.price_micro_usd,
                     tag.source_mask,
                     tag.signal,
-                    hex::encode(tag.payout_key),
+                    tag.payout_scheme_name(),
+                    hex::encode(&tag.payout_hash),
                     w.coinbase_script_sig.len()
                 ),
                 None => info!("work {} (gen {}, {}): {} txs, tag: none scriptSig={}B", t.height, generation, reason, w.transaction_count, w.coinbase_script_sig.len()),

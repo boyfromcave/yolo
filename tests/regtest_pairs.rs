@@ -837,11 +837,24 @@ async fn real_call_facts(ctx: &mut Ctx, ycashd: &Path, base: &[String], miners: 
     ctx.p.start(ycashd, base, &[]);
     ctx.w.start(ycashd, base, &[]);
     wait_for("W synced to P", Duration::from_secs(60), || ctx.w.height() == ctx.p.height());
+    // Tag v2 (beta4, rpcversion 11): P's payout key becomes a post-quantum address of W (one more
+    // restart of P), so every block's tag, the paired coinbases' `flags` included, is the 50-byte
+    // v2 tag (FN-DSA-512). A node before rpcversion 11 keeps the 37-byte v1 tag of `mineraddress`.
+    let rpcversion = ctx.p.call("yed_getinfo", json!([]))["rpcversion"].as_u64().unwrap_or(0);
+    let v2_payout = (rpcversion >= 11).then(|| ctx.w.call("getnewaddress", json!(["pq"])).as_str().unwrap().to_string());
+    let tag_len = if v2_payout.is_some() { 50 } else { 37 };
+    if let Some(pq) = &v2_payout {
+        ctx.p.stop();
+        ctx.p.args.push(format!("-yellowbackpayoutaddress={}", pq));
+        ctx.p.start(ycashd, base, &[]);
+        wait_for("W synced to P", Duration::from_secs(60), || ctx.w.height() == ctx.p.height());
+        log(&format!("quote: rpcversion {}: P's payout key is {} (tag v2)", rpcversion, pq));
+    }
     ctx.p.call("yed_setquote", json!([50_000, 1]));
     let mut flags = String::new();
-    wait_for("a 37-byte quote tag in the template", Duration::from_secs(30), || {
+    wait_for("a quote tag (37 bytes, or 50 for v2) in the template", Duration::from_secs(30), || {
         flags = ctx.p.call("getblocktemplate", json!([]))["coinbaseaux"]["flags"].as_str().unwrap_or("").to_string();
-        flags.len() == 74
+        flags.len() == 2 * tag_len
     });
     let tv = ctx.p.call("getblocktemplate", json!([]));
     let t: BlockTemplate = serde_json::from_value(tv).unwrap();
@@ -850,7 +863,10 @@ async fn real_call_facts(ctx: &mut Ctx, ycashd: &Path, base: &[String], miners: 
     assert_eq!(a.flags, next_flags, "flags is the node's current quote tag");
     let cb = Coinbase::parse(&hex::decode(&a.data).unwrap()).unwrap();
     let push = yolo::tag::height_push(t.height);
-    assert!(cb.script_sig.starts_with(&push) && cb.script_sig[push.len()..].windows(37).any(|w| w == hex::decode(&a.flags).unwrap().as_slice()), "the scriptSig carries the tag after the height push");
+    assert!(
+        cb.script_sig.starts_with(&push) && cb.script_sig[push.len()..].windows(tag_len).any(|w| w == hex::decode(&a.flags).unwrap().as_slice()),
+        "the scriptSig carries the tag after the height push"
+    );
     // a block for every kind of miner with the quote (beta4 item 3a): transparent on the swap path,
     // Sapling, FN-DSA and SLH-DSA on paired jobs; the chain reads each block's tag back
     let first = ctx.p.height() + 1;
@@ -858,6 +874,10 @@ async fn real_call_facts(ctx: &mut Ctx, ycashd: &Path, base: &[String], miners: 
     for (h, m) in (first..).zip(miners) {
         let tag = ctx.p.call("yed_gettag", json!([h.to_string()]));
         assert_eq!((tag["found"].clone(), tag["kind"].clone(), tag["priceMicroUsd"].clone()), (json!(true), json!("quote"), json!(50_000)), "{}: the block's tag: {}", m.user, tag);
+        if let Some(pq) = &v2_payout {
+            let want = (json!(2), json!("fn-dsa-512"), json!(pq));
+            assert_eq!((tag["version"].clone(), tag["payoutScheme"].clone(), tag["payoutAddress"].clone()), want, "{}: a v2 tag paying the post-quantum key: {}", m.user, tag);
+        }
         log(&format!("quote: block {} for {} ({}) carries the tag: {}", h, m.user, m.kind, tag));
     }
     log(&format!("quote: flags {} from the node's current tag; blocks {}..{} (every kind) carry it", a.flags, first, ctx.p.height()));

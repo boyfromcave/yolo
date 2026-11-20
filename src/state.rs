@@ -114,6 +114,9 @@ pub struct Inner {
     pub connections: usize,
     pub clients_seen: u64,
     pub last_tag_kind: &'static str,
+    /// The last template's tag version (1, or 2 from beta4) and its payee scheme (`yed_gettag`'s
+    /// `payoutScheme`), for `/status`.
+    pub last_tag: Option<(u8, &'static str)>,
     pub last_verdict: String,
     pub accepted: u64,
     pub rejected: u64,
@@ -193,6 +196,7 @@ impl Shared {
                 connections: 0,
                 clients_seen: 0,
                 last_tag_kind: "none",
+                last_tag: None,
                 last_verdict: String::new(),
                 accepted: 0,
                 rejected: 0,
@@ -368,6 +372,8 @@ impl Shared {
             "pairs": pairs,
             "connections": g.connections,
             "tag": g.last_tag_kind,
+            "tagVersion": g.last_tag.map(|t| t.0),
+            "tagPayoutScheme": g.last_tag.map(|t| t.1),
             "lastSubmitVerdict": g.last_verdict,
             "accepted": g.accepted,
             "rejected": g.rejected,
