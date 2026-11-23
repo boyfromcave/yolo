@@ -7,7 +7,8 @@
 #     --exclude-newer <a date two weeks back> -o contrib/semgrep/requirements.txt
 # Last regenerated 2026-10-23 with --exclude-newer 2026-10-21 (certifi's fix is newer than two weeks:
 # a security fix is taken when it ships); the opentelemetry-* train moved to 1.45.2 / 0.66b2 on
-# 2026-11-13 for GHSA-mf5v-w3w3-f6cg (--exclude-newer-package opentelemetry-*=2026-10-30, every other pin kept).
+# 2026-11-13 for GHSA-mf5v-w3w3-f6cg (--exclude-newer-package opentelemetry-*=2026-10-30, every other pin kept); wcmatch
+# moved to 11.2 (bracex 3.2.4) on 2026-11-22 for GHSA-53pm-wgxf-c6qf (override, every other pin kept).
 annotated-types==0.8.0 \
     --hash=sha256:13b2beaad985e05e2d6407ee4c4f35590b11f8d693a258a561055cac8f64cab7 \
     --hash=sha256:f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0
@@ -35,15 +36,15 @@ boltons==21.0.0 \
     #   face
     #   glom
     #   semgrep
-bracex==3.0.1 \
-    --hash=sha256:4e38e32392e4a4780fe15d644bfc7c8514057cfc3861e060b11814ce829c25e4 \
-    --hash=sha256:6523ad83aeb5098a4ee597cff0f964442ff74e460bd3fafaffab6a013ff2288c
+bracex==3.2.4 \
+    --hash=sha256:82e9e738b63fca213c33211d30b0b1ca330896a1091736e78da2c1bcda93ab30 \
+    --hash=sha256:c1e67eb59f81445dee15b2c588b7c81352b697cfbd6c4931a2943ea6b71eb5ea
     # via wcmatch
 certifi==2026.10.19 \
     --hash=sha256:035c1e85572b141bf1c3a3eff0e33a8eb74917522f2559075ff8d2fea780a1ae \
     --hash=sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b
     # via
-    #   --override /tmp/claude-0/-home-user/01311372-e189-57e2-a10c-cc03b51e8164/scratchpad/overrides.txt
+    #   --override contrib/semgrep/security-overrides.txt
     #   httpcore
     #   httpx
     #   requests
@@ -458,7 +459,7 @@ mcp==1.30.0 \
     --hash=sha256:445414625fce5c295faa505bb11bacece661ab6f4028d57c935db57820b7a3e4 \
     --hash=sha256:666edb5009503e1047c9d60346a756f94b261f05cc2625f23d41c728ffc484d0
     # via
-    #   --override /tmp/claude-0/-home-user/01311372-e189-57e2-a10c-cc03b51e8164/scratchpad/overrides.txt
+    #   --override contrib/semgrep/security-overrides.txt
     #   semgrep
 mdurl==0.1.2 \
     --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8 \
@@ -468,7 +469,7 @@ opentelemetry-api==1.45.2 \
     --hash=sha256:2cbd737377e710ee740d261c94e93fa0f08e6d037c18f17513cc0a2d94479a34 \
     --hash=sha256:d7b0008e21e5fd61cbe7a7f34ca3b6905a78ab677d9bc395e299359c75cda6b4
     # via
-    #   --override /tmp/claude-0/-home-user/01311372-e189-57e2-a10c-cc03b51e8164/scratchpad/overrides.txt
+    #   --override contrib/semgrep/security-overrides.txt
     #   opentelemetry-exporter-http-transport
     #   opentelemetry-exporter-otlp-proto-http
     #   opentelemetry-instrumentation
@@ -489,45 +490,45 @@ opentelemetry-exporter-otlp-proto-common==1.45.2 \
     --hash=sha256:af483b24217028892f017096731b794b196b785025d2e6808874720fd0b05a80 \
     --hash=sha256:f1f2806f3f28ce7938033823e50934fcd91595a39de38e69a28a51e19f40fc6d
     # via
-    #   --override /tmp/claude-0/-home-user/01311372-e189-57e2-a10c-cc03b51e8164/scratchpad/overrides.txt
+    #   --override contrib/semgrep/security-overrides.txt
     #   opentelemetry-exporter-otlp-proto-http
 opentelemetry-exporter-otlp-proto-http==1.45.2 \
     --hash=sha256:5984a3fb46bc4628e4e2b85d4a6e72637e03962aae6cf372791137768a4ad939 \
     --hash=sha256:6e4d025138829d0ee57946930c2ccad6491ad4d92a958e9c7eea69278fe60cfc
     # via
-    #   --override /tmp/claude-0/-home-user/01311372-e189-57e2-a10c-cc03b51e8164/scratchpad/overrides.txt
+    #   --override contrib/semgrep/security-overrides.txt
     #   semgrep
 opentelemetry-instrumentation==0.66b2 \
     --hash=sha256:02b094150e53b76f5906d75e628dbb3833bbc6e62fa109b5c7ba0c081865e923 \
     --hash=sha256:fa9ccfdab147a14af8107d19ef0a7b5015675273c5adced7a1fc38f28b42ec4c
     # via
-    #   --override /tmp/claude-0/-home-user/01311372-e189-57e2-a10c-cc03b51e8164/scratchpad/overrides.txt
+    #   --override contrib/semgrep/security-overrides.txt
     #   opentelemetry-instrumentation-requests
     #   opentelemetry-instrumentation-threading
 opentelemetry-instrumentation-requests==0.66b2 \
     --hash=sha256:b0ba903a0bd7ebb234c8b32d3d957efc4061ba8571916558dc3f3dcdabb5e5e1 \
     --hash=sha256:bcfbdc3ff3ec8524044908788f0e7f3c25e219053b496fd9926d75f8d7c7bc96
     # via
-    #   --override /tmp/claude-0/-home-user/01311372-e189-57e2-a10c-cc03b51e8164/scratchpad/overrides.txt
+    #   --override contrib/semgrep/security-overrides.txt
     #   semgrep
 opentelemetry-instrumentation-threading==0.66b2 \
     --hash=sha256:512e0d4b568eff36ca15a977b507ddc1e64a38f93dbcafa4e701b3555b066991 \
     --hash=sha256:647480ef889595d577fea66d0cfcec395cf5d89888bbe05ca9919355797c85a3
     # via
-    #   --override /tmp/claude-0/-home-user/01311372-e189-57e2-a10c-cc03b51e8164/scratchpad/overrides.txt
+    #   --override contrib/semgrep/security-overrides.txt
     #   semgrep
 opentelemetry-proto==1.45.2 \
     --hash=sha256:03a7ca1b43f89fd5b965d5975902bb2515c0c86e2428b456836e9a6149c6235a \
     --hash=sha256:bd8d23cf770605b0af9b7be2071d26a464fea289d35429abfd2a66226114ad64
     # via
-    #   --override /tmp/claude-0/-home-user/01311372-e189-57e2-a10c-cc03b51e8164/scratchpad/overrides.txt
+    #   --override contrib/semgrep/security-overrides.txt
     #   opentelemetry-exporter-otlp-proto-common
     #   opentelemetry-exporter-otlp-proto-http
 opentelemetry-sdk==1.45.2 \
     --hash=sha256:7eec4de13dd21ff3a1670dcb0e02079e692736f94d733dfdce5af461d884248d \
     --hash=sha256:ff974ea70ee4f1d51e2ec152db37c2b626c7bf82bb3f7d86114fd8704e7199c6
     # via
-    #   --override /tmp/claude-0/-home-user/01311372-e189-57e2-a10c-cc03b51e8164/scratchpad/overrides.txt
+    #   --override contrib/semgrep/security-overrides.txt
     #   opentelemetry-exporter-otlp-common
     #   opentelemetry-exporter-otlp-proto-http
     #   semgrep
@@ -535,7 +536,7 @@ opentelemetry-semantic-conventions==0.66b2 \
     --hash=sha256:4cbe61e5f9275d57ab31708446e7938ef4291ebbe6a7fca6f7a629c5acae87d8 \
     --hash=sha256:7da5f1a5dc4383eb66711d4d3d3e71824d9403ac1559fea021cc103c1a4c4976
     # via
-    #   --override /tmp/claude-0/-home-user/01311372-e189-57e2-a10c-cc03b51e8164/scratchpad/overrides.txt
+    #   --override contrib/semgrep/security-overrides.txt
     #   opentelemetry-instrumentation
     #   opentelemetry-instrumentation-requests
     #   opentelemetry-sdk
@@ -543,7 +544,7 @@ opentelemetry-util-http==0.66b2 \
     --hash=sha256:7ba066ea609202e474679ddf1d0f753a1e6619bd206b36afaecba4bbb86e25d0 \
     --hash=sha256:c4bb5d6744e60353bcaa3e325bc529a1515346b51cb4d9c8e5b730579337e06d
     # via
-    #   --override /tmp/claude-0/-home-user/01311372-e189-57e2-a10c-cc03b51e8164/scratchpad/overrides.txt
+    #   --override contrib/semgrep/security-overrides.txt
     #   opentelemetry-instrumentation-requests
 packaging==26.3 \
     --hash=sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79 \
@@ -1061,10 +1062,12 @@ uvicorn==0.54.0 \
     --hash=sha256:505bdb0f318731d45f1f712071fc781a8981f6847a31c902c9f5e652d4f67faf \
     --hash=sha256:a2e33cbfaa0306f8e6b0c13e0cb89d7d7a2da3e62b90c66e18c33d9807b28620
     # via mcp
-wcmatch==8.5.2 \
-    --hash=sha256:17d3ad3758f9d0b5b4dedc770b65420d4dac62e680229c287bf24c9db856a478 \
-    --hash=sha256:a70222b86dea82fb382dd87b73278c10756c138bd6f8f714e2183128887b9eb2
-    # via semgrep
+wcmatch==11.2 \
+    --hash=sha256:1605bde546fbde4c063628c7d89eda486909fd4337e51d73a873987fbcb2554c \
+    --hash=sha256:952bab83c75c233836007a69550a3a8753cf06964c1eb3b84ff11ad5bff1c272
+    # via
+    #   --override contrib/semgrep/security-overrides.txt
+    #   semgrep
 wrapt==1.17.3 \
     --hash=sha256:02b551d101f31694fc785e58e0720ef7d9a10c4e62c1c9358ce6f63f23e30a56 \
     --hash=sha256:042ec3bb8f319c147b1301f2393bc19dba6e176b7da446853406d041c36c7828 \
