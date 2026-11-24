@@ -25,6 +25,29 @@ pub struct TemplateTx {
     /// The transaction's signature operations, as the node counts them toward `sigoplimit`.
     #[serde(default)]
     pub sigops: Option<i64>,
+    /// Yugen (branch id `0x59474e30`): the proofs the transaction commits to, hex, in its own
+    /// order. They are block data beside the transaction (yugen-spec 0.5.1 §15.1, "The proofs
+    /// are block data"), not part of `data`; absent for every other transaction.
+    #[serde(default)]
+    pub proofs: Vec<String>,
+}
+
+impl TemplateTx {
+    /// The transaction's bytes in the block.
+    pub fn size(&self) -> usize {
+        self.data.len() / 2
+    }
+
+    /// The bytes of the proofs it commits to.
+    pub fn proof_bytes(&self) -> usize {
+        self.proofs.iter().map(|p| p.len() / 2).sum()
+    }
+
+    /// Its weight (yugen-spec 0.5.1 §16 W3): its bytes plus the bytes of every proof it
+    /// commits to. Equal to its size for a transaction without proofs.
+    pub fn weight(&self) -> usize {
+        self.size() + self.proof_bytes()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,6 +100,10 @@ pub struct BlockTemplate {
     pub height: u32,
     pub curtime: Option<i64>,
     pub sizelimit: Option<usize>,
+    /// Yugen: `BLOCK_WEIGHT_MAX` (4,000,000; yugen-spec 0.5.1 §16 W3), sent once Yugen is active
+    /// for the next block. Absent: the block has no weight rule beyond `sizelimit`.
+    #[serde(default)]
+    pub weightlimit: Option<usize>,
     /// The block's signature-operation limit (`MAX_BLOCK_SIGOPS`); the coinbase counts toward it.
     #[serde(default)]
     pub sigoplimit: Option<u64>,

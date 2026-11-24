@@ -1074,6 +1074,8 @@ mod tests {
             target: String::new(),
             transactions: String::new(),
             transaction_count: 1,
+            sidecar: String::new(),
+            weight: 0,
             coinbase_script_sig: vec![],
             tag: None,
             text_truncated_to: None,

@@ -9,7 +9,7 @@
 use crate::codec::{compact_size, dsha256, hash_from_display, merkle_root, reverse_hex, u32_le_hex};
 use crate::equihash::Equihash;
 use crate::tag::{decode_coinbase_tag, height_push_len, Tag};
-use crate::template::BlockTemplate;
+use crate::template::{BlockTemplate, TemplateTx};
 use crate::tx::{rebuild_script_sig, Coinbase, MAX_COINBASE_SCRIPTSIG};
 
 /// The coinbase policy: the two flags of plan Y7 (owner decision P-6). Every combination
@@ -56,6 +56,12 @@ pub struct Work {
     /// compact tx count ‖ coinbase ‖ selected transactions, hex.
     pub transactions: String,
     pub transaction_count: usize,
+    /// The Yugen proof section after the transactions (empty when no selected transaction
+    /// commits to a proof), hex: see [`proof_section`].
+    pub sidecar: String,
+    /// The block's weight (bytes plus proof bytes) as built, without the header's solution
+    /// variance; equals its size when there are no proofs.
+    pub weight: usize,
     pub coinbase_script_sig: Vec<u8>,
     pub tag: Option<Tag>,
     pub text_truncated_to: Option<usize>,
@@ -152,17 +158,31 @@ fn assemble_work(t: &BlockTemplate, coinbase: &[u8], script_sig: Vec<u8>, trunca
     let mut txids: Vec<[u8; 32]> = vec![dsha256(coinbase)];
     let mut txs_hex = hex::encode(coinbase);
     let mut size = HEADER_SIZE + equihash.solution_wire_len() + 9 + coinbase.len();
+    // Yugen: proof bytes count toward the weight only (W3), never toward `sizelimit` (W2).
+    let mut proof_bytes = 0usize;
+    let mut selected: Vec<&TemplateTx> = Vec::new();
     for tx in &t.transactions {
-        let tx_size = tx.data.len() / 2;
+        let tx_size = tx.size();
         if size + tx_size >= limit {
             if selection == Selection::All {
                 return Err(format!("coinbase-does-not-fit: the paired block would reach {} bytes, the limit is {}", size + tx_size, limit));
             }
             break;
         }
+        if let Some(wl) = t.weightlimit {
+            let w = size + proof_bytes + tx.weight();
+            if w > wl {
+                if selection == Selection::All {
+                    return Err(format!("coinbase-does-not-fit: the paired block would weigh {}, the limit is {}", w, wl));
+                }
+                break;
+            }
+        }
         txids.push(hash_from_display(&tx.hash)?);
         txs_hex.push_str(&tx.data);
         size += tx_size;
+        proof_bytes += tx.proof_bytes();
+        selected.push(tx);
     }
     let count = txids.len();
     let root = merkle_root(&txids);
@@ -179,6 +199,8 @@ fn assemble_work(t: &BlockTemplate, coinbase: &[u8], script_sig: Vec<u8>, trunca
         target: t.target.clone(),
         transactions: format!("{}{}", hex::encode(compact_size(count as u64)), txs_hex),
         transaction_count: count,
+        sidecar: proof_section(&selected)?,
+        weight: size + proof_bytes,
         tag: decode_coinbase_tag(&script_sig),
         coinbase_script_sig: script_sig,
         text_truncated_to: truncated,
@@ -251,7 +273,34 @@ pub fn assemble_header(work: &Work, nonce1: &str, s: &Submit) -> String {
 pub fn assemble_block(work: &Work, nonce1: &str, s: &Submit) -> String {
     let mut block = assemble_header(work, nonce1, s);
     block.push_str(&work.transactions);
+    block.push_str(&work.sidecar);
     block
+}
+
+/// The Yugen proof section of a block, hex: empty when no transaction commits to a proof (every
+/// block before Yugen, and every Yugen block without Yugen transactions, is unchanged), else
+/// `compactsize(n) ‖ entry_1 ‖ … ‖ entry_n` over the selected transactions that carry proofs, in
+/// block order, with `entry = txid(32, internal order) ‖ compactsize(k) ‖ (compactsize(len) ‖
+/// proof)^k`. This is the pool's proposal for the sidecar wire form (clones/INTERFACES.md,
+/// "yolo"); the node line defines the final one, and yolo follows it here only.
+pub fn proof_section(selected: &[&TemplateTx]) -> Result<String, String> {
+    let with: Vec<&&TemplateTx> = selected.iter().filter(|t| !t.proofs.is_empty()).collect();
+    if with.is_empty() {
+        return Ok(String::new());
+    }
+    let mut out = hex::encode(compact_size(with.len() as u64));
+    for tx in with {
+        out.push_str(&hex::encode(hash_from_display(&tx.hash)?));
+        out.push_str(&hex::encode(compact_size(tx.proofs.len() as u64)));
+        for proof in &tx.proofs {
+            if proof.len() % 2 != 0 || !proof.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!("transaction {} carries a proof that is not hex", tx.hash));
+            }
+            out.push_str(&hex::encode(compact_size((proof.len() / 2) as u64)));
+            out.push_str(&proof.to_ascii_lowercase());
+        }
+    }
+    Ok(out)
 }
 
 /// The block hash (SHA256d of the serialized header, solution included) as the node
@@ -300,6 +349,7 @@ pub fn meets_target(header_hex: &str, target_hex: &str) -> Result<bool, String> 
 mod tests {
     use super::*;
     use crate::tag::tag_kind;
+    use std::sync::Arc;
 
     fn template() -> BlockTemplate {
         serde_json::from_str(include_str!("../tests/vectors/regtest-template-105.json")).unwrap()
@@ -565,5 +615,65 @@ mod tests {
         assert!(Submit::check("b61cba6a", &"0".repeat(32), &sol, 28, Equihash::REGTEST).is_err());
         assert!(Submit::check("b61cba6a", &"0".repeat(36), &sol, 28, Equihash::MAINNET).is_err());
         assert!(Submit::check("b61cba6a", &"g".repeat(36), &sol, 28, Equihash::REGTEST).is_err());
+    }
+
+    /// A template as a Yugen node serves it: one leaf transfer with two proofs (systems A and B)
+    /// beside an ordinary transaction, and `weightlimit`.
+    fn yugen_template(weightlimit: usize) -> BlockTemplate {
+        let mut t = template();
+        let mut leaf = (*t.transactions[0]).clone();
+        leaf.proofs = vec!["aa".repeat(1000), "bb".repeat(700)];
+        t.transactions.insert(0, Arc::new(leaf));
+        t.weightlimit = Some(weightlimit);
+        t
+    }
+
+    #[test]
+    fn yugen_proofs_go_to_the_sidecar_and_count_toward_weight_only() {
+        let t = yugen_template(4_000_000);
+        let pol = policy(fixed(NODE_SPK), None);
+        let w = build_work(&t, &pol, Equihash::REGTEST, &params(None)).unwrap();
+        assert_eq!(w.transaction_count, t.transactions.len() + 1);
+        // the transactions section is unchanged by the proofs: tx data only
+        assert!(!w.transactions.contains(&"aa".repeat(1000)));
+        let leaf = &t.transactions[0];
+        let mut expect = String::from("01");
+        expect.push_str(&hex::encode(hash_from_display(&leaf.hash).unwrap()));
+        expect.push_str("02");
+        expect.push_str("fde803");
+        expect.push_str(&"aa".repeat(1000));
+        expect.push_str("fdbc02");
+        expect.push_str(&"bb".repeat(700));
+        assert_eq!(w.sidecar, expect);
+        let plain = build_work(&template(), &pol, Equihash::REGTEST, &params(None)).unwrap();
+        assert_eq!(plain.sidecar, "", "no proofs, no section: pre-Yugen blocks are unchanged");
+        assert_eq!(w.weight, plain.weight + leaf.size() + 1700);
+        let s = Submit { ntime: "b61cba6a".into(), nonce2: "00".into(), solution: "11".into() };
+        assert!(assemble_block(&w, "", &s).ends_with(&expect));
+    }
+
+    #[test]
+    fn yugen_weight_limit_drops_the_tail_or_refuses_a_paired_job() {
+        let base = build_work(&template(), &policy(fixed(NODE_SPK), None), Equihash::REGTEST, &params(None)).unwrap();
+        // room for everything but the leaf's proofs: the swap path stops before the leaf
+        let t = yugen_template(base.weight + 1000);
+        let w = build_work(&t, &policy(fixed(NODE_SPK), None), Equihash::REGTEST, &params(None)).unwrap();
+        assert_eq!(w.transaction_count, 1, "the leaf is first, so nothing after it is taken");
+        assert_eq!(w.sidecar, "");
+        let cb = hex::decode(&t.coinbasetxn.data).unwrap();
+        let err = build_paired_work(&t, &cb, &[], &policy(None, None), Equihash::REGTEST, &params(None)).unwrap_err();
+        assert!(err.starts_with("coinbase-does-not-fit: the paired block would weigh"), "{}", err);
+    }
+
+    #[test]
+    fn template_reads_proofs_and_weightlimit() {
+        let mut v: serde_json::Value = serde_json::from_str(include_str!("../tests/vectors/regtest-template-105.json")).unwrap();
+        v["weightlimit"] = 4_000_000.into();
+        v["transactions"][0]["proofs"] = serde_json::json!(["00ff", "11"]);
+        let t: BlockTemplate = serde_json::from_value(v).unwrap();
+        assert_eq!(t.weightlimit, Some(4_000_000));
+        assert_eq!(t.transactions[0].proof_bytes(), 3);
+        assert_eq!(t.transactions[0].weight(), t.transactions[0].size() + 3);
+        assert!(proof_section(&[&TemplateTx { proofs: vec!["0g".into()], ..(*t.transactions[0]).clone() }]).is_err());
     }
 }

@@ -40,6 +40,9 @@
 //! `YOLO_REGTEST_LEGACY=1` runs against a node without the vault upgrade (`harden/yellowback`)
 //! instead: `NODE_ARGS` as they are, with `-experimentalfeatures -yellowback`.
 //!
+//! **Yugen** (`YOLO_REGTEST_YUGEN=<h>`, h > vault + 1, ycashd from the Yugen ycash6 clone): adds
+//! `-nuparams=59474e30:<h>` and the case `across-yugen-activation` (beta4 Yugen addendum P-3).
+//!
 //! **The kogany mode** (`YOLO_REGTEST_KOGANY=<koganyd built with --features ycash>`, vault mode
 //! only; kogany plan W8-c): a kogany node (`Kogany`) joins as a third node, dialling node A over
 //! P2P, and yolo serves *its* templates; nodes A and B stay ycashd and keep the wallet roles
@@ -88,7 +91,18 @@ fn node_args(vault: Option<u64>) -> Vec<String> {
     let Some(h) = vault else { return NODE_ARGS.iter().map(|a| a.to_string()).collect() };
     let mut args: Vec<String> = NODE_ARGS.iter().filter(|a| **a != "-yellowback" && !a.starts_with("-yellowbackstartheight")).map(|a| a.to_string()).collect();
     args.push(format!("-nuparams={}:{}", VAULT_BRANCH_ID, h));
+    if let Some(y) = yugen_height() {
+        args.push(format!("-nuparams={}:{}", YUGEN_BRANCH_ID, y));
+    }
     args
+}
+
+/// Yugen's consensus branch id ("YGN0"; beta4 Yugen addendum, ruling 5).
+const YUGEN_BRANCH_ID: &str = "59474e30";
+
+/// `YOLO_REGTEST_YUGEN=<h>`: activate Yugen at `h` (after Vault) and mine across it too (P-3).
+fn yugen_height() -> Option<u64> {
+    std::env::var("YOLO_REGTEST_YUGEN").ok().filter(|v| !v.is_empty()).map(|v| v.parse().expect("YOLO_REGTEST_YUGEN is a height"))
 }
 
 fn workspace() -> PathBuf {
@@ -577,6 +591,18 @@ async fn payout_text_grid_against_a_regtest_node() {
             assert_eq!(info["upgrades"][VAULT_BRANCH_ID]["activationheight"], json!(h), "node {}: Vault height", node.index);
         }
         log(&format!("across-vault-activation: yolo mined 102..={} through the upgrade at {}; tip branch {}", h + 1, h, VAULT_BRANCH_ID));
+        // Yugen (addendum P-3): the same pool process mines on through Yugen's activation; the
+        // node advertises rpcversion 12 there, which yolo never gates on.
+        if let Some(y) = yugen_height() {
+            assert!(y > h + 1 && kogany.is_none(), "YOLO_REGTEST_YUGEN must be above the vault height + 1, ycashd only");
+            run_plain("across-yugen-activation", &a, &b, &python, &miner, &user, y + 1 - a.height()).await;
+            for node in [&a, &b] {
+                let info = node.call("getblockchaininfo", json!([]));
+                assert_eq!(info["consensus"]["chaintip"], json!(YUGEN_BRANCH_ID), "node {}: the tip is past the Yugen activation", node.index);
+                assert_eq!(info["upgrades"][YUGEN_BRANCH_ID]["activationheight"], json!(y), "node {}: Yugen height", node.index);
+            }
+            log(&format!("across-yugen-activation: yolo mined through {} at {}", YUGEN_BRANCH_ID, y));
+        }
         // The YED attestor set (U-22): created after activation, then both nodes restart naming it.
         // maturity 2: the post-quantum nodes refuse less than MIN_SET_MATURITY (regtest 2, mainnet 16,128;
         // D-Q-31, set_create's "maturity must be at least"); the pre-quantum upgrade/vault nodes take it too.
