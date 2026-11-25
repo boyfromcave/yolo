@@ -164,7 +164,13 @@ impl BlockTemplate {
     }
 
     pub fn change_key(&self) -> ChangeKey {
-        ChangeKey { height: self.height, target: self.target.clone(), light_client_root: self.header_root().unwrap_or("").to_string(), flags: self.coinbaseaux.flags.clone(), txset: hex::encode(crate::codec::dsha256(self.txids().join(",").as_bytes())) }
+        ChangeKey {
+            height: self.height,
+            target: self.target.clone(),
+            light_client_root: self.header_root().unwrap_or("").to_string(),
+            flags: self.coinbaseaux.flags.clone(),
+            txset: hex::encode(crate::codec::dsha256(self.txids().join(",").as_bytes())),
+        }
     }
 
     /// The template's transaction ids in its order: the reference `getcoinbasetemplatefor` names

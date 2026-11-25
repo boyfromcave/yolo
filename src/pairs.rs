@@ -108,7 +108,8 @@ impl PayoutKind {
 pub fn yugen_refusal(address: &str) -> Option<String> {
     const PREFIXES: [&str; 6] = ["yqtf", "yqrf", "yqtk", "yqrk", "yqf", "yqk"];
     PREFIXES.iter().any(|p| address.starts_with(p)).then(|| {
-        "Invalid address: a Yugen address (yq...) cannot receive a block reward; mine to a Sapling, post-quantum (sqf/sqs) or transparent address and move the coins to Yugen from your wallet".to_string()
+        "Invalid address: a Yugen address (yq...) cannot receive a block reward; mine to a Sapling, post-quantum (sqf/sqs) or transparent address and move the coins to Yugen from your wallet"
+            .to_string()
     })
 }
 
