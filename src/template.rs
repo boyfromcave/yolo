@@ -117,7 +117,13 @@ pub struct ChangeKey {
     /// The header root, or empty when the template does not determine it.
     pub light_client_root: String,
     pub flags: String,
+    /// Digest of the template's transaction ids, in order (a transaction arriving mid-job is
+    /// mined in the next block, not one later). The poller rate-limits refreshes on this alone.
+    pub txset: String,
 }
+
+/// How often a change of the transaction set alone sends new work, at most.
+pub const TXSET_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn non_empty(s: &Option<String>) -> Option<&str> {
     s.as_deref().filter(|v| !v.is_empty())
@@ -158,7 +164,7 @@ impl BlockTemplate {
     }
 
     pub fn change_key(&self) -> ChangeKey {
-        ChangeKey { height: self.height, target: self.target.clone(), light_client_root: self.header_root().unwrap_or("").to_string(), flags: self.coinbaseaux.flags.clone() }
+        ChangeKey { height: self.height, target: self.target.clone(), light_client_root: self.header_root().unwrap_or("").to_string(), flags: self.coinbaseaux.flags.clone(), txset: hex::encode(crate::codec::dsha256(self.txids().join(",").as_bytes())) }
     }
 
     /// The template's transaction ids in its order: the reference `getcoinbasetemplatefor` names
@@ -244,6 +250,12 @@ mod tests {
         let mut t2 = t.clone();
         t2.coinbaseaux.flags = String::new();
         assert_ne!(t2.change_key(), k);
+        // only the transaction set differs → a new key (its txset alone)
+        let mut t3 = t.clone();
+        t3.transactions.pop();
+        let k3 = t3.change_key();
+        assert_ne!(k3, k);
+        assert_eq!((k3.height, &k3.target, &k3.flags), (k.height, &k.target, &k.flags));
         // a node where Yellowback is not live (no vault upgrade or no YED attestor set) omits coinbaseaux in coinbasetxn mode
         let mut v: serde_json::Value = serde_json::from_str(include_str!("../tests/vectors/regtest-template-4-noflags.json")).unwrap();
         v.as_object_mut().unwrap().remove("coinbaseaux");

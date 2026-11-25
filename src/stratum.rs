@@ -600,6 +600,11 @@ impl Client {
                         return Action::Disconnect;
                     }
                 };
+                if let Some(why) = crate::pairs::yugen_refusal(&address) {
+                    out.push_str(&msg_auth_failed(&id, &why));
+                    warn!("miner {}: {} refused: {}", self.index, shown(&address), why);
+                    return Action::Disconnect;
+                }
                 let cached = state.cached_address(&address);
                 let was_cached = cached.is_some();
                 let answer = match cached {

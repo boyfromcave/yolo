@@ -55,6 +55,9 @@ pub struct Config {
 /// Resolves `--payout` to its scriptPubKey with `validateaddress`, retrying while the node is
 /// unreachable; an invalid or shielded address is a startup error.
 pub async fn resolve_payout(rpc: &RpcClient, address: &str) -> Result<Payout, String> {
+    if let Some(why) = pairs::yugen_refusal(address) {
+        return Err(format!("--payout {}: {}", address, why));
+    }
     loop {
         let r = rpc.clone();
         let a = address.to_string();

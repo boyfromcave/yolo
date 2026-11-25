@@ -59,7 +59,11 @@ pub fn apply_template(state: &State, mut template: BlockTemplate) -> bool {
     }
     let was_down = !g.node_up;
     g.node_up = true;
-    if g.template.is_some() && g.key == key && !was_down {
+    // Only the transaction set changed, and recently new work went out: keep the jobs for now
+    // (the key keeps its old txset, so a later poll sends the work).
+    let txset_only = g.key.height == key.height && g.key.flags == key.flags && g.key.target == key.target && g.key.light_client_root == key.light_client_root;
+    let recent = g.key_at.is_some_and(|at| at.elapsed() < crate::template::TXSET_REFRESH);
+    if g.template.is_some() && !was_down && (g.key == key || (txset_only && recent)) {
         g.template = Some(std::sync::Arc::new(template));
         g.template_at = Some(Instant::now());
         see_tip(&mut g);
@@ -73,10 +77,13 @@ pub fn apply_template(state: &State, mut template: BlockTemplate) -> bool {
         "coinbaseaux.flags changed"
     } else if g.key.target != key.target {
         "target changed"
-    } else {
+    } else if g.key.light_client_root != key.light_client_root {
         "light-client root changed"
+    } else {
+        "transactions changed"
     };
     g.key = key;
+    g.key_at = Some(Instant::now());
     g.template = Some(std::sync::Arc::new(template));
     g.template_at = Some(Instant::now());
     see_tip(&mut g);

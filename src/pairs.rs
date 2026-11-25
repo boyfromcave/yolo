@@ -101,6 +101,17 @@ impl PayoutKind {
     }
 }
 
+/// The refusal for a Yugen address (addendum ruling 14: `yqf`/`yqtf`/`yqrf`, reserved
+/// `yqk`/`yqtk`/`yqrk`). A Yugen note is not a coinbase output (no consensus path pays a block
+/// reward into the Yugen pool), so a pool cannot pay one; the miner is told to use a Sapling,
+/// post-quantum or transparent address and shield to Yugen from the wallet. None: not Yugen.
+pub fn yugen_refusal(address: &str) -> Option<String> {
+    const PREFIXES: [&str; 6] = ["yqtf", "yqrf", "yqtk", "yqrk", "yqf", "yqk"];
+    PREFIXES.iter().any(|p| address.starts_with(p)).then(|| {
+        "Invalid address: a Yugen address (yq...) cannot receive a block reward; mine to a Sapling, post-quantum (sqf/sqs) or transparent address and move the coins to Yugen from your wallet".to_string()
+    })
+}
+
 /// Asks the node what `address` is: `validateaddress`, then `z_validateaddress` for an address the
 /// first does not know (a Sapling address is invalid to `validateaddress`).
 pub fn classify_address(rpc: &RpcClient, address: &str) -> Result<Option<PayoutKind>, RpcError> {
@@ -983,5 +994,20 @@ mod tests {
         assert_eq!(need(&e, &next, now), Some(0), "another template is asked for at once");
         e.subscribers = 0;
         assert_eq!(need(&e, &next, now), None);
+    }
+}
+
+#[cfg(test)]
+mod yugen_tests {
+    use super::yugen_refusal;
+
+    #[test]
+    fn yugen_addresses_are_refused_with_a_reason() {
+        for a in ["yqf1abc", "yqtf1abc", "yqrf1abc", "yqk1abc", "yqtk1", "yqrk1"] {
+            assert!(yugen_refusal(a).unwrap().contains("Yugen"), "{}", a);
+        }
+        for a in ["ys1abc", "s1abc", "sqf1abc", "rqf1", "ybf1", "yrf1", "zregtestsapling1"] {
+            assert!(yugen_refusal(a).is_none(), "{}", a);
+        }
     }
 }

@@ -105,6 +105,8 @@ pub struct MinerInfo {
 pub struct Inner {
     pub template: Option<Arc<BlockTemplate>>,
     pub key: ChangeKey,
+    /// When `key` last changed (the transaction-set refresh is rate-limited against it).
+    pub key_at: Option<Instant>,
     pub template_at: Option<Instant>,
     pub generation: u64,
     pub node_up: bool,
@@ -189,6 +191,7 @@ impl Shared {
             inner: Mutex::new(Inner {
                 template: None,
                 key: ChangeKey::default(),
+                key_at: None,
                 template_at: None,
                 generation: 0,
                 node_up: false,
