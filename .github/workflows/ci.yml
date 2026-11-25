@@ -21,7 +21,7 @@ on:
     # The one branch list: harden/yellowback (P1 hardening), upgrade/vault (the network upgrade),
     # main (the branch of record, AGENTS.md rule 2), vaults/kogany-compat (the kogany work's
     # integration branch, kogany plan §4.2 rule 0).
-    branches: &branches [main, harden/yellowback, upgrade/vault, vaults/kogany-compat]
+    branches: &branches [main, harden/yellowback, upgrade/vault, upgrade/yugen, vaults/kogany-compat]
   pull_request:
     branches: *branches
   workflow_dispatch:

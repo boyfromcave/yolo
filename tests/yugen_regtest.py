@@ -17,14 +17,14 @@ the Python (48,5) stratum miner:
    coinbasetxn: subsidy - fund + every fee, the Yugen transfer fees included).
 3. A Yugen username (yqrf...) is refused at mining.authorize with the Yugen message.
 
-  tests/yugen_regtest.py   (env: YCASHD, YUGEN_LEAFVERIFY, YEWD_YUGEN, YOLO_BIN, STRATUM_MINER, PYTHON,
+  tests/yugen_regtest.py   (env: YELLOWBACK_WORKSPACE, YCASHD, YUGEN_LEAFVERIFY, YEWD_YUGEN, YOLO_BIN, STRATUM_MINER, PYTHON,
                             YUGEN_RT_PORT=30410)
 """
 import base64, json, os, shutil, struct, subprocess, sys, tempfile, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLONES = os.path.dirname(ROOT)
-WS = os.path.expanduser('~/projects/yellowback-workspace')
+WS = os.environ.get('YELLOWBACK_WORKSPACE', CLONES)
 YCASHD = os.environ.get('YCASHD', os.path.join(CLONES, 'ycash6', 'src', 'ycashd'))
 HELPER = os.environ.get('YUGEN_LEAFVERIFY', os.path.join(
     CLONES, 'ycash6', 'contrib', 'yugen-leafverify', 'target', 'release', 'yugen-leafverify'))

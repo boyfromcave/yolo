@@ -13,7 +13,7 @@ name: secops
 # hash-locked (pip --require-hashes). Actions are pinned by commit; the comment carries the tag.
 on:
   push:
-    branches: [upgrade/vault]
+    branches: [upgrade/vault, upgrade/yugen]
   pull_request:
   schedule:
     - cron: '43 3 * * *'
